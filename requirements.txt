@@ -1,0 +1,30 @@
+# ============================================================
+# battery_ts_rag — Phase 1: Retrieval-Only Framework
+# ============================================================
+# Requires Python >= 3.10
+
+# --- Core: AutoGluon 1.5 + Chronos-2 -----------------------
+autogluon.timeseries>=1.5.0,<1.6.0
+# chronos-forecasting >= 2.0 is pulled in as an autogluon.timeseries dep;
+# pin explicitly so the Chronos2Pipeline.embed() API is available.
+chronos-forecasting>=2.0.0
+
+# --- Vector search ------------------------------------------
+faiss-cpu>=1.7.2
+
+# --- Numerical / data ---------------------------------------
+numpy>=1.25.0
+pandas>=2.0.0
+pyarrow>=12.0.0          # for parquet I/O
+
+# --- Deep learning (should already be installed with AG) ----
+torch>=2.0.0
+
+# --- Config / CLI -------------------------------------------
+pyyaml>=6.0
+
+# --- Progress bars ------------------------------------------
+tqdm>=4.60.0
+
+# --- (Optional) experiment tracking -------------------------
+# wandb>=0.19.0

@@ -1,0 +1,7 @@
+.claude
+output
+**/__pycache__
+datasets
+docs
+configs
+tests
