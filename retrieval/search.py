@@ -5,6 +5,7 @@ search.py — Query a FAISS retrieval database and return structured results.
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -114,9 +115,12 @@ class RetrieverSearcher:
             meta_list = []
             for _, row in rows.iterrows():
                 try:
-                    meta_list.append(ast.literal_eval(row["metadata_json"]))
-                except (ValueError, SyntaxError):
-                    meta_list.append({})
+                    meta_list.append(json.loads(row["metadata_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    try:
+                        meta_list.append(ast.literal_eval(row["metadata_json"]))
+                    except (ValueError, SyntaxError):
+                        meta_list.append({})
 
             results.append(
                 SearchResult(

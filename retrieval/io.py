@@ -11,6 +11,7 @@ in a pair of files:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -39,7 +40,7 @@ def save_sidecar(
                 "window_end": s.window_end,
                 "target_start": s.target_start,
                 "target_end": s.target_end,
-                "metadata_json": str(s.metadata),
+                "metadata_json": json.dumps(s.metadata, ensure_ascii=True),
             }
         )
         if s.future_values is not None:

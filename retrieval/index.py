@@ -4,7 +4,10 @@ index.py — FAISS index wrapper with L2 and cosine similarity support.
 
 from __future__ import annotations
 
+import os
 from typing import Literal, Optional, Tuple
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import faiss
 import numpy as np

@@ -71,14 +71,15 @@ def build_database(
     index : FAISSIndex
     embeddings : np.ndarray, shape ``(N, D)``
     """
-    # Stack all window values → [N, L] (univariate) or [N, L, C]
-    all_windows = np.stack([s.window_values for s in samples])
+    if not samples:
+        raise ValueError("Cannot build a database from an empty sample list.")
 
-    # Batch-encode
+    # Batch-encode without stacking the full dataset in memory.
     all_embeddings: List[np.ndarray] = []
-    N = len(all_windows)
+    N = len(samples)
     for start in tqdm(range(0, N, encode_batch_size), desc="Encoding"):
-        batch = all_windows[start : start + encode_batch_size]
+        batch_samples = samples[start : start + encode_batch_size]
+        batch = np.stack([s.window_values for s in batch_samples])
         emb = encoder.encode(batch)  # [B, D]
         all_embeddings.append(emb)
     embeddings = np.concatenate(all_embeddings, axis=0)  # [N, D]
