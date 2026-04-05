@@ -1,7 +1,9 @@
 .claude
+.vscode
 output
 **/__pycache__
 datasets
 docs
 configs
 tests
+**/.DS_Store
