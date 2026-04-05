@@ -127,3 +127,101 @@ def recent_delta_mean(values: Sequence[float], last_k: int) -> float:
     if tail.size < 2:
         return 0.0
     return float(np.diff(tail).mean())
+
+
+def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series([np.nan] * len(df), index=df.index, dtype="float32")
+    return pd.to_numeric(df[column], errors="coerce").astype("float32")
+
+
+def _rolling_delta(series: pd.Series, periods: int = 1) -> pd.Series:
+    return series.diff(periods=periods).astype("float32")
+
+
+def _rolling_mean_slope(series: pd.Series, window: int) -> pd.Series:
+    return series.diff().rolling(window=max(window - 1, 1), min_periods=1).mean().astype("float32")
+
+
+def _rolling_std(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window=max(window, 2), min_periods=2).std().astype("float32")
+
+
+def _rolling_spectral_entropy(series: pd.Series, window: int) -> pd.Series:
+    min_periods = min(max(window // 2, 4), window)
+
+    def _entropy(chunk: np.ndarray) -> float:
+        arr = np.asarray(chunk, dtype=np.float32)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < 4:
+            return np.nan
+        arr = arr - arr.mean()
+        power = np.abs(np.fft.rfft(arr)) ** 2
+        if power.size <= 1:
+            return np.nan
+        power = power[1:]
+        total = float(power.sum())
+        if total < 1e-12:
+            return np.nan
+        probs = power / total
+        denom = math.log(len(probs))
+        if denom <= 0:
+            return np.nan
+        return float(-(probs * np.log(probs + 1e-12)).sum() / denom)
+
+    return series.rolling(window=window, min_periods=min_periods).apply(_entropy, raw=True).astype("float32")
+
+
+def _rolling_low_freq_ratio(series: pd.Series, window: int) -> pd.Series:
+    min_periods = min(max(window // 2, 4), window)
+
+    def _ratio(chunk: np.ndarray) -> float:
+        arr = np.asarray(chunk, dtype=np.float32)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < 4:
+            return np.nan
+        arr = arr - arr.mean()
+        power = np.abs(np.fft.rfft(arr)) ** 2
+        if power.size <= 2:
+            return np.nan
+        power = power[1:]
+        total = float(power.sum())
+        if total < 1e-12:
+            return np.nan
+        low_bins = max(1, len(power) // 3)
+        return float(power[:low_bins].sum() / total)
+
+    return series.rolling(window=window, min_periods=min_periods).apply(_ratio, raw=True).astype("float32")
+
+
+def augment_cycle_feature_frame(
+    cell_cycles: pd.DataFrame,
+    rolling_window: int = 5,
+    spectral_window: int = 16,
+    spectral_columns: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    df = cell_cycles.copy()
+    spectral_columns = list(spectral_columns or ["voltage_mean", "temp_mean", "current_mean"])
+
+    df["soh_pct"] = _numeric_series(df, "soh") * 100.0
+    df["capacity_ratio"] = _numeric_series(df, "soh")
+    df["voltage_range"] = _numeric_series(df, "voltage_max") - _numeric_series(df, "voltage_min")
+    df["temp_range"] = _numeric_series(df, "temp_max") - _numeric_series(df, "temp_min")
+    df["current_abs_mean"] = _numeric_series(df, "current_mean").abs()
+
+    for column in ["soh", "voltage_mean", "temp_mean", "current_mean"]:
+        series = _numeric_series(df, column)
+        df[f"{column}_diff_1"] = _rolling_delta(series, periods=1)
+        df[f"{column}_slope_{rolling_window}"] = _rolling_mean_slope(series, window=rolling_window)
+        df[f"{column}_std_{rolling_window}"] = _rolling_std(series, window=rolling_window)
+
+    for column in ["charge_throughput", "discharge_throughput", "energy_charge", "energy_discharge"]:
+        series = _numeric_series(df, column)
+        df[f"{column}_delta_1"] = _rolling_delta(series, periods=1)
+
+    for column in spectral_columns:
+        series = _numeric_series(df, column)
+        df[f"{column}_fft_entropy_{spectral_window}"] = _rolling_spectral_entropy(series, window=spectral_window)
+        df[f"{column}_fft_low_ratio_{spectral_window}"] = _rolling_low_freq_ratio(series, window=spectral_window)
+
+    return df

@@ -5,14 +5,26 @@ import json
 
 import yaml
 
-from retrieval.encoder_chronos2 import Chronos2RetrieverEncoder
-
 from .build_memory_bank import build_battery_memory_bank
 
 
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def build_encoder_from_config(cfg: dict):
+    from retrieval.encoder_chronos2 import Chronos2RetrieverEncoder
+
+    enc_cfg = cfg["encoder"]
+    return Chronos2RetrieverEncoder(
+        model_path=enc_cfg.get("model_path", "autogluon/chronos-2"),
+        pooling=enc_cfg.get("pooling", "mean"),
+        device=enc_cfg.get("device", "auto"),
+        context_length=enc_cfg.get("context_length"),
+        batch_size=enc_cfg.get("batch_size", 256),
+        torch_dtype=enc_cfg.get("torch_dtype", "float32"),
+    )
 
 
 def main(argv=None):
@@ -22,15 +34,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
-    enc_cfg = cfg["encoder"]
-    encoder = Chronos2RetrieverEncoder(
-        model_path=enc_cfg.get("model_path", "autogluon/chronos-2"),
-        pooling=enc_cfg.get("pooling", "mean"),
-        device=enc_cfg.get("device", "cpu"),
-        context_length=enc_cfg.get("context_length"),
-        batch_size=enc_cfg.get("batch_size", 256),
-        torch_dtype=enc_cfg.get("torch_dtype", "float32"),
-    )
+    encoder = build_encoder_from_config(cfg)
 
     result = build_battery_memory_bank(
         cfg=cfg,

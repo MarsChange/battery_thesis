@@ -26,7 +26,17 @@ Cross-learning / batch coupling
 
 from __future__ import annotations
 
+import os
 from typing import Literal, Optional, Union
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 import torch
@@ -57,7 +67,7 @@ class Chronos2RetrieverEncoder:
         self,
         model_path: str = "autogluon/chronos-2",
         pooling: Literal["mean", "last"] = "mean",
-        device: str = "cpu",
+        device: str = "auto",
         context_length: Optional[int] = None,
         batch_size: int = 256,
         torch_dtype: str = "float32",
@@ -67,7 +77,7 @@ class Chronos2RetrieverEncoder:
 
         self.model_path = model_path
         self.pooling = pooling
-        self.device = device
+        self.device = self.resolve_device(device)
         self.context_length = context_length
         self.batch_size = batch_size
         self.torch_dtype_str = torch_dtype
@@ -75,11 +85,71 @@ class Chronos2RetrieverEncoder:
         # Lazy-load to avoid import overhead when just configuring
         self._pipeline = None
 
+    @staticmethod
+    def _mps_available() -> bool:
+        return bool(
+            getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()
+            and torch.backends.mps.is_built()
+        )
+
+    @classmethod
+    def detect_best_device(cls) -> str:
+        if torch.cuda.is_available():
+            return "cuda"
+        if cls._mps_available():
+            return "mps"
+        return "cpu"
+
+    @classmethod
+    def resolve_device(cls, requested: Optional[str]) -> str:
+        requested = (requested or "auto").strip().lower()
+        if requested in {"", "auto"}:
+            resolved = cls.detect_best_device()
+            print(f"[Chronos2] Auto-detected device='{resolved}'.", flush=True)
+            return resolved
+
+        if requested.startswith("cuda"):
+            if torch.cuda.is_available():
+                return requested
+            fallback = cls.detect_best_device()
+            print(
+                f"[Chronos2] Requested device='{requested}' is unavailable. "
+                f"Falling back to '{fallback}'.",
+                flush=True,
+            )
+            return fallback
+
+        if requested == "mps":
+            if cls._mps_available():
+                return requested
+            fallback = cls.detect_best_device()
+            print(
+                f"[Chronos2] Requested device='mps' is unavailable. "
+                f"Falling back to '{fallback}'.",
+                flush=True,
+            )
+            return fallback
+
+        if requested == "cpu":
+            return requested
+
+        print(
+            f"[Chronos2] Unknown device='{requested}'. Falling back to auto detection.",
+            flush=True,
+        )
+        return cls.detect_best_device()
+
     # ------------------------------------------------------------------
     # Lazy model loading
     # ------------------------------------------------------------------
 
     def _load_pipeline(self):
+        print(
+            f"[Chronos2] Loading model '{self.model_path}' on device='{self.device}' "
+            f"with dtype='{self.torch_dtype_str}'...",
+            flush=True,
+        )
         from chronos import Chronos2Pipeline
 
         dtype_map = {
@@ -94,6 +164,7 @@ class Chronos2RetrieverEncoder:
             device_map=self.device,
             dtype=torch_dtype,
         )
+        print("[Chronos2] Model loaded.", flush=True)
 
     @property
     def pipeline(self):

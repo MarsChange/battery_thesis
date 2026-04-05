@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from retrieval.build_db import build_and_save
 from retrieval.search import RetrieverSearcher
@@ -21,6 +22,21 @@ def _default_db_specs(cfg: Dict[str, object]) -> List[Dict[str, object]]:
     if db_specs:
         return list(db_specs)
     return [{"name": cfg.get("db_name", "source_bank"), "include_splits": ["source_train"]}]
+
+
+def encode_memory_samples(
+    memory_samples,
+    encoder,
+    batch_size: int,
+) -> np.ndarray:
+    if not memory_samples:
+        return np.zeros((0, 0), dtype=np.float32)
+    all_embeddings = []
+    for start in tqdm(range(0, len(memory_samples), batch_size), desc="Encoding all memory samples"):
+        batch_samples = memory_samples[start : start + batch_size]
+        batch = np.stack([sample.window_tokens for sample in batch_samples])
+        all_embeddings.append(encoder.encode(batch))
+    return np.concatenate(all_embeddings, axis=0).astype(np.float32)
 
 
 def build_dataset_summary(
@@ -92,14 +108,18 @@ def build_battery_memory_bank(
 ) -> Dict[str, object]:
     output_dir = Path(cfg.get("output_dir", "output/battery_memory_bank"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Battery] Output directory: {output_dir}", flush=True)
 
+    print("[Battery] Loading dataset adapters...", flush=True)
     cells = assign_cell_uids(
         load_enabled_cells(cfg),
         prefix=str(cfg.get("cell_uid_prefix", "cell")),
     )
     if not cells:
         raise ValueError("No cells were loaded; check dataset roots and config.")
+    print(f"[Battery] Loaded {len(cells)} cells.", flush=True)
 
+    print("[Battery] Building cell-level split manifest...", flush=True)
     split_manifest = build_split_manifest(
         cells,
         cfg.get("split", {}),
@@ -107,10 +127,17 @@ def build_battery_memory_bank(
     )
     assert_no_split_leakage(split_manifest)
 
+    print("[Battery] Combining canonical cycle tables...", flush=True)
     canonical_cycles = combine_canonical_cycles(cells)
     canonical_path = output_dir / "canonical_cycles.parquet"
     canonical_cycles.to_parquet(canonical_path, index=False)
+    print(
+        f"[Battery] Wrote canonical cycles: {canonical_path} "
+        f"({len(canonical_cycles)} rows)",
+        flush=True,
+    )
 
+    print("[Battery] Building window-level memory samples...", flush=True)
     memory_samples, memory_df = build_memory_samples(
         canonical_cycles,
         split_manifest,
@@ -119,19 +146,36 @@ def build_battery_memory_bank(
     )
     memory_path = output_dir / "memory_samples.parquet"
     memory_df.to_parquet(memory_path, index=False)
+    print(
+        f"[Battery] Wrote memory samples: {memory_path} "
+        f"({len(memory_samples)} samples)",
+        flush=True,
+    )
+
+    batch_size = int(cfg.get("encoder", {}).get("batch_size", 256))
+    if encoder is not None and bool(cfg.get("save_all_memory_embeddings", True)):
+        print("[Battery] Saving all-memory embedding cache...", flush=True)
+        all_embeddings = encode_memory_samples(memory_samples, encoder, batch_size=batch_size)
+        np.save(output_dir / "all_memory_embeddings.npy", all_embeddings)
+        print("[Battery] Saved all_memory_embeddings.npy", flush=True)
 
     split_path = output_dir / "split_manifest.csv"
     split_manifest.to_csv(split_path, index=False)
+    print(f"[Battery] Wrote split manifest: {split_path}", flush=True)
 
     db_outputs = []
     metric = cfg.get("retrieval", {}).get("metric", "cosine")
-    batch_size = int(cfg.get("encoder", {}).get("batch_size", 256))
     for db_spec in _default_db_specs(cfg):
         include_splits = set(db_spec.get("include_splits", ["source_train"]))
         selected_samples = [sample for sample in memory_samples if sample.split in include_splits]
         if not selected_samples:
             continue
         db_name = str(db_spec["name"])
+        print(
+            f"[Battery] Building vector DB '{db_name}' from splits={sorted(include_splits)} "
+            f"with {len(selected_samples)} samples...",
+            flush=True,
+        )
         build_and_save(
             samples=[sample.to_window_sample() for sample in selected_samples],
             encoder=encoder,
@@ -148,9 +192,11 @@ def build_battery_memory_bank(
     summary = build_dataset_summary(canonical_cycles, split_manifest, memory_df)
     summary_path = output_dir / "dataset_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True))
+    print(f"[Battery] Wrote dataset summary: {summary_path}", flush=True)
 
     validation = None
     if run_search_validation and db_outputs:
+        print("[Battery] Running validation search...", flush=True)
         validation = run_validation_search(
             output_dir=output_dir,
             db_name=db_outputs[0]["name"],
@@ -162,6 +208,7 @@ def build_battery_memory_bank(
         if validation is not None:
             validation_path = output_dir / "validation_search.json"
             validation_path.write_text(json.dumps(validation, indent=2, ensure_ascii=True))
+            print(f"[Battery] Wrote validation search: {validation_path}", flush=True)
 
     return {
         "output_dir": str(output_dir),

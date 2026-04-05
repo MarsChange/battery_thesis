@@ -74,6 +74,20 @@ def build_database(
     if not samples:
         raise ValueError("Cannot build a database from an empty sample list.")
 
+    print(
+        f"[Retrieval] Building FAISS database for {len(samples)} samples "
+        f"(metric={metric}, batch_size={encode_batch_size})",
+        flush=True,
+    )
+
+    if hasattr(encoder, "embedding_dim"):
+        try:
+            dim = encoder.embedding_dim
+            print(f"[Retrieval] Encoder ready (embedding_dim={dim}).", flush=True)
+        except Exception:
+            print("[Retrieval] Encoder initialization failed while probing embedding_dim.", flush=True)
+            raise
+
     # Batch-encode without stacking the full dataset in memory.
     all_embeddings: List[np.ndarray] = []
     N = len(samples)

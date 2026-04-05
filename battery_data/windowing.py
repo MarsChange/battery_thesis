@@ -6,8 +6,93 @@ import numpy as np
 import pandas as pd
 
 from .domain_labeling import build_domain_label
-from .features import parse_json_list, recent_delta_mean, serialize_json
+from .features import augment_cycle_feature_frame, parse_json_list, recent_delta_mean, serialize_json
 from .schema import BatteryMemorySample, DEFAULT_TOKEN_FEATURES
+
+
+def _robust_center_scale(values: pd.Series) -> pd.Series:
+    valid = values.replace([np.inf, -np.inf], np.nan).dropna()
+    if valid.empty:
+        return values
+    median = float(valid.median())
+    mad = float((valid - median).abs().median())
+    if mad > 1e-8:
+        return (values - median) / (1.4826 * mad)
+    scale = float(valid.abs().quantile(0.95)) if len(valid) > 1 else float(abs(valid.iloc[0]))
+    if scale < 1e-8:
+        scale = 1.0
+    return (values - median) / scale
+
+
+def _quantile_abs_scale(values: pd.Series) -> pd.Series:
+    valid = values.replace([np.inf, -np.inf], np.nan).abs().dropna()
+    if valid.empty:
+        return values
+    scale = float(valid.quantile(0.95))
+    if scale < 1e-8:
+        scale = float(valid.max()) if not valid.empty else 1.0
+    if scale < 1e-8:
+        scale = 1.0
+    return values / scale
+
+
+def _normalize_feature_values(values: pd.Series, feature: str, normalization: str) -> pd.Series:
+    if normalization != "cell_relative":
+        return values
+
+    if feature in {"soh", "capacity_ratio"}:
+        return values
+    if feature == "soh_pct":
+        return values / 100.0
+    if feature == "capacity":
+        valid = values.replace([np.inf, -np.inf], np.nan).dropna()
+        scale = float(valid.iloc[0]) if not valid.empty and abs(valid.iloc[0]) > 1e-8 else 1.0
+        return values / scale
+
+    if (
+        feature.startswith("voltage_")
+        and "_fft_" not in feature
+        and not feature.endswith("_range")
+        and "_diff_" not in feature
+        and "_slope_" not in feature
+        and "_std_" not in feature
+    ):
+        return _robust_center_scale(values)
+    if (
+        feature.startswith("temp_")
+        and "_fft_" not in feature
+        and not feature.endswith("_range")
+        and "_diff_" not in feature
+        and "_slope_" not in feature
+        and "_std_" not in feature
+    ):
+        return _robust_center_scale(values)
+    if feature in {"current_mean", "current_max", "current_min", "current_abs_mean"}:
+        return _robust_center_scale(values)
+
+    if (
+        feature.endswith("_diff_1")
+        or feature.endswith("_delta_1")
+        or "_slope_" in feature
+        or "_std_" in feature
+        or feature.endswith("_range")
+    ):
+        return _quantile_abs_scale(values)
+
+    if "_fft_entropy_" in feature or "_fft_low_ratio_" in feature:
+        return values
+
+    if feature in {
+        "charge_throughput",
+        "discharge_throughput",
+        "energy_charge",
+        "energy_discharge",
+        "cc_time",
+        "cv_time",
+    }:
+        return _quantile_abs_scale(values)
+
+    return values
 
 
 def build_cycle_token_matrix(
@@ -21,25 +106,7 @@ def build_cycle_token_matrix(
             values = pd.Series([0.0] * len(cell_cycles), dtype="float32")
         else:
             values = pd.to_numeric(cell_cycles[feature], errors="coerce").astype("float32")
-        if normalization == "cell_relative":
-            if feature == "capacity":
-                valid = values.replace([np.inf, -np.inf], np.nan).dropna()
-                scale = float(valid.iloc[0]) if not valid.empty and valid.iloc[0] != 0 else 1.0
-                values = values / scale
-            elif feature in {
-                "charge_throughput",
-                "discharge_throughput",
-                "energy_charge",
-                "energy_discharge",
-                "current_mean",
-                "current_max",
-                "current_min",
-                "cc_time",
-                "cv_time",
-            }:
-                valid = values.replace([np.inf, -np.inf], np.nan).abs().dropna()
-                scale = float(valid.max()) if not valid.empty and valid.max() != 0 else 1.0
-                values = values / scale
+        values = _normalize_feature_values(values, feature, normalization)
         values = values.fillna(0.0)
         columns.append(values.to_numpy(dtype=np.float32))
     return np.stack(columns, axis=-1)
@@ -90,6 +157,10 @@ def build_memory_samples(
     slope_window = int(memory_cfg.get("slope_window", 5))
     token_features = list(memory_cfg.get("token_features", DEFAULT_TOKEN_FEATURES))
     normalization = str(memory_cfg.get("token_normalization", "cell_relative"))
+    derived_cfg = memory_cfg.get("derived_features", {})
+    rolling_window = int(derived_cfg.get("rolling_window", 5))
+    spectral_window = int(derived_cfg.get("spectral_window", 16))
+    spectral_columns = list(derived_cfg.get("spectral_columns", ["voltage_mean", "temp_mean", "current_mean"]))
 
     manifest_map = split_manifest.set_index("cell_uid").to_dict(orient="index")
     memory_samples: List[BatteryMemorySample] = []
@@ -99,7 +170,13 @@ def build_memory_samples(
         cell_cycles = cell_cycles.sort_values("cycle_idx").reset_index(drop=True)
         manifest_row = manifest_map[cell_uid]
         split = manifest_row["split"]
-        token_matrix = build_cycle_token_matrix(cell_cycles, token_features, normalization)
+        token_frame = augment_cycle_feature_frame(
+            cell_cycles,
+            rolling_window=rolling_window,
+            spectral_window=spectral_window,
+            spectral_columns=spectral_columns,
+        )
+        token_matrix = build_cycle_token_matrix(token_frame, token_features, normalization)
         soh_values = pd.to_numeric(cell_cycles["soh"], errors="coerce").to_numpy(dtype=np.float32)
 
         max_start = len(cell_cycles) - lookback - horizon + 1
