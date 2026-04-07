@@ -74,6 +74,7 @@ def main(argv=None):
     cfg = load_config(args.config)
     db_spec = choose_db_spec(cfg, db_name=args.db_name)
     output_dir = Path(cfg.get("output_dir", "output/battery_memory_bank"))
+    all_memory_embeddings_path = output_dir / "all_memory_embeddings.npy"
     offline_ready = all(
         path.exists()
         for path in [
@@ -87,7 +88,19 @@ def main(argv=None):
     )
 
     encoder = None
-    if not offline_ready:
+    # Even when the FAISS DB already exists, we still need an encoder for
+    # out-of-index queries (e.g. target_query) if all_memory_embeddings.npy
+    # is unavailable.
+    need_encoder = (not offline_ready) or (not all_memory_embeddings_path.exists()) or (args.max_eval_queries > 0)
+    if need_encoder:
+        reason = []
+        if not offline_ready:
+            reason.append("retrieval artifacts are incomplete")
+        if not all_memory_embeddings_path.exists():
+            reason.append("all_memory_embeddings.npy is missing")
+        if args.max_eval_queries > 0:
+            reason.append("evaluation queries require on-the-fly encoding")
+        print(f"[EvalCLI] Loading encoder because {', '.join(reason)}.", flush=True)
         encoder = build_encoder_from_config(cfg)
 
     result = run_retrieval_visual_evaluation(

@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from battery_data.canonicalize import finalize_canonical_cell_frame
+from battery_data.features import bucket_temperature
 from battery_data.schema import CanonicalCell
 
 CHEMISTRY_BY_FOLDER = {
@@ -37,19 +38,16 @@ def _infer_tju_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object]
     match = re.match(r"CY(?P<temp>\d+)-(?P<rate>[0-9]+)_(?P<group>\d+)-#(?P<cell>\d+)", path.stem)
     charge_rate = None
     temperature_bucket = cfg.get("temperature_bucket")
+    temperature_c = None
     if match:
         charge_rate = _parse_rate_token(match.group("rate"))
+        temperature_c = float(match.group("temp"))
         if temperature_bucket is None:
-            temperature = float(match.group("temp"))
-            if temperature < 30:
-                temperature_bucket = "room"
-            elif temperature < 40:
-                temperature_bucket = "warm"
-            else:
-                temperature_bucket = "hot"
+            temperature_bucket = bucket_temperature(temperature_c)
     return {
         "chemistry_family": chemistry,
         "temperature_bucket": temperature_bucket,
+        "temperature_c": temperature_c,
         "charge_rate_c": charge_rate,
         "discharge_policy_family": "regular",
         "full_or_partial": "full",
@@ -76,6 +74,8 @@ def load_tju_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
         "cycle number",
     ]
     for path in paths:
+        metadata = _infer_tju_metadata(path, cfg)
+        temperature_c = metadata.get("temperature_c")
         df = pd.read_csv(path, usecols=usecols)
         grouped = df.groupby("cycle number", sort=True)
         rows = []
@@ -107,9 +107,9 @@ def load_tju_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                     "current_mean": float(current_a.mean()),
                     "current_max": float(current_a.max()),
                     "current_min": float(current_a.min()),
-                    "temp_mean": np.nan,
-                    "temp_max": np.nan,
-                    "temp_min": np.nan,
+                    "temp_mean": temperature_c,
+                    "temp_max": temperature_c,
+                    "temp_min": temperature_c,
                     "cc_time": _duration(cc_rows),
                     "cv_time": _duration(cv_rows),
                     "charge_throughput": float(charge_capacity),
@@ -121,7 +121,8 @@ def load_tju_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
         base = pd.DataFrame(rows).sort_values("cycle_idx").reset_index(drop=True)
         base["charge_throughput"] = base["charge_throughput"].fillna(0).cumsum()
         base["discharge_throughput"] = base["discharge_throughput"].fillna(0).cumsum()
-        canonical = finalize_canonical_cell_frame(base, _infer_tju_metadata(path, cfg), cfg)
+        metadata.pop("temperature_c", None)
+        canonical = finalize_canonical_cell_frame(base, metadata, cfg)
         cells.append(
             CanonicalCell(
                 source_dataset="tju",

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from battery_data.canonicalize import finalize_canonical_cell_frame
+from battery_data.features import bucket_temperature
 from battery_data.schema import CanonicalCell
 
 
@@ -40,6 +41,24 @@ def _infer_xjtu_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object
     }
 
 
+def _load_xjtu_temperature_frame(summary_path: Path) -> pd.DataFrame | None:
+    data_path = summary_path.with_name(summary_path.name.replace("_summary.csv", "_data.csv"))
+    if not data_path.exists():
+        return None
+
+    df = pd.read_csv(data_path, usecols=["cycle_index", "temperature_C"])
+    if df.empty:
+        return None
+
+    grouped = (
+        df.groupby("cycle_index", sort=True)["temperature_C"]
+        .agg(temp_mean="mean", temp_max="max", temp_min="min")
+        .reset_index()
+        .rename(columns={"cycle_index": "cycle_idx"})
+    )
+    return grouped
+
+
 def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     root = Path(cfg["root"])
     paths = sorted(root.glob("Batch-*/*_summary.csv"))
@@ -50,6 +69,7 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     cells: List[CanonicalCell] = []
     for path in paths:
         df = pd.read_csv(path)
+        temp_frame = _load_xjtu_temperature_frame(path)
         base = pd.DataFrame(
             {
                 "cycle_idx": df["cycle_index"].astype(int),
@@ -72,7 +92,19 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 "energy_discharge": df["discharge_power_Wh"].astype(float),
             }
         )
-        canonical = finalize_canonical_cell_frame(base, _infer_xjtu_metadata(path, cfg), cfg)
+        if temp_frame is not None:
+            base = base.merge(temp_frame, on="cycle_idx", how="left", suffixes=("", "_from_data"))
+            for column in ["temp_mean", "temp_max", "temp_min"]:
+                merged_col = f"{column}_from_data"
+                if merged_col in base.columns:
+                    base[column] = base[merged_col]
+                    base = base.drop(columns=[merged_col])
+
+        metadata = _infer_xjtu_metadata(path, cfg)
+        if metadata.get("temperature_bucket") is None and base["temp_mean"].notna().any():
+            metadata["temperature_bucket"] = bucket_temperature(base["temp_mean"].median())
+
+        canonical = finalize_canonical_cell_frame(base, metadata, cfg)
         cells.append(
             CanonicalCell(
                 source_dataset="xjtu",

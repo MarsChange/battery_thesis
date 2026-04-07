@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -369,8 +370,24 @@ def plot_query_and_neighbors(
     display_mode: str = "zscore",
 ) -> str:
     output_path = str(output_path)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-    axes = axes.flatten()
+    n_rows = 1 + len(neighbor_samples)
+    n_cols = max(1, len(series_columns))
+    left_margin = 0.17 if n_cols >= 4 else 0.21
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.2 * n_cols, 2.8 * n_rows),
+        constrained_layout=False,
+        squeeze=False,
+    )
+    fig.subplots_adjust(
+        left=left_margin,
+        right=0.985,
+        top=0.92,
+        bottom=0.075,
+        wspace=0.18,
+        hspace=0.28,
+    )
 
     color_map = {
         "soh": "#1f77b4",
@@ -387,11 +404,14 @@ def plot_query_and_neighbors(
         context_length=plot_context_length,
         mode="raw",
     )
-    neighbor_plot_data = []
-    all_y = []
-    for series in query_series_map.values():
-        if len(series):
-            all_y.append(_normalize_for_plot(series, display_mode))
+    plot_rows = [
+        {
+            "row_label": f"Query | {query_sample.cell_uid} | {query_sample.domain_label}",
+            "x": query_x,
+            "series_map": query_series_map,
+            "highlight": query_highlight,
+        }
+    ]
     for neighbor_sample in neighbor_samples:
         x, series_map, highlight = get_multivariate_series_from_sample(
             neighbor_sample,
@@ -400,64 +420,137 @@ def plot_query_and_neighbors(
             context_length=plot_context_length,
             mode="raw",
         )
-        neighbor_plot_data.append((x, series_map, highlight))
-        for series in series_map.values():
-            if len(series):
+        plot_rows.append(
+            {
+                "row_label": (
+                    f"Top-{len(plot_rows)} | {neighbor_sample.cell_uid} | {neighbor_sample.domain_label}\n"
+                    f"Index={index_scores[len(plot_rows)-1]:.4f} | "
+                    f"TSRAG-L2={tsrag_l2_scores[len(plot_rows)-1]:.4f} | "
+                    f"MultiShape={multivariate_shape_scores[len(plot_rows)-1]:.4f}"
+                ),
+                "x": x,
+                "series_map": series_map,
+                "highlight": highlight,
+            }
+        )
+
+    y_lims: Dict[str, tuple[float, float]] = {}
+    for column in series_columns:
+        all_y = []
+        for row in plot_rows:
+            series = row["series_map"].get(column)
+            if series is not None and len(series):
                 all_y.append(_normalize_for_plot(series, display_mode))
+        if all_y:
+            y_min = min(float(np.min(y)) for y in all_y if len(y))
+            y_max = max(float(np.max(y)) for y in all_y if len(y))
+            y_pad = 0.08 * max(y_max - y_min, 1.0)
+            y_lims[column] = (y_min - y_pad, y_max + y_pad)
+        else:
+            y_lims[column] = (-1.2, 1.2)
 
-    if all_y:
-        y_min = min(float(np.min(y)) for y in all_y if len(y))
-        y_max = max(float(np.max(y)) for y in all_y if len(y))
-        y_pad = 0.08 * max(y_max - y_min, 1.0)
-    else:
-        y_min, y_max, y_pad = -1.0, 1.0, 0.2
-
-    _plot_multivariate_subplot(
-        ax=axes[0],
-        x=query_x,
-        series_map=query_series_map,
-        highlight=query_highlight,
-        title=f"Query | {query_sample.cell_uid} | {query_sample.domain_label}",
-        series_columns=series_columns,
-        color_map=color_map,
-        display_mode=display_mode,
-        y_lim=(y_min - y_pad, y_max + y_pad),
-        show_legend=True,
-    )
-
-    for idx, (neighbor_sample, index_score, tsrag_l2_score, multivariate_shape_score, plot_data) in enumerate(
-        zip(neighbor_samples, index_scores, tsrag_l2_scores, multivariate_shape_scores, neighbor_plot_data),
-        start=1,
-    ):
-        ax = axes[idx]
-        x, series_map, highlight = plot_data
-        _plot_multivariate_subplot(
-            ax=ax,
-            x=x,
-            series_map=series_map,
-            highlight=highlight,
-            title="Top-{} | {} | {}\nIndex={:.4f} | TSRAG-L2={:.4f} | MultiShape={:.4f}".format(
-                idx,
-                neighbor_sample.cell_uid,
-                neighbor_sample.domain_label,
-                index_score,
-                tsrag_l2_score,
-                multivariate_shape_score,
-            ),
-            series_columns=series_columns,
-            color_map=color_map,
-            display_mode=display_mode,
-            y_lim=(y_min - y_pad, y_max + y_pad),
-            show_legend=False,
+    for row_idx, row in enumerate(plot_rows):
+        for col_idx, column in enumerate(series_columns):
+            ax = axes[row_idx, col_idx]
+            x = row["x"]
+            series = row["series_map"].get(column)
+            highlight = row["highlight"]
+            _plot_single_series_subplot(
+                ax=ax,
+                x=x,
+                y=series,
+                highlight=highlight,
+                column=column,
+                color=color_map.get(column, "#1f77b4"),
+                display_mode=display_mode,
+                y_lim=y_lims[column],
+                show_title=(row_idx == 0),
+                show_ylabel=(col_idx == 0),
+                show_xlabel=(row_idx == n_rows - 1),
+            )
+        first_ax = axes[row_idx, 0]
+        bbox = first_ax.get_position()
+        fig.text(
+            0.02,
+            (bbox.y0 + bbox.y1) / 2.0,
+            _format_row_label(row["row_label"]),
+            ha="left",
+            va="center",
+            fontsize=9,
+            linespacing=1.15,
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": "white",
+                "edgecolor": "#dddddd",
+                "alpha": 0.96,
+            },
         )
 
     fig.suptitle(
-        f"Battery Retrieval Top-{len(neighbor_samples)} (features={','.join(series_columns)}, context={plot_context_length}, mode={display_mode})",
+        f"Battery Retrieval Top-{len(neighbor_samples)} Grid (features={','.join(series_columns)}, context={plot_context_length}, mode={display_mode})",
         fontsize=14,
     )
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
     return output_path
+
+
+def _plot_single_series_subplot(
+    ax,
+    x: np.ndarray,
+    y: Optional[np.ndarray],
+    highlight: tuple[int, int],
+    column: str,
+    color: str,
+    display_mode: str,
+    y_lim: tuple[float, float],
+    show_title: bool,
+    show_ylabel: bool,
+    show_xlabel: bool,
+) -> None:
+    raw = np.asarray(y if y is not None else np.zeros((0,), dtype=np.float32), dtype=np.float32)
+    y_plot = _normalize_for_plot(raw, display_mode) if len(raw) else raw
+    if len(y_plot):
+        ax.plot(x, y_plot, color=color, linewidth=2)
+    else:
+        ax.text(0.5, 0.5, "missing", ha="center", va="center", transform=ax.transAxes, fontsize=9)
+    if len(x):
+        h_start = x[highlight[0]]
+        h_end = x[min(highlight[1] - 1, len(x) - 1)]
+        ax.axvspan(h_start, h_end, color="#9ecae1", alpha=0.18)
+
+    if display_mode == "zscore" and len(raw) and float(np.nanstd(raw)) < 1e-8:
+        ax.text(
+            0.03,
+            0.92,
+            f"constant={float(raw[0]):.2f}",
+            transform=ax.transAxes,
+            fontsize=8,
+            color=color,
+            va="top",
+        )
+
+    if show_title:
+        ax.set_title(column)
+    if show_ylabel:
+        ax.set_ylabel(f"Value ({display_mode})")
+    if show_xlabel:
+        ax.set_xlabel("Cycle Index")
+    else:
+        ax.set_xlabel("")
+
+    ax.grid(alpha=0.3)
+    ax.set_ylim(*y_lim)
+
+
+def _format_row_label(row_label: str) -> str:
+    lines = []
+    for raw_line in row_label.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        lines.extend(textwrap.wrap(raw_line, width=28) or [""])
+    return "\n".join(lines)
 
 
 def _normalize_for_plot(values: np.ndarray, display_mode: str) -> np.ndarray:
@@ -582,6 +675,8 @@ def run_retrieval_visual_evaluation(
     query_embedding = None
     if all_memory_embeddings is not None and query_key in memory_index_by_key:
         query_embedding = all_memory_embeddings[memory_index_by_key[query_key]]
+    elif db_embeddings is not None and query_key in db_id_by_key:
+        query_embedding = db_embeddings[db_id_by_key[query_key]]
     elif encoder is not None:
         query_embedding = encoder.encode(np.asarray([query_sample.window_tokens], dtype=np.float32))[0]
 

@@ -9,15 +9,22 @@ import pandas as pd
 from battery_data.canonicalize import finalize_canonical_cell_frame
 from battery_data.schema import CanonicalCell
 
+HUST_CHEMISTRY_FAMILY = "LFP"
+HUST_TEMPERATURE_C = 30.0
+HUST_NOMINAL_CAPACITY_AH = 1.1
+HUST_NOMINAL_VOLTAGE_V = 3.3
+
 
 def _infer_hust_metadata(df: pd.DataFrame, cfg: Dict[str, object]) -> Dict[str, object]:
-    status_text = " ".join(df["Status"].dropna().astype(str).unique().tolist()).lower()
-    discharge_policy = "multistage" if "discharge_1" in status_text or "discharge_2" in status_text else "regular"
+    # HUST contains LFP/graphite cells cycled under multi-stage discharge
+    # protocols at a constant 30 C environment.
     return {
-        "chemistry_family": cfg.get("chemistry_family"),
-        "temperature_bucket": cfg.get("temperature_bucket"),
-        "discharge_policy_family": discharge_policy,
+        "chemistry_family": cfg.get("chemistry_family") or HUST_CHEMISTRY_FAMILY,
+        "temperature_bucket": cfg.get("temperature_bucket") or "room",
+        "discharge_policy_family": "multistage",
         "full_or_partial": "full",
+        "nominal_capacity_hint": cfg.get("nominal_capacity_hint", HUST_NOMINAL_CAPACITY_AH),
+        "nominal_voltage_hint": cfg.get("nominal_voltage_hint", HUST_NOMINAL_VOLTAGE_V),
         "voltage_min_hint": 2.0,
         "voltage_max_hint": 4.5,
     }
@@ -75,9 +82,9 @@ def load_hust_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                     "current_mean": float(current_a.mean()),
                     "current_max": float(current_a.max()),
                     "current_min": float(current_a.min()),
-                    "temp_mean": np.nan,
-                    "temp_max": np.nan,
-                    "temp_min": np.nan,
+                    "temp_mean": HUST_TEMPERATURE_C,
+                    "temp_max": HUST_TEMPERATURE_C,
+                    "temp_min": HUST_TEMPERATURE_C,
                     "cc_time": _duration(cc_mask),
                     "cv_time": _duration(cv_mask),
                     "charge_throughput": charge_capacity,
@@ -96,7 +103,13 @@ def load_hust_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 raw_cell_id=path.stem,
                 file_path=str(path),
                 cycles=canonical,
-                source_info={"battery_id": df["battery_id"].iloc[0] if "battery_id" in df.columns and not df.empty else path.stem},
+                source_info={
+                    "battery_id": df["battery_id"].iloc[0] if "battery_id" in df.columns and not df.empty else path.stem,
+                    "chemistry_family": HUST_CHEMISTRY_FAMILY,
+                    "nominal_capacity_ah": HUST_NOMINAL_CAPACITY_AH,
+                    "nominal_voltage_v": HUST_NOMINAL_VOLTAGE_V,
+                    "temperature_c": HUST_TEMPERATURE_C,
+                },
             )
         )
     return cells
