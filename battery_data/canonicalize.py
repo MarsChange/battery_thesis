@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import time
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,6 +19,114 @@ from .features import (
     stable_nominal_capacity,
 )
 from .schema import CANONICAL_COLUMNS, CANONICAL_NUMERIC_COLUMNS, CanonicalCell
+
+# ---------------------------------------------------------------------------
+# Adapter-level parquet cache
+# ---------------------------------------------------------------------------
+# Each adapter reads GB-scale raw CSVs and aggregates them into cycle-level
+# DataFrames.  This is the dominant cost when running cli_retrieval_eval.
+# We cache the result per-dataset so subsequent runs skip the raw parsing.
+#
+# Cache location: <dataset_root>/.canonical_cache/<fingerprint>.parquet
+#   + a companion .json with per-cell source_info.
+# The fingerprint is derived from the sorted list of raw file paths + their
+# mtime, so the cache auto-invalidates when files change.
+# ---------------------------------------------------------------------------
+
+_CACHE_DIR_NAME = ".canonical_cache"
+
+
+def _cache_fingerprint(root: Path, glob_pattern: str) -> str:
+    """Deterministic hash of (sorted file paths + mtimes) under *root*."""
+    entries = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and not p.name.startswith("."):
+            entries.append(f"{p.relative_to(root)}:{p.stat().st_mtime_ns}")
+    digest = hashlib.sha256("\n".join(entries).encode()).hexdigest()[:16]
+    return digest
+
+
+def _try_load_adapter_cache(
+    root: Path,
+    dataset_name: str,
+) -> Optional[List[CanonicalCell]]:
+    """Return cached CanonicalCells if a valid cache exists, else None."""
+    cache_dir = root / _CACHE_DIR_NAME
+    if not cache_dir.is_dir():
+        return None
+    # Find the most recent cache file for this dataset
+    parquet_files = sorted(cache_dir.glob(f"{dataset_name}_*.parquet"))
+    if not parquet_files:
+        return None
+    # Use the latest one
+    parquet_path = parquet_files[-1]
+    meta_path = parquet_path.with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+        with open(meta_path) as f:
+            cell_metas = json.load(f)
+    except Exception:
+        return None
+
+    # Reconstruct CanonicalCell objects
+    cells: List[CanonicalCell] = []
+    for meta in cell_metas:
+        cell_uid_or_id = meta["raw_cell_id"]
+        cell_df = df[df["_raw_cell_id"] == cell_uid_or_id].drop(columns=["_raw_cell_id"]).reset_index(drop=True)
+        cells.append(
+            CanonicalCell(
+                source_dataset=meta["source_dataset"],
+                raw_cell_id=meta["raw_cell_id"],
+                file_path=meta["file_path"],
+                cycles=cell_df,
+                source_info=meta.get("source_info", {}),
+            )
+        )
+    return cells
+
+
+def _save_adapter_cache(
+    root: Path,
+    dataset_name: str,
+    cells: List[CanonicalCell],
+) -> None:
+    """Persist adapter output so next run can skip raw CSV parsing."""
+    cache_dir = root / _CACHE_DIR_NAME
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Use timestamp as simple versioning
+    tag = str(int(time.time()))
+    parquet_path = cache_dir / f"{dataset_name}_{tag}.parquet"
+    meta_path = parquet_path.with_suffix(".json")
+
+    frames = []
+    cell_metas = []
+    for cell in cells:
+        frame = cell.cycles.copy()
+        frame["_raw_cell_id"] = cell.raw_cell_id
+        frames.append(frame)
+        cell_metas.append({
+            "source_dataset": cell.source_dataset,
+            "raw_cell_id": cell.raw_cell_id,
+            "file_path": cell.file_path,
+            "source_info": cell.source_info,
+        })
+
+    if frames:
+        combined = pd.concat(frames, ignore_index=True)
+        combined.to_parquet(parquet_path, index=False)
+    else:
+        pd.DataFrame().to_parquet(parquet_path, index=False)
+
+    with open(meta_path, "w") as f:
+        json.dump(cell_metas, f, ensure_ascii=True)
+
+    # Clean up older cache files for this dataset (keep only latest)
+    for old in sorted(cache_dir.glob(f"{dataset_name}_*.parquet")):
+        if old != parquet_path:
+            old.unlink(missing_ok=True)
+            old.with_suffix(".json").unlink(missing_ok=True)
 
 
 def finalize_canonical_cell_frame(
@@ -96,13 +207,36 @@ def load_enabled_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     from .adapters import ADAPTER_REGISTRY
 
     datasets_cfg = cfg.get("datasets", {})
+    use_cache = cfg.get("adapter_cache", True)  # enabled by default
     all_cells: List[CanonicalCell] = []
     for dataset_name, dataset_cfg in datasets_cfg.items():
         if not dataset_cfg or not dataset_cfg.get("enabled", True):
             continue
         if dataset_name not in ADAPTER_REGISTRY:
             raise KeyError(f"Unsupported dataset adapter: {dataset_name}")
-        all_cells.extend(ADAPTER_REGISTRY[dataset_name](dataset_cfg))
+
+        root = Path(dataset_cfg.get("root", ""))
+
+        # Try loading from parquet cache first
+        if use_cache and root.is_dir():
+            cached = _try_load_adapter_cache(root, dataset_name)
+            if cached is not None:
+                print(f"  [{dataset_name}] Loaded {len(cached)} cells from cache (skipped raw CSV parsing)", flush=True)
+                all_cells.extend(cached)
+                continue
+
+        # Fall back to full adapter (slow path: reads raw CSVs)
+        t0 = time.time()
+        cells = ADAPTER_REGISTRY[dataset_name](dataset_cfg)
+        elapsed = time.time() - t0
+        print(f"  [{dataset_name}] Parsed {len(cells)} cells from raw data in {elapsed:.1f}s", flush=True)
+
+        # Save cache for next time
+        if use_cache and root.is_dir() and cells:
+            _save_adapter_cache(root, dataset_name, cells)
+            print(f"  [{dataset_name}] Saved adapter cache to {root / _CACHE_DIR_NAME}/", flush=True)
+
+        all_cells.extend(cells)
     return all_cells
 
 
