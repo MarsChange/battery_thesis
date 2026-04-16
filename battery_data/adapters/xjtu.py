@@ -10,6 +10,8 @@ from battery_data.canonicalize import finalize_canonical_cell_frame
 from battery_data.features import bucket_temperature
 from battery_data.schema import CanonicalCell
 
+XJTU_CHEMISTRY_FAMILY = "NCM"
+
 
 def _infer_xjtu_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object]:
     stem = path.stem.replace("_summary", "")
@@ -33,7 +35,7 @@ def _infer_xjtu_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object
         full_or_partial = "partial"
 
     return {
-        "chemistry_family": cfg.get("chemistry_family"),
+        "chemistry_family": cfg.get("chemistry_family") or XJTU_CHEMISTRY_FAMILY,
         "temperature_bucket": cfg.get("temperature_bucket"),
         "charge_rate_c": charge_rate,
         "discharge_policy_family": discharge_policy,
@@ -111,7 +113,10 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 raw_cell_id=path.stem.replace("_summary", ""),
                 file_path=str(path),
                 cycles=canonical,
-                source_info={"batch": path.parent.name},
+                source_info={
+                    "batch": path.parent.name,
+                    "chemistry_family": XJTU_CHEMISTRY_FAMILY,
+                },
             )
         )
     return cells

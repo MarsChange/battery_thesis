@@ -10,6 +10,8 @@ import pandas as pd
 from battery_data.canonicalize import finalize_canonical_cell_frame
 from battery_data.schema import CanonicalCell
 
+MIT_CHEMISTRY_FAMILY = "LFP"
+
 
 def _infer_mit_metadata(summary_path: Path, meta_path: Path | None, cfg: Dict[str, object]) -> Dict[str, object]:
     protocol = None
@@ -25,7 +27,7 @@ def _infer_mit_metadata(summary_path: Path, meta_path: Path | None, cfg: Dict[st
             charge_rate = max(rates)
 
     return {
-        "chemistry_family": cfg.get("chemistry_family"),
+        "chemistry_family": cfg.get("chemistry_family") or MIT_CHEMISTRY_FAMILY,
         "temperature_bucket": cfg.get("temperature_bucket"),
         "charge_rate_c": charge_rate,
         "discharge_policy_family": "fastcharge",
@@ -76,7 +78,10 @@ def load_mit_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 raw_cell_id=summary_path.stem.replace("_structure_summary", ""),
                 file_path=str(summary_path),
                 cycles=canonical,
-                source_info={"meta_path": str(meta_path) if meta_path.exists() else None},
+                source_info={
+                    "meta_path": str(meta_path) if meta_path.exists() else None,
+                    "chemistry_family": MIT_CHEMISTRY_FAMILY,
+                },
             )
         )
     return cells
