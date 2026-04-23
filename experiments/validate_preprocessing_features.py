@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from battery_data.build_case_bank import build_case_bank, load_config
+from battery_data.feature_registry import write_features_markdown
 from experiments.plotting_utils import ensure_dir, save_bar, save_boxplot, save_heatmap
 from forecasting.metrics import horizon_metrics, regression_metrics
 
@@ -93,6 +94,8 @@ def _target_views(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
 
 def _flat_feature_table(rows: pd.DataFrame, arrays: Dict[str, np.ndarray], feature_names: Dict[str, object]) -> pd.DataFrame:
     records = []
+    operation_names = list(feature_names.get("operation", []))
+    future_operation_names = list(feature_names.get("future_operation", operation_names))
     for idx, row in rows.iterrows():
         anchor_cycle = arrays["cycle_stats"][idx, -1]
         qv_anchor = arrays["qv_maps"][idx, -1]
@@ -117,9 +120,13 @@ def _flat_feature_table(rows: pd.DataFrame, arrays: Dict[str, np.ndarray], featu
         record["relaxation_std"] = float(relax_anchor.std())
         for feat_idx, name in enumerate(feature_names["physics_feature_names"]):
             record[f"physics_{name}"] = float(physics_anchor[feat_idx])
+        op_mean = arrays["operation_seq"][idx].mean(axis=0)
+        future_op_mean = arrays["future_ops"][idx].mean(axis=0)
         for op_idx in range(arrays["operation_seq"].shape[-1]):
-            record[f"operation_{op_idx}"] = float(arrays["operation_seq"][idx].mean(axis=0)[op_idx])
-            record[f"future_operation_{op_idx}"] = float(arrays["future_ops"][idx].mean(axis=0)[op_idx])
+            op_name = operation_names[op_idx] if op_idx < len(operation_names) else f"unknown_operation_feature_{op_idx}"
+            future_name = future_operation_names[op_idx] if op_idx < len(future_operation_names) else f"unknown_future_operation_feature_{op_idx}"
+            record[f"operation_{op_name}"] = float(op_mean[op_idx])
+            record[f"future_operation_{future_name}"] = float(future_op_mean[op_idx])
         if arrays["tsfm_embedding"] is not None:
             for dim_idx in range(min(8, arrays["tsfm_embedding"].shape[-1])):
                 record[f"tsfm_{dim_idx}"] = float(arrays["tsfm_embedding"][idx, dim_idx])
@@ -350,6 +357,7 @@ def validate_preprocessing_features(cfg: Dict[str, object]) -> Dict[str, object]
         (output_dir / "run_config.yaml").write_text(json.dumps(cfg, indent=2, ensure_ascii=True))
     (output_dir / "run_metadata.json").write_text(json.dumps({"run_id": run_id, "case_bank_dir": str(case_bank_dir)}, indent=2, ensure_ascii=True))
     (output_dir / "experiment.log").write_text("feature validation started\n")
+    write_features_markdown(output_dir / "FEATURES.md")
 
     availability = _availability_rows(rows, arrays)
     availability_summary = availability.drop(columns=["case_id", "split", "chemistry_family", "domain_label"]).mean().to_dict()

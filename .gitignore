@@ -3,9 +3,9 @@ output
 **/__pycache__
 datasets
 docs
-configs
 tests
 .pytest_cache
 .vscode
 models
 .DS_Store
+PROJECT_CODE.md

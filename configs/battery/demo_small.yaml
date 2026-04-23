@@ -1,0 +1,86 @@
+encoder:
+  model_path: "autogluon/chronos-2"
+  pooling: "mean"
+  device: "auto"
+  context_length: null
+  batch_size: 8
+  torch_dtype: "float32"
+
+datasets:
+  xjtu:
+    enabled: true
+    root: "datasets/xjtu_dataset"
+    max_cells: 1
+  tju:
+    enabled: true
+    root: "datasets/TJU_dataset"
+    max_cells: 1
+  hust:
+    enabled: true
+    root: "datasets/HUST_dataset"
+    max_cells: 1
+  mit:
+    enabled: true
+    root: "datasets/MIT_dataset"
+    max_cells: 1
+
+memory:
+  lookback_length: 16
+  prediction_length: 4
+  stride: 4
+  slope_window: 4
+  token_normalization: "cell_relative"
+  derived_features:
+    rolling_window: 5
+    spectral_window: 16
+    spectral_columns:
+      - "voltage_mean"
+      - "temp_mean"
+      - "current_mean"
+  token_features:
+    - "soh"
+    - "soh_diff_1"
+    - "soh_slope_5"
+    - "voltage_mean"
+    - "voltage_range"
+    - "voltage_mean_diff_1"
+    - "voltage_mean_fft_entropy_16"
+    - "temp_mean"
+    - "temp_range"
+    - "temp_mean_diff_1"
+    - "temp_mean_fft_entropy_16"
+    - "current_abs_mean"
+    - "current_mean_diff_1"
+    - "current_mean_fft_entropy_16"
+    - "cc_time"
+    - "cv_time"
+    - "charge_throughput_delta_1"
+    - "energy_charge_delta_1"
+
+split:
+  strategy: "default-main"
+  source_datasets: ["xjtu", "hust", "tju"]
+  target_datasets: ["mit"]
+  source_val_frac: 0.34
+  few_shot_k_cells: 0
+  random_seed: 7
+
+domain_labeling:
+  fallback_chemistry: "Unknown"
+  fallback_policy: "regular"
+  fallback_full: "full"
+
+retrieval:
+  metric: "cosine"
+  top_k: 3
+
+vector_dbs:
+  - name: "source_bank"
+    include_splits: ["source_train"]
+
+output_dir: "output/battery_memory_bank_demo_small"
+db_name: "source_bank"
+cell_uid_prefix: "cell"
+nominal_capacity_window: 5
+soh_skip_initial_cycles: 0
+save_all_memory_embeddings: true

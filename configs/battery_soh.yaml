@@ -1,0 +1,189 @@
+output_dir: output/case_bank
+model_output_dir: output/forecasting
+random_seed: 7
+cell_uid_prefix: cell
+adapter_cache: true
+nominal_capacity_window: 5
+soh_skip_initial_cycles: 0
+
+encoder:
+  model_path: models/chronos-2
+  pooling: mean
+  device: auto
+  context_length: null
+  batch_size: 32
+  torch_dtype: float32
+
+datasets:
+  xjtu:
+    enabled: true
+    root: datasets/xjtu_dataset
+  tju:
+    enabled: true
+    root: datasets/TJU_dataset
+  hust:
+    enabled: true
+    root: datasets/HUST_dataset
+  mit:
+    enabled: true
+    root: datasets/MIT_dataset
+
+split:
+  strategy: default-main
+  source_datasets: ["xjtu", "hust", "tju"]
+  target_datasets: ["mit"]
+  source_val_frac: 0.2
+  few_shot_k_cells: 1
+  random_seed: 7
+
+memory:
+  lookback_length: 32
+  prediction_length: 8
+  stride: 1
+  target_type: delta_soh
+  token_normalization: cell_relative
+  slope_window: 5
+  derived_features:
+    rolling_window: 5
+    spectral_window: 16
+    spectral_columns:
+      - voltage_mean
+      - temp_mean
+      - current_mean
+  token_features:
+    - soh
+    - soh_diff_1
+    - soh_slope_5
+    - voltage_mean
+    - voltage_range
+    - voltage_mean_diff_1
+    - voltage_mean_std_5
+    - voltage_mean_fft_entropy_16
+    - temp_mean
+    - temp_range
+    - temp_mean_diff_1
+    - temp_mean_std_5
+    - temp_mean_fft_entropy_16
+    - current_abs_mean
+    - current_mean_diff_1
+    - current_mean_std_5
+    - current_mean_fft_entropy_16
+    - cc_time
+    - cv_time
+    - charge_throughput_delta_1
+    - discharge_throughput_delta_1
+    - energy_charge_delta_1
+    - energy_discharge_delta_1
+
+features:
+  q_grid_size: 100
+  partial_charge_segments: 50
+  relaxation_points: 30
+  relaxation_time_max_minutes: 30
+  current_rest_threshold: 0.02
+  rolling_median_window: 5
+  normalize_using: source_train
+  use_batlinet_qv_map: true
+  use_partial_charge_curve: true
+  use_relaxation_curve: true
+  use_physics_features: true
+  future_ops_mode: known
+
+retrieval:
+  retrieval_feature_config_path: configs/rag_retrieval_features.yaml
+  db_splits: ["source_train"]
+  metric: cosine
+  top_m: 200
+  top_k: 8
+  same_cell_policy: exclude
+  allow_cross_chemistry: true
+  retrieval_temperature: 0.1
+  stage1_embedding: tsfm
+  use_mmr: true
+  mmr_lambda: 0.75
+  max_neighbors_per_cell: 2
+
+model:
+  hidden_dim: 256
+  dropout: 0.1
+  meta_embedding_dim: 16
+  use_tsfm_embedding: true
+  use_qv_encoder: true
+  use_partial_charge_encoder: true
+  use_relaxation_encoder: true
+  use_pairwise_branch: true
+  use_moe_branch: true
+  use_future_ops_encoder: true
+  expert_names:
+    - shared
+    - LFP
+    - NCM
+    - NCA
+    - slow_linear
+    - accelerating
+    - high_polarization
+    - relaxation_impedance
+  top_k_experts: 2
+  router_type: grouped_additive
+  fusion_router_type: grouped_additive
+
+loss:
+  criterion: huber
+  forecast: 1.0
+  pairwise: 0.5
+  monotonic: 0.05
+  smoothness: 0.01
+  expert_balance: 0.01
+  retrieval_consistency: 0.02
+  fusion_regularization: 0.0
+  monotonic_epsilon: 0.0005
+
+train:
+  train_splits: ["source_train"]
+  val_splits: ["source_val"]
+  batch_size: 64
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  patience: 15
+  grad_clip_norm: 1.0
+  device: auto
+  num_workers: 0
+
+fewshot:
+  enabled: true
+  support_splits: ["target_support"]
+  freeze_generalist_head: true
+  freeze_curve_encoders: true
+  train_router: true
+  train_fusion_router: true
+  train_experts: true
+  train_pairwise_branch: true
+  lr: 0.0003
+  epochs: 50
+  patience: 10
+
+experiments:
+  feature_validation:
+    enabled: true
+    output_dir: output/experiments/feature_validation
+    run_ridge: true
+    run_random_forest: true
+    run_small_mlp: false
+    use_target_query_only_for_final_report: true
+    num_plot_examples: 20
+  retrieval_validation:
+    enabled: true
+    output_dir: output/experiments/retrieval_validation
+    num_queries: 100
+    num_plot_queries: 20
+    compare_random_baseline: true
+    run_rag_only_sanity: true
+
+eval:
+  test_splits: ["target_query"]
+  save_predictions: true
+  save_router_contributions: true
+  save_retrieval_case_report: true
+  plot_examples: true
+  num_plot_examples: 20

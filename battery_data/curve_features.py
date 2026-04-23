@@ -1,3 +1,9 @@
+"""battery_data.curve_features
+
+提取基于归一化容量 Q 轴的充放电曲线特征图和低维曲线统计量。
+输出既可用于预测输入，也可用于 RAG 检索和案例可视化。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -177,10 +183,13 @@ def extract_q_indexed_feature_map(
     curve_stats = {
         "delta_v_mean": _masked_mean(delta_v, bool(qv_mask[4])),
         "delta_v_std": _masked_std(delta_v, bool(qv_mask[4])),
+        "delta_v_q95": float(np.quantile(delta_v, 0.95)) if qv_mask[4] else 0.0,
         "delta_v_max": float(np.max(delta_v)) if qv_mask[4] else 0.0,
         "r_mean": _masked_mean(resistance, bool(qv_mask[5])),
         "r_std": _masked_std(resistance, bool(qv_mask[5])),
         "r_q95": float(np.quantile(resistance, 0.95)) if qv_mask[5] else 0.0,
+        "vc_curve_slope_mean": _masked_mean(vc_slope, bool(qv_mask[0])),
+        "vd_curve_slope_mean": _masked_mean(vd_slope, bool(qv_mask[1])),
         "vc_slope_mean": _masked_mean(vc_slope, bool(qv_mask[0])),
         "vd_slope_mean": _masked_mean(vd_slope, bool(qv_mask[1])),
         "ic_mean": _masked_mean(qv_map[2], bool(qv_mask[2])),

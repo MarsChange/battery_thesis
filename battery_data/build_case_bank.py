@@ -1,3 +1,9 @@
+"""battery_data.build_case_bank
+
+构建用于少样本跨工况电池 SOH 多步预测的数值案例库。
+输出包含监督标签、Q-V 曲线特征、物理启发特征、工况特征和可选 TSFM embedding。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -32,12 +38,12 @@ from battery_data.splits import assert_no_split_leakage, build_split_manifest
 DEFAULT_QV_CURVE_STATS = [
     "delta_v_mean",
     "delta_v_std",
-    "delta_v_max",
+    "delta_v_q95",
     "r_mean",
     "r_std",
     "r_q95",
-    "vc_slope_mean",
-    "vd_slope_mean",
+    "vc_curve_slope_mean",
+    "vd_curve_slope_mean",
     "ic_mean",
     "id_mean",
     "v_charge_mean",

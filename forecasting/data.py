@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 
-from retrieval.multistage_retriever import MultiStageBatteryRetriever
+from retrieval.multistage_retriever import COMPONENT_NAMES, MultiStageBatteryRetriever
 
 
 DEFAULT_META_FIELDS = [
@@ -120,13 +120,14 @@ class BatterySOHForecastDataset(Dataset):
     def _load_or_build_retrieval_cache(self, auto_build_retrieval_cache: bool) -> Dict[str, np.ndarray]:
         retriever = MultiStageBatteryRetriever(
             case_bank_dir=self.case_bank_dir,
+            retrieval_config_path=str(self.retrieval_cfg.get("retrieval_feature_config_path", "configs/rag_retrieval_features.yaml")),
             db_splits=list(self.retrieval_cfg.get("db_splits", ["source_train"])),
             metric=str(self.retrieval_cfg.get("metric", "cosine")),
             stage1_embedding_name=str(self.retrieval_cfg.get("stage1_embedding", self.retrieval_cfg.get("stage1_embedding_name", "tsfm"))),
             top_m=int(self.retrieval_cfg.get("top_m", 200)),
             top_k=int(self.retrieval_cfg.get("top_k", 8)),
-            rerank_weights=dict(self.retrieval_cfg.get("rerank_weights", {})),
-            hard_filter={"same_cell_policy": self.retrieval_cfg.get("same_cell_policy", "exclude")},
+            same_cell_policy=str(self.retrieval_cfg.get("same_cell_policy", "exclude")),
+            allow_cross_chemistry=bool(self.retrieval_cfg.get("allow_cross_chemistry", True)),
             mmr={
                 "use_mmr": bool(self.retrieval_cfg.get("use_mmr", True)),
                 "mmr_lambda": float(self.retrieval_cfg.get("mmr_lambda", 0.75)),
@@ -134,7 +135,6 @@ class BatterySOHForecastDataset(Dataset):
                 "max_neighbors_per_domain": self.retrieval_cfg.get("max_neighbors_per_domain"),
             },
             retrieval_temperature=float(self.retrieval_cfg.get("retrieval_temperature", 0.1)),
-            qv_channel_weights=dict(self.retrieval_cfg.get("qv_channel_weights", {})) if self.retrieval_cfg.get("qv_channel_weights") else None,
         )
         cache_path = self._retrieval_cache_path(retriever)
         if not cache_path.exists():
@@ -152,12 +152,20 @@ class BatterySOHForecastDataset(Dataset):
 
     def _zero_retrieval_dict(self, horizon: int, top_k: int) -> Dict[str, np.ndarray]:
         tsfm_dim = int(self.arrays["tsfm_embedding"].shape[-1]) if self.arrays["tsfm_embedding"] is not None else 0
+        zero_component = np.zeros((top_k, len(COMPONENT_NAMES)), dtype=np.float32)
         return {
             "neighbor_case_ids": np.full(top_k, -1, dtype=np.int64),
             "retrieval_mask": np.zeros(top_k, dtype=np.float32),
             "retrieval_alpha": np.zeros(top_k, dtype=np.float32),
             "retrieval_confidence": np.asarray(0.0, dtype=np.float32),
-            "component_distances": np.zeros((top_k, 8), dtype=np.float32),
+            "component_distances": zero_component,
+            "composite_distance": np.full(top_k, np.inf, dtype=np.float32),
+            "d_soh_state": np.zeros(top_k, dtype=np.float32),
+            "d_qv_shape": np.zeros(top_k, dtype=np.float32),
+            "d_physics": np.zeros(top_k, dtype=np.float32),
+            "d_operation": np.zeros(top_k, dtype=np.float32),
+            "d_metadata": np.zeros(top_k, dtype=np.float32),
+            "d_tsfm": np.zeros(top_k, dtype=np.float32),
             "reference_compatibility_score": np.zeros(top_k, dtype=np.float32),
             "ref_future_delta_soh": np.zeros((top_k, horizon), dtype=np.float32),
             "ref_cycle_stats": np.zeros((top_k,) + self.arrays["cycle_stats"].shape[1:], dtype=np.float32),
@@ -214,6 +222,7 @@ class BatterySOHForecastDataset(Dataset):
             local_idx = self.query_case_id_to_local[case_id]
             neighbor_case_ids = np.asarray(self.retrieval_cache["neighbor_case_ids"][local_idx], dtype=np.int64)
             retrieval_mask = np.asarray(self.retrieval_cache["retrieval_mask"][local_idx], dtype=np.float32)
+            component_distances = np.asarray(self.retrieval_cache["component_distances"][local_idx], dtype=np.float32)
             ref_indices = np.where(neighbor_case_ids >= 0, neighbor_case_ids, 0).astype(np.int64)
             ref_tsfm = (
                 np.asarray(self.arrays["tsfm_embedding"][ref_indices], dtype=np.float32)
@@ -225,7 +234,37 @@ class BatterySOHForecastDataset(Dataset):
                 "retrieval_mask": retrieval_mask,
                 "retrieval_alpha": np.asarray(self.retrieval_cache["retrieval_alpha"][local_idx], dtype=np.float32),
                 "retrieval_confidence": np.asarray(self.retrieval_cache["retrieval_confidence"][local_idx], dtype=np.float32),
-                "component_distances": np.asarray(self.retrieval_cache["component_distances"][local_idx], dtype=np.float32),
+                "component_distances": component_distances,
+                "composite_distance": np.asarray(
+                    self.retrieval_cache["composite_distance"][local_idx]
+                    if "composite_distance" in self.retrieval_cache
+                    else self.retrieval_cache["composite_distances"][local_idx],
+                    dtype=np.float32,
+                ),
+                "d_soh_state": np.asarray(
+                    self.retrieval_cache["d_soh_state"][local_idx] if "d_soh_state" in self.retrieval_cache else component_distances[:, 0],
+                    dtype=np.float32,
+                ),
+                "d_qv_shape": np.asarray(
+                    self.retrieval_cache["d_qv_shape"][local_idx] if "d_qv_shape" in self.retrieval_cache else component_distances[:, 1],
+                    dtype=np.float32,
+                ),
+                "d_physics": np.asarray(
+                    self.retrieval_cache["d_physics"][local_idx] if "d_physics" in self.retrieval_cache else component_distances[:, 2],
+                    dtype=np.float32,
+                ),
+                "d_operation": np.asarray(
+                    self.retrieval_cache["d_operation"][local_idx] if "d_operation" in self.retrieval_cache else component_distances[:, 3],
+                    dtype=np.float32,
+                ),
+                "d_metadata": np.asarray(
+                    self.retrieval_cache["d_metadata"][local_idx] if "d_metadata" in self.retrieval_cache else component_distances[:, 4],
+                    dtype=np.float32,
+                ),
+                "d_tsfm": np.asarray(
+                    self.retrieval_cache["d_tsfm"][local_idx] if "d_tsfm" in self.retrieval_cache else component_distances[:, 5],
+                    dtype=np.float32,
+                ),
                 "reference_compatibility_score": np.asarray(self.retrieval_cache["reference_compatibility_score"][local_idx], dtype=np.float32),
                 "ref_future_delta_soh": np.asarray(self.arrays["future_delta_soh"][ref_indices], dtype=np.float32),
                 "ref_cycle_stats": np.asarray(self.arrays["cycle_stats"][ref_indices], dtype=np.float32),

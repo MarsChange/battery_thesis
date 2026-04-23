@@ -19,6 +19,7 @@ from forecasting.metrics import horizon_metrics, regression_metrics
 from forecasting.model import BatterySOHForecaster
 from forecasting.train import load_config, move_batch_to_device, resolve_device
 from forecasting.visualization import plot_group_bar, plot_horizon_error, plot_weight_heatmap
+from retrieval.multistage_retriever import component_matrix_to_named_list
 
 
 def _group_metrics(frame: pd.DataFrame, pred_cols: List[str], true_cols: List[str], group_col: str) -> pd.DataFrame:
@@ -83,7 +84,10 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
                     "expert_router_contributions_json": json.dumps({k: v[idx].detach().cpu().numpy().astype(float).tolist() for k, v in outputs["expert_router_contributions"].items()}),
                     "fusion_router_contributions_json": json.dumps({k: v[idx].detach().cpu().numpy().astype(float).tolist() for k, v in outputs["fusion_router_contributions"].items()}),
                     "topk_neighbor_case_ids_json": json.dumps(batch["retrieval"]["neighbor_case_ids"][idx].detach().cpu().numpy().astype(int).tolist()),
-                    "topk_component_distances_json": json.dumps(batch["retrieval"]["component_distances"][idx].detach().cpu().numpy().astype(float).tolist()),
+                    "topk_component_distances_json": json.dumps(
+                        component_matrix_to_named_list(batch["retrieval"]["component_distances"][idx].detach().cpu().numpy().astype(float))
+                    ),
+                    "topk_composite_distance_json": json.dumps(batch["retrieval"]["composite_distance"][idx].detach().cpu().numpy().astype(float).tolist()),
                     "retrieval_confidence": float(outputs["retrieval_confidence"][idx].detach().cpu().item()),
                 }
                 for h in range(len(pred_delta)):
@@ -107,7 +111,10 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
                     {
                         "case_id": case_id,
                         "neighbor_case_ids_json": json.dumps(batch["retrieval"]["neighbor_case_ids"][idx].detach().cpu().numpy().astype(int).tolist()),
-                        "component_distances_json": json.dumps(batch["retrieval"]["component_distances"][idx].detach().cpu().numpy().astype(float).tolist()),
+                        "component_distances_json": json.dumps(
+                            component_matrix_to_named_list(batch["retrieval"]["component_distances"][idx].detach().cpu().numpy().astype(float))
+                        ),
+                        "composite_distance_json": json.dumps(batch["retrieval"]["composite_distance"][idx].detach().cpu().numpy().astype(float).tolist()),
                         "retrieval_confidence": float(outputs["retrieval_confidence"][idx].detach().cpu().item()),
                     }
                 )

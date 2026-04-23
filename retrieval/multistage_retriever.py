@@ -1,32 +1,44 @@
+"""retrieval.multistage_retriever
+
+实现用于电池 SOH 任务的多阶段历史案例检索器。
+该检索器遵守 `configs/rag_retrieval_features.yaml` 中的显式开关：
+1. Stage 0: hard filtering，确保 target_query 不进入 reference DB，且排除 self-retrieval。
+2. Stage 1: coarse retrieval，优先用 d_tsfm 或回退到手工 embedding 召回候选。
+3. Stage 2: physics-aware reranking，计算命名距离分量并生成 composite_distance。
+4. Stage 3: optional diversity selection，用 MMR 控制 top-k 多样性。
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from retrieval.physics_distance import (
+    CORE_DISTANCE_NAMES,
+    compute_composite_distance,
+    compute_metadata_distance,
+    compute_operation_distance,
+    compute_physics_distance,
+    compute_qv_shape_distance,
     compute_retrieval_confidence,
+    compute_soh_state_distance,
+    compute_tsfm_distance,
     degradation_stage_distance,
-    metadata_distance,
-    normalized_l2,
-    operation_distance,
-    physics_feature_distance,
-    qv_map_distance,
-    soh_state_distance,
 )
 
 try:
     from retrieval.index import FAISSIndex
-except Exception:  # pragma: no cover - fallback path only matters without faiss.
+except Exception:  # pragma: no cover - fallback path is enough for tests without faiss.
     FAISSIndex = None
 
 
-COMPONENT_NAMES = ["tsfm", "soh", "qv", "physics", "operation", "metadata", "stage", "missing"]
+COMPONENT_NAMES = list(CORE_DISTANCE_NAMES)
 
 
 def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
@@ -44,105 +56,168 @@ def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
     raise FileNotFoundError(f"Missing case rows at {parquet_path} or {csv_path}")
 
 
+def _read_json(path: Path, default: object) -> object:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def _softmax_masked(distances: np.ndarray, mask: np.ndarray, temperature: float) -> np.ndarray:
+    logits = -np.asarray(distances, dtype=np.float32) / max(float(temperature), 1e-6)
+    mask_arr = np.asarray(mask, dtype=np.float32)
+    if logits.size == 0:
+        return logits.astype(np.float32)
+    logits = np.where(mask_arr > 0, logits, -1e9)
+    logits = logits - float(np.max(logits))
+    weights = np.exp(logits) * mask_arr
+    denom = float(weights.sum())
+    if denom <= 0:
+        return np.zeros_like(logits, dtype=np.float32)
+    return (weights / denom).astype(np.float32)
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    arr_a = np.asarray(a, dtype=np.float32)
+    arr_b = np.asarray(b, dtype=np.float32)
+    denom = float(np.linalg.norm(arr_a) * np.linalg.norm(arr_b))
+    if denom <= 1e-8:
+        return 0.0
+    return float(np.dot(arr_a, arr_b) / denom)
+
+
+def component_matrix_to_named_list(component_distances: np.ndarray) -> list[dict[str, float]]:
+    """把 `[K, C]` 距离矩阵转换成带名称的字典列表。"""
+
+    matrix = np.asarray(component_distances, dtype=np.float32)
+    result = []
+    for row in matrix.tolist():
+        result.append({name: float(value) for name, value in zip(COMPONENT_NAMES, row)})
+    return result
+
+
 @dataclass
 class RetrievalResult:
     query_case_id: int
     neighbor_case_ids: np.ndarray
     retrieval_mask: np.ndarray
-    composite_distances: np.ndarray
-    component_distances: np.ndarray
-    retrieval_alpha: np.ndarray
+    d_soh_state: np.ndarray
+    d_qv_shape: np.ndarray
+    d_physics: np.ndarray
+    d_operation: np.ndarray
+    d_metadata: np.ndarray
+    d_tsfm: np.ndarray
+    composite_distance: np.ndarray
     retrieval_confidence: float
+    retrieval_alpha: np.ndarray
     neighbor_future_delta_soh: np.ndarray
-    reference_compatibility_score: np.ndarray
-    explain: Dict[str, object]
+    neighbor_metadata: list[dict[str, object]] = field(default_factory=list)
+    explain_json: Dict[str, object] = field(default_factory=dict)
+    stage_distance: np.ndarray | None = None
+    missing_penalty: np.ndarray | None = None
+    reference_compatibility_score: np.ndarray | None = None
+    mmr_diversity_score: np.ndarray | None = None
 
+    @property
+    def component_distances(self) -> np.ndarray:
+        return np.stack(
+            [
+                self.d_soh_state,
+                self.d_qv_shape,
+                self.d_physics,
+                self.d_operation,
+                self.d_metadata,
+                self.d_tsfm,
+            ],
+            axis=-1,
+        ).astype(np.float32)
 
-def _softmax_masked(logits: np.ndarray, mask: np.ndarray, temperature: float) -> np.ndarray:
-    logits = np.asarray(logits, dtype=np.float32)
-    mask = np.asarray(mask, dtype=np.float32)
-    if logits.size == 0:
-        return logits
-    scaled = -logits / max(float(temperature), 1e-6)
-    scaled = np.where(mask > 0, scaled, -1e9)
-    scaled = scaled - float(np.max(scaled))
-    weight = np.exp(scaled) * mask
-    total = float(weight.sum())
-    return (weight / total).astype(np.float32) if total > 0 else np.zeros_like(logits, dtype=np.float32)
+    @property
+    def composite_distances(self) -> np.ndarray:
+        return self.composite_distance
 
-
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denom <= 1e-8:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    @property
+    def explain(self) -> Dict[str, object]:
+        return self.explain_json
 
 
 class MultiStageBatteryRetriever:
     def __init__(
         self,
         case_bank_dir: str | Path,
-        db_splits: List[str],
+        retrieval_config_path: str | Path = "configs/rag_retrieval_features.yaml",
+        db_splits: List[str] | None = None,
+        query_splits: List[str] | None = None,
+        top_m: int | None = None,
+        top_k: int | None = None,
+        same_cell_policy: str | None = None,
+        allow_cross_chemistry: bool | None = None,
         metric: str = "cosine",
-        stage1_embedding_name: str = "tsfm",
-        top_m: int = 200,
-        top_k: int = 8,
-        rerank_weights: Dict[str, float] | None = None,
+        stage1_embedding_name: str | None = None,
+        retrieval_temperature: float = 0.1,
         hard_filter: Dict[str, object] | None = None,
         mmr: Dict[str, object] | None = None,
-        retrieval_temperature: float = 0.1,
+        rerank_weights: Dict[str, float] | None = None,
         qv_channel_weights: Dict[str, float] | None = None,
     ):
+        import yaml
+
         self.case_bank_dir = Path(case_bank_dir)
+        self.retrieval_config_path = Path(retrieval_config_path)
+        self.rag_config = yaml.safe_load(self.retrieval_config_path.read_text())
         self.case_rows = _read_case_rows(self.case_bank_dir).sort_values("case_id").reset_index(drop=True)
         self.case_rows["case_id"] = self.case_rows["case_id"].astype(int)
-        self.metric = metric
-        self.stage1_embedding_name = stage1_embedding_name
-        self.top_m = int(top_m)
-        self.top_k = int(top_k)
+        self.case_id_to_index = {int(case_id): row_idx for row_idx, case_id in enumerate(self.case_rows["case_id"].tolist())}
+        self.metric = str(metric)
+
+        final_topk_cfg = dict(self.rag_config.get("final_topk", {}) or {})
+        stage1_cfg = dict(self.rag_config.get("stage1_retrieval", {}) or {})
+        hard_filter = dict(hard_filter or {})
+        mmr = dict(mmr or {})
+
+        self.db_splits = list(db_splits or ["source_train"])
+        self.query_splits = list(query_splits or [])
+        self.top_m = int(top_m if top_m is not None else stage1_cfg.get("top_m", 200))
+        self.top_k = int(top_k if top_k is not None else final_topk_cfg.get("top_k", 8))
+        self.same_cell_policy = str(same_cell_policy or hard_filter.get("same_cell_policy") or final_topk_cfg.get("same_cell_policy", "exclude"))
+        self.allow_cross_chemistry = bool(
+            allow_cross_chemistry if allow_cross_chemistry is not None else final_topk_cfg.get("allow_cross_chemistry", True)
+        )
         self.retrieval_temperature = float(retrieval_temperature)
-        self.rerank_weights = {
-            "tsfm": 0.2,
-            "soh_state": 0.2,
-            "qv_map": 0.25,
-            "physics_features": 0.2,
-            "operation": 0.05,
-            "metadata": 0.05,
-            "stage": 0.05,
-            "missing": 0.05,
-            **(rerank_weights or {}),
-        }
-        self.hard_filter = {"same_cell_policy": "exclude", **(hard_filter or {})}
-        self.mmr = {
-            "use_mmr": True,
-            "mmr_lambda": 0.75,
-            "max_neighbors_per_cell": 2,
-            "max_neighbors_per_domain": None,
-            **(mmr or {}),
-        }
-        self.qv_channel_weights = qv_channel_weights or {
-            "Vc": 0.10,
-            "Vd": 0.20,
-            "Ic": 0.05,
-            "Id": 0.05,
-            "DeltaV": 0.35,
-            "R": 0.25,
-        }
+        self.use_mmr = bool(mmr.get("use_mmr", final_topk_cfg.get("use_mmr", True)))
+        self.mmr_lambda = float(mmr.get("mmr_lambda", final_topk_cfg.get("mmr_lambda", 0.75)))
+        self.max_neighbors_per_cell = int(mmr.get("max_neighbors_per_cell", final_topk_cfg.get("max_neighbors_per_cell", 2)))
+        self.max_neighbors_per_domain = mmr.get("max_neighbors_per_domain", final_topk_cfg.get("max_neighbors_per_domain"))
+        self.stage1_embedding_name = str(stage1_embedding_name or ("tsfm" if bool(stage1_cfg.get("use_tsfm_embedding", True)) else "handcrafted"))
 
-        self.db_splits = list(db_splits)
-        self.db_mask = np.asarray(self.case_rows["split"].astype(str).isin(self.db_splits).to_numpy(), dtype=bool).copy()
-        self.db_mask &= self.case_rows["split"].astype(str).ne("target_query").to_numpy()
-        self.db_case_ids = self.case_rows.loc[self.db_mask, "case_id"].to_numpy(dtype=np.int64)
-        self.case_id_to_index = {int(case_id): idx for idx, case_id in enumerate(self.case_rows["case_id"].tolist())}
+        if rerank_weights:
+            for distance_name, weight in rerank_weights.items():
+                if distance_name in dict(self.rag_config.get("distance_components", {}) or {}):
+                    self.rag_config["distance_components"][distance_name]["weight"] = float(weight)
+        if qv_channel_weights:
+            qv_cfg = dict(self.rag_config.get("distance_components", {}).get("d_qv_shape", {}) or {})
+            qv_cfg["channel_weights"] = dict(qv_cfg.get("channel_weights", {}) or {})
+            qv_cfg["channel_weights"].update({key: float(value) for key, value in qv_channel_weights.items()})
+            self.rag_config["distance_components"]["d_qv_shape"] = qv_cfg
 
+        self.feature_names = dict(_read_json(self.case_bank_dir / "feature_names.json", {}))
         self.arrays = self._load_case_arrays()
-        self.stage1_embeddings = self._load_stage1_embeddings()
+        self.db_mask = (
+            self.case_rows["split"].astype(str).isin(self.db_splits).to_numpy()
+            & self.case_rows["split"].astype(str).ne("target_query").to_numpy()
+        )
+        self.db_indices = np.flatnonzero(self.db_mask).astype(np.int64)
+        self.db_case_ids = self.case_rows.loc[self.db_indices, "case_id"].to_numpy(dtype=np.int64)
+
+        self.handcrafted_embeddings = self._build_handcrafted_embeddings()
+        self.stage1_embeddings = self._build_stage1_embeddings()
+        self.db_stage1_embeddings = self.stage1_embeddings[self.db_indices]
         self._build_index()
 
-    def _load_case_arrays(self) -> Dict[str, np.ndarray]:
-        arrays = {
+    def _load_case_arrays(self) -> Dict[str, np.ndarray | None]:
+        arrays: Dict[str, np.ndarray | None] = {
             "future_delta": np.load(self.case_bank_dir / "case_future_delta_soh.npy"),
             "future_soh": np.load(self.case_bank_dir / "case_future_soh.npy"),
             "cycle_stats": np.load(self.case_bank_dir / "case_cycle_stats.npy"),
@@ -164,50 +239,247 @@ class MultiStageBatteryRetriever:
         arrays["tsfm_embeddings"] = np.load(tsfm_path) if tsfm_path.exists() else None
         return arrays
 
-    def _load_stage1_embeddings(self) -> np.ndarray:
-        if self.stage1_embedding_name == "tsfm" and self.arrays["tsfm_embeddings"] is not None:
-            return np.asarray(self.arrays["tsfm_embeddings"], dtype=np.float32)
-        if self.stage1_embedding_name == "physics":
-            return np.concatenate(
-                [
-                    np.asarray(self.arrays["anchor_physics_features"], dtype=np.float32),
-                    np.asarray(self.arrays["soh_seq"][:, -4:], dtype=np.float32),
-                ],
-                axis=-1,
-            )
-        # hybrid / fallback
-        return np.concatenate(
-            [
-                np.asarray(self.arrays["anchor_physics_features"], dtype=np.float32),
-                np.asarray(self.arrays["cycle_stats"][:, -1], dtype=np.float32),
-                np.asarray(self.arrays["soh_seq"][:, -4:], dtype=np.float32),
-            ],
-            axis=-1,
-        )
-
     def _build_index(self) -> None:
-        db_embeddings = self.stage1_embeddings[self.db_case_ids]
-        self.db_embeddings = np.asarray(db_embeddings, dtype=np.float32)
-        if FAISSIndex is not None and self.db_embeddings.size > 0:
-            self.index = FAISSIndex(dim=self.db_embeddings.shape[1], metric=self.metric)
-            self.index.add(self.db_embeddings)
-        else:
+        if self.db_stage1_embeddings.size == 0 or FAISSIndex is None:
             self.index = None
+            return
+        self.index = FAISSIndex(dim=int(self.db_stage1_embeddings.shape[1]), metric=self.metric)
+        self.index.add(np.asarray(self.db_stage1_embeddings, dtype=np.float32))
 
     def retrieval_config_hash(self) -> str:
         payload = {
+            "retrieval_config_path": str(self.retrieval_config_path),
+            "rag_config": self.rag_config,
             "db_splits": self.db_splits,
-            "metric": self.metric,
-            "stage1_embedding_name": self.stage1_embedding_name,
+            "query_splits": self.query_splits,
             "top_m": self.top_m,
             "top_k": self.top_k,
-            "rerank_weights": self.rerank_weights,
-            "hard_filter": self.hard_filter,
-            "mmr": self.mmr,
+            "same_cell_policy": self.same_cell_policy,
+            "allow_cross_chemistry": self.allow_cross_chemistry,
+            "metric": self.metric,
+            "stage1_embedding_name": self.stage1_embedding_name,
             "retrieval_temperature": self.retrieval_temperature,
+            "use_mmr": self.use_mmr,
+            "mmr_lambda": self.mmr_lambda,
+            "max_neighbors_per_cell": self.max_neighbors_per_cell,
+            "max_neighbors_per_domain": self.max_neighbors_per_domain,
         }
         text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+    def _cycle_feature_index(self, name: str) -> int | None:
+        names = list(self.feature_names.get("cycle_stats", []))
+        try:
+            return names.index(name)
+        except ValueError:
+            return None
+
+    def _qv_summary_stats(self, idx: int) -> Dict[str, float]:
+        cycle_last = np.asarray(self.arrays["cycle_stats"][idx, -1], dtype=np.float32)
+        stats: Dict[str, float] = {}
+        for name in [
+            "delta_v_mean",
+            "delta_v_std",
+            "delta_v_q95",
+            "delta_v_max",
+            "r_mean",
+            "r_std",
+            "r_q95",
+            "vc_slope_mean",
+            "vd_slope_mean",
+            "vc_curve_slope_mean",
+            "vd_curve_slope_mean",
+        ]:
+            feature_idx = self._cycle_feature_index(name)
+            if feature_idx is not None and feature_idx < cycle_last.shape[0]:
+                stats[name] = float(cycle_last[feature_idx])
+        if "delta_v_q95" not in stats and "delta_v_max" in stats:
+            stats["delta_v_q95"] = stats["delta_v_max"]
+        if "vc_curve_slope_mean" not in stats and "vc_slope_mean" in stats:
+            stats["vc_curve_slope_mean"] = stats["vc_slope_mean"]
+        if "vd_curve_slope_mean" not in stats and "vd_slope_mean" in stats:
+            stats["vd_curve_slope_mean"] = stats["vd_slope_mean"]
+        return stats
+
+    def _state_dict(self, idx: int) -> Dict[str, object]:
+        row = self.case_rows.iloc[idx]
+        lookback = max(int(row.get("lookback_length", self.arrays["soh_seq"].shape[1])), 1)
+        return {
+            "anchor_soh": float(row.get("anchor_soh", 0.0)),
+            "recent_soh_slope": float(row.get("recent_soh_slope", 0.0)),
+            "recent_soh_curvature": float(row.get("recent_soh_curvature", 0.0)),
+            "degradation_stage": str(row.get("degradation_stage", "unknown")),
+            "normalized_cycle_index": float(int(row.get("window_end", 0)) / max(lookback, 1)),
+        }
+
+    def _qv_dict(self, idx: int) -> Dict[str, object]:
+        return {
+            "qv_map": np.asarray(self.arrays["qv_maps"][idx, -1], dtype=np.float32),
+            "qv_mask": np.asarray(self.arrays["qv_masks"][idx, -1], dtype=np.float32),
+            "qv_summary_stats": self._qv_summary_stats(idx),
+        }
+
+    def _physics_dict(self, idx: int) -> Dict[str, object]:
+        return {
+            "physics_features": np.asarray(self.arrays["anchor_physics_features"][idx], dtype=np.float32),
+            "physics_feature_mask": np.asarray(self.arrays["physics_feature_masks"][idx, -1], dtype=np.float32),
+        }
+
+    def _operation_feature_dict(self, idx: int) -> Dict[str, object]:
+        op_seq = np.asarray(self.arrays["operation_seq"][idx], dtype=np.float32)
+        future_ops = np.asarray(self.arrays["future_ops"][idx], dtype=np.float32)
+        op_names = list(self.feature_names.get("operation", []))
+        name_to_series = {name: op_seq[:, pos] for pos, name in enumerate(op_names[: op_seq.shape[1]])}
+        row = self.case_rows.iloc[idx]
+        anchor_capacity = max(float(row.get("anchor_capacity", 1.0) or 1.0), 1e-6)
+
+        current_abs_series = name_to_series.get("current_abs_mean")
+        temp_mean_series = name_to_series.get("temp_mean")
+        cc_time_series = name_to_series.get("cc_time")
+        cv_time_series = name_to_series.get("cv_time")
+        current_based_c_rate = current_abs_series / anchor_capacity if current_abs_series is not None else None
+
+        def _mask_for(series: np.ndarray | None) -> float:
+            return 1.0 if series is not None and np.isfinite(series).any() else 0.0
+
+        protocol_change_rate = 0.0
+        protocol_mask = 0.0
+        if current_based_c_rate is not None and len(current_based_c_rate) > 1:
+            delta = np.abs(np.diff(current_based_c_rate))
+            protocol_change_rate = float(np.mean(delta > max(0.05, 0.1 * float(np.nanmean(np.abs(current_based_c_rate)) + 1e-6))))
+            protocol_mask = 1.0
+        elif temp_mean_series is not None and len(temp_mean_series) > 1:
+            delta = np.abs(np.diff(temp_mean_series))
+            protocol_change_rate = float(np.mean(delta > 1.0))
+            protocol_mask = 1.0
+
+        future_ops_mask = np.asarray(self.arrays["future_ops_mask"][idx], dtype=np.float32)
+        future_known_score = float(np.mean(np.abs(future_ops) * future_ops_mask)) if future_ops.size else 0.0
+
+        values = {
+            "charge_c_rate_mean": float(np.nanmean(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
+            "charge_c_rate_std": float(np.nanstd(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
+            "discharge_c_rate_mean": float(np.nanmean(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
+            "discharge_c_rate_std": float(np.nanstd(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
+            "temperature_mean": float(np.nanmean(temp_mean_series)) if temp_mean_series is not None else 0.0,
+            "temperature_std": float(np.nanstd(temp_mean_series)) if temp_mean_series is not None else 0.0,
+            "temperature_max": float(np.nanmax(temp_mean_series)) if temp_mean_series is not None else 0.0,
+            "dod_estimate": 0.0,
+            "protocol_change_rate": protocol_change_rate,
+            "charge_duration_mean": float(np.nanmean(cc_time_series)) if cc_time_series is not None else 0.0,
+            "discharge_duration_mean": float(np.nanmean(cv_time_series)) if cv_time_series is not None else 0.0,
+            "rest_duration_mean": 0.0,
+            "future_operation_if_known": future_known_score,
+        }
+        mask = {
+            "charge_c_rate_mean": _mask_for(current_based_c_rate),
+            "charge_c_rate_std": _mask_for(current_based_c_rate),
+            "discharge_c_rate_mean": _mask_for(current_based_c_rate),
+            "discharge_c_rate_std": _mask_for(current_based_c_rate),
+            "temperature_mean": _mask_for(temp_mean_series),
+            "temperature_std": _mask_for(temp_mean_series),
+            "temperature_max": _mask_for(temp_mean_series),
+            "dod_estimate": 0.0,
+            "protocol_change_rate": protocol_mask,
+            "charge_duration_mean": _mask_for(cc_time_series),
+            "discharge_duration_mean": _mask_for(cv_time_series),
+            "rest_duration_mean": 0.0,
+            "future_operation_if_known": float(np.mean(future_ops_mask) > 0) if future_ops_mask.size else 0.0,
+        }
+        values["operation_mask"] = mask
+        return values
+
+    def _metadata_dict(self, idx: int) -> Dict[str, object]:
+        row = self.case_rows.iloc[idx]
+        return {
+            "chemistry_family": row.get("chemistry_family", "unknown"),
+            "source_dataset": row.get("source_dataset", "unknown"),
+            "domain_label": row.get("domain_label", "unknown"),
+            "voltage_window_bucket": row.get("voltage_window_bucket", "unknown"),
+            "nominal_capacity_bucket": row.get("nominal_capacity_bucket", "unknown"),
+            "temperature_bucket": row.get("temperature_bucket", "unknown"),
+            "charge_rate_bucket": row.get("charge_rate_bucket", "unknown"),
+        }
+
+    def _feature_availability_ratio(self, query_idx: int, ref_idx: int) -> float:
+        q_qv = np.asarray(self.arrays["qv_masks"][query_idx, -1], dtype=np.float32)
+        r_qv = np.asarray(self.arrays["qv_masks"][ref_idx, -1], dtype=np.float32)
+        q_phy = np.asarray(self.arrays["physics_feature_masks"][query_idx, -1], dtype=np.float32)
+        r_phy = np.asarray(self.arrays["physics_feature_masks"][ref_idx, -1], dtype=np.float32)
+        q_op_mask = self._operation_feature_dict(query_idx)["operation_mask"]
+        r_op_mask = self._operation_feature_dict(ref_idx)["operation_mask"]
+        op_keys = sorted(set(q_op_mask.keys()) | set(r_op_mask.keys()))
+        op_common = np.asarray(
+            [1.0 if float(q_op_mask.get(key, 0.0)) > 0 and float(r_op_mask.get(key, 0.0)) > 0 else 0.0 for key in op_keys],
+            dtype=np.float32,
+        )
+        availability = np.concatenate(
+            [
+                ((q_qv > 0) & (r_qv > 0)).astype(np.float32),
+                ((q_phy > 0) & (r_phy > 0)).astype(np.float32),
+                op_common,
+            ]
+        )
+        return float(availability.mean()) if availability.size else 0.0
+
+    def _reference_compatibility_score(self, query_idx: int, ref_idx: int, component_distances: Dict[str, float], missing_penalty: float) -> float:
+        query_row = self.case_rows.iloc[query_idx]
+        ref_row = self.case_rows.iloc[ref_idx]
+        chemistry_bonus = 0.1 if str(query_row["chemistry_family"]) == str(ref_row["chemistry_family"]) else -0.05
+        domain_bonus = 0.05 if str(query_row["domain_label"]) == str(ref_row["domain_label"]) else 0.0
+        stage_bonus = 0.1 if str(query_row["degradation_stage"]) == str(ref_row["degradation_stage"]) else -0.05
+        core_mean = float(np.mean([component_distances[name] for name in COMPONENT_NAMES]))
+        raw_score = 1.0 - core_mean + chemistry_bonus + domain_bonus + stage_bonus - 0.2 * float(missing_penalty)
+        return float(np.clip(raw_score, 0.0, 1.0))
+
+    def _build_handcrafted_embeddings(self) -> np.ndarray:
+        rows = []
+        for row_idx in range(len(self.case_rows)):
+            state = self._state_dict(row_idx)
+            physics = np.asarray(self.arrays["anchor_physics_features"][row_idx], dtype=np.float32)
+            operation = self._operation_feature_dict(row_idx)
+            op_names = [
+                "charge_c_rate_mean",
+                "charge_c_rate_std",
+                "discharge_c_rate_mean",
+                "discharge_c_rate_std",
+                "temperature_mean",
+                "temperature_std",
+                "temperature_max",
+                "protocol_change_rate",
+            ]
+            op_vec = np.asarray([float(operation.get(name, 0.0)) for name in op_names], dtype=np.float32)
+            rows.append(
+                np.concatenate(
+                    [
+                        np.asarray(
+                            [
+                                float(state["anchor_soh"]),
+                                float(state["recent_soh_slope"]),
+                                float(state["recent_soh_curvature"]),
+                            ],
+                            dtype=np.float32,
+                        ),
+                        physics.astype(np.float32),
+                        op_vec,
+                    ]
+                )
+            )
+        return np.asarray(rows, dtype=np.float32)
+
+    def _build_stage1_embeddings(self) -> np.ndarray:
+        tsfm_cfg = dict(self.rag_config.get("distance_components", {}).get("d_tsfm", {}) or {})
+        tsfm_features_cfg = dict(tsfm_cfg.get("features", {}) or {})
+        tsfm_embeddings = self.arrays["tsfm_embeddings"]
+        use_tsfm = (
+            self.stage1_embedding_name == "tsfm"
+            and bool(tsfm_cfg.get("enabled", False))
+            and bool(dict(tsfm_features_cfg.get("tsfm_stage1_coarse_retrieval", {}) or {}).get("enabled", True))
+            and tsfm_embeddings is not None
+        )
+        if use_tsfm:
+            return np.asarray(tsfm_embeddings, dtype=np.float32)
+        return np.asarray(self.handcrafted_embeddings, dtype=np.float32)
 
     def _coarse_candidates(self, query_idx: int) -> np.ndarray:
         if len(self.db_case_ids) == 0:
@@ -216,148 +488,115 @@ class MultiStageBatteryRetriever:
         fetch = min(max(self.top_m * 4, self.top_k * 8), len(self.db_case_ids))
         if self.index is not None:
             _, index_positions = self.index.search(query_embedding, fetch)
-            candidate_case_ids = self.db_case_ids[index_positions[0]]
-        else:
-            distances = np.linalg.norm(self.db_embeddings - query_embedding[0], axis=1)
-            candidate_case_ids = self.db_case_ids[np.argsort(distances)[:fetch]]
-        return np.asarray(candidate_case_ids, dtype=np.int64)
+            return self.db_case_ids[index_positions[0]].astype(np.int64)
+        distances = np.linalg.norm(self.db_stage1_embeddings - query_embedding[0], axis=1)
+        return self.db_case_ids[np.argsort(distances)[:fetch]].astype(np.int64)
 
     def _hard_filter_candidate_ids(self, query_idx: int, candidate_case_ids: np.ndarray) -> np.ndarray:
         query_row = self.case_rows.iloc[query_idx]
         query_case_id = int(query_row["case_id"])
-        same_cell_policy = str(self.hard_filter.get("same_cell_policy", "exclude"))
         query_horizon = int(query_row["target_horizon"])
         valid_ids = []
-        for case_id in candidate_case_ids.tolist():
+        for case_id in np.asarray(candidate_case_ids, dtype=np.int64).tolist():
             ref_idx = self.case_id_to_index[int(case_id)]
             ref_row = self.case_rows.iloc[ref_idx]
             if int(ref_row["case_id"]) == query_case_id:
                 continue
-            if int(ref_row["target_horizon"]) != query_horizon:
-                continue
             if str(ref_row["split"]) == "target_query":
                 continue
-            if same_cell_policy == "exclude" and str(ref_row["cell_uid"]) == str(query_row["cell_uid"]):
+            if int(ref_row["target_horizon"]) != query_horizon:
                 continue
-            if same_cell_policy == "past_only" and str(ref_row["cell_uid"]) == str(query_row["cell_uid"]):
+            ref_future = np.asarray(self.arrays["future_delta"][ref_idx], dtype=np.float32)
+            if ref_future.size == 0 or not np.isfinite(ref_future).all():
+                continue
+            if self.same_cell_policy == "exclude" and str(ref_row["cell_uid"]) == str(query_row["cell_uid"]):
+                continue
+            if self.same_cell_policy == "past_only" and str(ref_row["cell_uid"]) == str(query_row["cell_uid"]):
                 if int(ref_row["window_end"]) > int(query_row["window_end"]):
                     continue
+            if not self.allow_cross_chemistry and str(ref_row["chemistry_family"]) != str(query_row["chemistry_family"]):
+                continue
             valid_ids.append(int(case_id))
         return np.asarray(valid_ids, dtype=np.int64)
 
-    def _meta_dict(self, row: pd.Series) -> Dict[str, object]:
+    def _distance_bundle(self, query_idx: int, ref_idx: int) -> Dict[str, float]:
+        query_state = self._state_dict(query_idx)
+        ref_state = self._state_dict(ref_idx)
+        query_qv = self._qv_dict(query_idx)
+        ref_qv = self._qv_dict(ref_idx)
+        query_physics = self._physics_dict(query_idx)
+        ref_physics = self._physics_dict(ref_idx)
+        query_operation = self._operation_feature_dict(query_idx)
+        ref_operation = self._operation_feature_dict(ref_idx)
+        query_metadata = self._metadata_dict(query_idx)
+        ref_metadata = self._metadata_dict(ref_idx)
+        d_soh_state = compute_soh_state_distance(
+            query_state,
+            ref_state,
+            self.rag_config["distance_components"]["d_soh_state"],
+        )
+        d_qv_shape = compute_qv_shape_distance(
+            query_qv,
+            ref_qv,
+            self.rag_config["distance_components"]["d_qv_shape"],
+        )
+        d_physics = compute_physics_distance(
+            query_physics,
+            ref_physics,
+            self.rag_config["distance_components"]["d_physics"],
+        )
+        d_operation = compute_operation_distance(
+            query_operation,
+            ref_operation,
+            self.rag_config["distance_components"]["d_operation"],
+        )
+        d_metadata = compute_metadata_distance(
+            query_metadata,
+            ref_metadata,
+            self.rag_config["distance_components"]["d_metadata"],
+        )
+        d_tsfm = compute_tsfm_distance(
+            self.stage1_embeddings[query_idx],
+            self.stage1_embeddings[ref_idx],
+            self.rag_config["distance_components"]["d_tsfm"],
+        )
+        components = {
+            "d_soh_state": float(d_soh_state),
+            "d_qv_shape": float(d_qv_shape),
+            "d_physics": float(d_physics),
+            "d_operation": float(d_operation),
+            "d_metadata": float(d_metadata),
+            "d_tsfm": float(d_tsfm),
+        }
+        composite_distance = compute_composite_distance(components, self.rag_config)
+        stage_distance = degradation_stage_distance(
+            str(query_state.get("degradation_stage", "unknown")),
+            str(ref_state.get("degradation_stage", "unknown")),
+        )
+        feature_availability_ratio = self._feature_availability_ratio(query_idx, ref_idx)
+        missing_penalty = float(1.0 - feature_availability_ratio)
+        reference_compatibility_score = self._reference_compatibility_score(query_idx, ref_idx, components, missing_penalty)
         return {
-            "chemistry_family": row.get("chemistry_family"),
-            "temperature_bucket": row.get("temperature_bucket"),
-            "charge_rate_bucket": row.get("charge_rate_bucket"),
-            "discharge_policy_family": row.get("discharge_policy_family"),
-            "nominal_capacity_bucket": row.get("nominal_capacity_bucket"),
-            "voltage_window_bucket": row.get("voltage_window_bucket"),
-            "full_or_partial": row.get("full_or_partial"),
-            "domain_label": row.get("domain_label"),
+            **components,
+            "composite_distance": float(composite_distance),
+            "stage_distance": float(stage_distance),
+            "missing_penalty": float(missing_penalty),
+            "feature_availability_ratio": float(feature_availability_ratio),
+            "reference_compatibility_score": float(reference_compatibility_score),
+            "chemistry_match": float(self.case_rows.iloc[query_idx]["chemistry_family"] == self.case_rows.iloc[ref_idx]["chemistry_family"]),
+            "domain_match": float(self.case_rows.iloc[query_idx]["domain_label"] == self.case_rows.iloc[ref_idx]["domain_label"]),
         }
 
-    def _state_dict(self, row: pd.Series) -> Dict[str, float]:
-        return {
-            "anchor_soh": float(row.get("anchor_soh", 0.0)),
-            "recent_soh_slope": float(row.get("recent_soh_slope", 0.0)),
-            "recent_soh_curvature": float(row.get("recent_soh_curvature", 0.0)),
-            "throughput_recent": float(row.get("throughput_recent", 0.0)),
-        }
+    def _apply_mmr(self, candidate_case_ids: np.ndarray, composite_distance: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if not self.use_mmr or len(candidate_case_ids) <= self.top_k:
+            scores = np.ones(min(len(candidate_case_ids), self.top_k), dtype=np.float32)
+            return candidate_case_ids[: self.top_k], scores
 
-    def _operation_summary(self, idx: int) -> np.ndarray:
-        op_seq = np.asarray(self.arrays["operation_seq"][idx], dtype=np.float32)
-        future = np.asarray(self.arrays["future_ops"][idx], dtype=np.float32)
-        return np.concatenate([op_seq.mean(axis=0), op_seq.std(axis=0), future.mean(axis=0)], axis=0).astype(np.float32)
-
-    def _missing_penalty(self, query_idx: int, ref_idx: int) -> float:
-        q_avail = np.concatenate(
-            [
-                self.arrays["qv_masks"][query_idx, -1].reshape(-1),
-                self.arrays["physics_feature_masks"][query_idx, -1].reshape(-1),
-                self.arrays["future_ops_mask"][query_idx].reshape(-1),
-            ],
-            axis=0,
-        )
-        r_avail = np.concatenate(
-            [
-                self.arrays["qv_masks"][ref_idx, -1].reshape(-1),
-                self.arrays["physics_feature_masks"][ref_idx, -1].reshape(-1),
-                self.arrays["future_ops_mask"][ref_idx].reshape(-1),
-            ],
-            axis=0,
-        )
-        common = float(((q_avail > 0) & (r_avail > 0)).mean())
-        return float(1.0 - common)
-
-    def _component_distances(self, query_idx: int, ref_idx: int) -> Tuple[np.ndarray, float]:
-        query_row = self.case_rows.iloc[query_idx]
-        ref_row = self.case_rows.iloc[ref_idx]
-
-        d_tsfm = normalized_l2(self.stage1_embeddings[query_idx], self.stage1_embeddings[ref_idx])
-        d_soh = soh_state_distance(self._state_dict(query_row), self._state_dict(ref_row))
-        d_qv = qv_map_distance(
-            self.arrays["qv_maps"][query_idx, -1],
-            self.arrays["qv_maps"][ref_idx, -1],
-            self.arrays["qv_masks"][query_idx, -1],
-            self.arrays["qv_masks"][ref_idx, -1],
-            self.qv_channel_weights,
-        )
-        d_physics = physics_feature_distance(
-            self.arrays["physics_features"][query_idx, -1],
-            self.arrays["physics_features"][ref_idx, -1],
-            self.arrays["physics_feature_masks"][query_idx, -1],
-            self.arrays["physics_feature_masks"][ref_idx, -1],
-        )
-        d_operation = operation_distance(self._operation_summary(query_idx), self._operation_summary(ref_idx))
-        d_metadata = metadata_distance(
-            self._meta_dict(query_row),
-            self._meta_dict(ref_row),
-            {
-                "chemistry_family": 0.35,
-                "domain_label": 0.20,
-                "temperature_bucket": 0.10,
-                "charge_rate_bucket": 0.10,
-                "discharge_policy_family": 0.10,
-                "full_or_partial": 0.05,
-                "nominal_capacity_bucket": 0.05,
-                "voltage_window_bucket": 0.05,
-            },
-        )
-        d_stage = degradation_stage_distance(str(query_row["degradation_stage"]), str(ref_row["degradation_stage"]))
-        d_missing = self._missing_penalty(query_idx, ref_idx)
-        components = np.asarray([d_tsfm, d_soh, d_qv, d_physics, d_operation, d_metadata, d_stage, d_missing], dtype=np.float32)
-        composite = (
-            self.rerank_weights["tsfm"] * d_tsfm
-            + self.rerank_weights["soh_state"] * d_soh
-            + self.rerank_weights["qv_map"] * d_qv
-            + self.rerank_weights["physics_features"] * d_physics
-            + self.rerank_weights["operation"] * d_operation
-            + self.rerank_weights["metadata"] * d_metadata
-            + self.rerank_weights["stage"] * d_stage
-            + self.rerank_weights["missing"] * d_missing
-        )
-        return components, float(composite)
-
-    def _reference_compatibility_score(self, query_idx: int, ref_idx: int, components: np.ndarray) -> float:
-        query_row = self.case_rows.iloc[query_idx]
-        ref_row = self.case_rows.iloc[ref_idx]
-        chemistry_bonus = 0.1 if str(query_row["chemistry_family"]) == str(ref_row["chemistry_family"]) else -0.05
-        stage_bonus = 0.1 if str(query_row["degradation_stage"]) == str(ref_row["degradation_stage"]) else -0.05
-        domain_bonus = 0.05 if str(query_row["domain_label"]) == str(ref_row["domain_label"]) else 0.0
-        base = 1.0 - float(np.mean(components[:5]))
-        return float(np.clip(base + chemistry_bonus + stage_bonus + domain_bonus - 0.2 * components[-1], 0.0, 1.0))
-
-    def _apply_mmr(self, query_idx: int, candidate_case_ids: np.ndarray, distances: np.ndarray) -> np.ndarray:
-        if not bool(self.mmr.get("use_mmr", True)) or len(candidate_case_ids) <= self.top_k:
-            return candidate_case_ids[: self.top_k]
-        lambda_ = float(self.mmr.get("mmr_lambda", 0.75))
-        max_per_cell = int(self.mmr.get("max_neighbors_per_cell", 2))
-        max_per_domain = self.mmr.get("max_neighbors_per_domain")
         selected: List[int] = []
+        mmr_scores: List[float] = []
         cell_counter: Dict[str, int] = {}
         domain_counter: Dict[str, int] = {}
-        candidate_order = list(np.argsort(distances))
+        candidate_order = list(np.argsort(composite_distance))
 
         while candidate_order and len(selected) < self.top_k:
             best_case = None
@@ -368,134 +607,206 @@ class MultiStageBatteryRetriever:
                 ref_row = self.case_rows.iloc[ref_idx]
                 cell_uid = str(ref_row["cell_uid"])
                 domain_label = str(ref_row["domain_label"])
-                if cell_counter.get(cell_uid, 0) >= max_per_cell:
+                if cell_counter.get(cell_uid, 0) >= self.max_neighbors_per_cell:
                     continue
-                if max_per_domain is not None and domain_counter.get(domain_label, 0) >= int(max_per_domain):
+                if self.max_neighbors_per_domain is not None and domain_counter.get(domain_label, 0) >= int(self.max_neighbors_per_domain):
                     continue
-                relevance = -float(distances[pos])
+                relevance = -float(composite_distance[pos])
                 diversity = 0.0
                 if selected:
                     similarities = []
+                    ref_embedding = self.stage1_embeddings[ref_idx]
                     for selected_case in selected:
                         sel_idx = self.case_id_to_index[selected_case]
-                        similarities.append(_cosine_similarity(self.stage1_embeddings[ref_idx], self.stage1_embeddings[sel_idx]))
+                        similarities.append(_cosine_similarity(ref_embedding, self.stage1_embeddings[sel_idx]))
                     diversity = max(similarities) if similarities else 0.0
-                mmr_score = lambda_ * relevance - (1.0 - lambda_) * diversity
-                if best_score is None or mmr_score > best_score:
+                score = self.mmr_lambda * relevance - (1.0 - self.mmr_lambda) * diversity
+                if best_score is None or score > best_score:
                     best_case = case_id
-                    best_score = mmr_score
+                    best_score = score
             if best_case is None:
                 break
             selected.append(int(best_case))
+            mmr_scores.append(float(best_score))
             chosen_row = self.case_rows.iloc[self.case_id_to_index[int(best_case)]]
             cell_counter[str(chosen_row["cell_uid"])] = cell_counter.get(str(chosen_row["cell_uid"]), 0) + 1
             domain_counter[str(chosen_row["domain_label"])] = domain_counter.get(str(chosen_row["domain_label"]), 0) + 1
             candidate_order = [pos for pos in candidate_order if int(candidate_case_ids[pos]) != int(best_case)]
-        return np.asarray(selected, dtype=np.int64)
+        return np.asarray(selected, dtype=np.int64), np.asarray(mmr_scores, dtype=np.float32)
 
     def retrieve(self, query_case_id: int) -> RetrievalResult:
         query_idx = self.case_id_to_index[int(query_case_id)]
-        candidate_case_ids = self._coarse_candidates(query_idx)
-        candidate_case_ids = self._hard_filter_candidate_ids(query_idx, candidate_case_ids)
+        candidate_case_ids = self._hard_filter_candidate_ids(query_idx, self._coarse_candidates(query_idx))
         if candidate_case_ids.size == 0:
+            horizon = int(self.arrays["future_delta"].shape[1])
+            zeros = np.zeros(self.top_k, dtype=np.float32)
             return RetrievalResult(
                 query_case_id=int(query_case_id),
                 neighbor_case_ids=np.full(self.top_k, -1, dtype=np.int64),
-                retrieval_mask=np.zeros(self.top_k, dtype=np.float32),
-                composite_distances=np.full(self.top_k, np.inf, dtype=np.float32),
-                component_distances=np.zeros((self.top_k, len(COMPONENT_NAMES)), dtype=np.float32),
-                retrieval_alpha=np.zeros(self.top_k, dtype=np.float32),
+                retrieval_mask=zeros.copy(),
+                d_soh_state=zeros.copy(),
+                d_qv_shape=zeros.copy(),
+                d_physics=zeros.copy(),
+                d_operation=zeros.copy(),
+                d_metadata=zeros.copy(),
+                d_tsfm=zeros.copy(),
+                composite_distance=np.full(self.top_k, np.inf, dtype=np.float32),
                 retrieval_confidence=0.0,
-                neighbor_future_delta_soh=np.zeros((self.top_k, self.arrays["future_delta"].shape[1]), dtype=np.float32),
-                reference_compatibility_score=np.zeros(self.top_k, dtype=np.float32),
-                explain={"component_names": COMPONENT_NAMES, "warning": "No valid neighbors after hard filter"},
+                retrieval_alpha=zeros.copy(),
+                neighbor_future_delta_soh=np.zeros((self.top_k, horizon), dtype=np.float32),
+                neighbor_metadata=[{} for _ in range(self.top_k)],
+                explain_json={
+                    "component_names": COMPONENT_NAMES,
+                    "enabled_distance_components": [name for name in COMPONENT_NAMES if bool(self.rag_config["distance_components"][name]["enabled"])],
+                    "warning": "No valid neighbors after hard filtering.",
+                },
+                stage_distance=zeros.copy(),
+                missing_penalty=zeros.copy(),
+                reference_compatibility_score=zeros.copy(),
+                mmr_diversity_score=zeros.copy(),
             )
 
         candidate_case_ids = candidate_case_ids[: self.top_m]
-        components = []
-        composite = []
-        compat = []
+        bundles = []
         for case_id in candidate_case_ids.tolist():
             ref_idx = self.case_id_to_index[int(case_id)]
-            comp, comp_dist = self._component_distances(query_idx, ref_idx)
-            components.append(comp)
-            composite.append(comp_dist)
-            compat.append(self._reference_compatibility_score(query_idx, ref_idx, comp))
-        components = np.asarray(components, dtype=np.float32)
-        composite = np.asarray(composite, dtype=np.float32)
-        compat = np.asarray(compat, dtype=np.float32)
-        order = np.argsort(composite)
-        candidate_case_ids = candidate_case_ids[order]
-        components = components[order]
-        composite = composite[order]
-        compat = compat[order]
+            bundles.append(self._distance_bundle(query_idx, ref_idx))
 
-        selected_case_ids = self._apply_mmr(query_idx, candidate_case_ids, composite)
+        bundle_frame = pd.DataFrame(bundles)
+        order = np.argsort(bundle_frame["composite_distance"].to_numpy(dtype=np.float32))
+        candidate_case_ids = candidate_case_ids[order]
+        bundle_frame = bundle_frame.iloc[order].reset_index(drop=True)
+
+        selected_case_ids, mmr_scores = self._apply_mmr(candidate_case_ids, bundle_frame["composite_distance"].to_numpy(dtype=np.float32))
         if selected_case_ids.size == 0:
             selected_case_ids = candidate_case_ids[: self.top_k]
-        selected_positions = [int(np.flatnonzero(candidate_case_ids == case_id)[0]) for case_id in selected_case_ids.tolist()]
-        selected_components = components[selected_positions]
-        selected_composite = composite[selected_positions]
-        selected_compat = compat[selected_positions]
+            mmr_scores = np.ones(len(selected_case_ids), dtype=np.float32)
 
+        selected_positions = [int(np.flatnonzero(candidate_case_ids == case_id)[0]) for case_id in selected_case_ids.tolist()]
+        selected_frame = bundle_frame.iloc[selected_positions].reset_index(drop=True)
         k = min(len(selected_case_ids), self.top_k)
+        horizon = int(self.arrays["future_delta"].shape[1])
+
         neighbor_case_ids = np.full(self.top_k, -1, dtype=np.int64)
         retrieval_mask = np.zeros(self.top_k, dtype=np.float32)
-        composite_distances = np.full(self.top_k, np.inf, dtype=np.float32)
-        component_distances = np.zeros((self.top_k, len(COMPONENT_NAMES)), dtype=np.float32)
+        composite_distance = np.full(self.top_k, np.inf, dtype=np.float32)
+        named_distance_arrays = {name: np.zeros(self.top_k, dtype=np.float32) for name in COMPONENT_NAMES}
+        stage_distance = np.zeros(self.top_k, dtype=np.float32)
+        missing_penalty = np.zeros(self.top_k, dtype=np.float32)
+        reference_compatibility_score = np.zeros(self.top_k, dtype=np.float32)
+        mmr_diversity_score = np.zeros(self.top_k, dtype=np.float32)
         retrieval_alpha = np.zeros(self.top_k, dtype=np.float32)
-        compatibility = np.zeros(self.top_k, dtype=np.float32)
-        neighbor_future_delta = np.zeros((self.top_k, self.arrays["future_delta"].shape[1]), dtype=np.float32)
+        neighbor_future_delta_soh = np.zeros((self.top_k, horizon), dtype=np.float32)
+        neighbor_metadata = [{} for _ in range(self.top_k)]
 
         if k > 0:
             neighbor_case_ids[:k] = selected_case_ids[:k]
             retrieval_mask[:k] = 1.0
-            composite_distances[:k] = selected_composite[:k]
-            component_distances[:k] = selected_components[:k]
-            compatibility[:k] = selected_compat[:k]
-            retrieval_alpha[:k] = _softmax_masked(selected_composite[:k], retrieval_mask[:k], self.retrieval_temperature)
-            neighbor_future_delta[:k] = self.arrays["future_delta"][selected_case_ids[:k]]
-
-        confidence = compute_retrieval_confidence(component_distances[:k]) if k > 0 else 0.0
-        explain = {
-            "component_names": COMPONENT_NAMES,
-            "candidate_count_after_filter": int(len(candidate_case_ids)),
-            "selected_metadata": [
-                self.case_rows.iloc[self.case_id_to_index[int(case_id)]][
-                    ["case_id", "cell_uid", "chemistry_family", "domain_label", "degradation_stage", "anchor_soh", "recent_soh_slope"]
+            composite_distance[:k] = selected_frame["composite_distance"].to_numpy(dtype=np.float32)[:k]
+            for name in COMPONENT_NAMES:
+                named_distance_arrays[name][:k] = selected_frame[name].to_numpy(dtype=np.float32)[:k]
+            stage_distance[:k] = selected_frame["stage_distance"].to_numpy(dtype=np.float32)[:k]
+            missing_penalty[:k] = selected_frame["missing_penalty"].to_numpy(dtype=np.float32)[:k]
+            reference_compatibility_score[:k] = selected_frame["reference_compatibility_score"].to_numpy(dtype=np.float32)[:k]
+            mmr_diversity_score[: min(len(mmr_scores), self.top_k)] = mmr_scores[: self.top_k]
+            retrieval_alpha[:k] = _softmax_masked(composite_distance[:k], retrieval_mask[:k], self.retrieval_temperature)
+            row_indices = [self.case_id_to_index[int(case_id)] for case_id in selected_case_ids[:k].tolist()]
+            neighbor_future_delta_soh[:k] = np.asarray(self.arrays["future_delta"][row_indices], dtype=np.float32)
+            neighbor_metadata[:k] = [
+                self.case_rows.iloc[row_idx][
+                    [
+                        "case_id",
+                        "cell_uid",
+                        "chemistry_family",
+                        "domain_label",
+                        "source_dataset",
+                        "degradation_stage",
+                        "anchor_soh",
+                        "recent_soh_slope",
+                        "voltage_window_bucket",
+                    ]
                 ].to_dict()
-                for case_id in neighbor_case_ids[:k].tolist()
-            ],
-            "selected_component_distances": component_distances[:k].tolist(),
+                for row_idx in row_indices
+            ]
+
+        confidence_payload = {
+            "composite_distance": composite_distance[:k],
+            "feature_availability_ratio": float(selected_frame["feature_availability_ratio"].mean()) if k > 0 else 0.0,
+            "chemistry_match_rate": float(selected_frame["chemistry_match"].mean()) if k > 0 else 0.0,
+            "domain_match_rate": float(selected_frame["domain_match"].mean()) if k > 0 else 0.0,
         }
+        retrieval_confidence = compute_retrieval_confidence(confidence_payload, self.rag_config) if k > 0 else 0.0
+
+        explain_json = {
+            "component_names": COMPONENT_NAMES,
+            "enabled_distance_components": [
+                name
+                for name in COMPONENT_NAMES
+                if bool(dict(self.rag_config.get("distance_components", {}).get(name, {}) or {}).get("enabled", False))
+            ],
+            "candidate_count_after_filter": int(len(candidate_case_ids)),
+            "selected_neighbors": [
+                {
+                    "case_id": int(neighbor_case_ids[pos]),
+                    "metadata": neighbor_metadata[pos],
+                    **{name: float(named_distance_arrays[name][pos]) for name in COMPONENT_NAMES},
+                    "composite_distance": float(composite_distance[pos]),
+                    "stage_distance": float(stage_distance[pos]),
+                    "missing_penalty": float(missing_penalty[pos]),
+                    "reference_compatibility_score": float(reference_compatibility_score[pos]),
+                    "mmr_diversity_score": float(mmr_diversity_score[pos]),
+                }
+                for pos in range(k)
+            ],
+            "feature_switches": self.rag_config,
+        }
+
         return RetrievalResult(
             query_case_id=int(query_case_id),
             neighbor_case_ids=neighbor_case_ids,
             retrieval_mask=retrieval_mask,
-            composite_distances=composite_distances,
-            component_distances=component_distances,
+            d_soh_state=named_distance_arrays["d_soh_state"],
+            d_qv_shape=named_distance_arrays["d_qv_shape"],
+            d_physics=named_distance_arrays["d_physics"],
+            d_operation=named_distance_arrays["d_operation"],
+            d_metadata=named_distance_arrays["d_metadata"],
+            d_tsfm=named_distance_arrays["d_tsfm"],
+            composite_distance=composite_distance,
+            retrieval_confidence=float(retrieval_confidence),
             retrieval_alpha=retrieval_alpha,
-            retrieval_confidence=float(confidence),
-            neighbor_future_delta_soh=neighbor_future_delta,
-            reference_compatibility_score=compatibility,
-            explain=explain,
+            neighbor_future_delta_soh=neighbor_future_delta_soh,
+            neighbor_metadata=neighbor_metadata,
+            explain_json=explain_json,
+            stage_distance=stage_distance,
+            missing_penalty=missing_penalty,
+            reference_compatibility_score=reference_compatibility_score,
+            mmr_diversity_score=mmr_diversity_score,
         )
 
     def build_cache(self, query_case_ids: Iterable[int], output_path: str | Path) -> Path:
         output_path = Path(output_path)
         query_case_ids = [int(case_id) for case_id in query_case_ids]
-        all_results = [self.retrieve(case_id) for case_id in query_case_ids]
+        results = [self.retrieve(case_id) for case_id in query_case_ids]
         np.savez_compressed(
             output_path,
             query_case_ids=np.asarray(query_case_ids, dtype=np.int64),
-            neighbor_case_ids=np.stack([result.neighbor_case_ids for result in all_results]).astype(np.int64),
-            retrieval_mask=np.stack([result.retrieval_mask for result in all_results]).astype(np.float32),
-            composite_distances=np.stack([result.composite_distances for result in all_results]).astype(np.float32),
-            component_distances=np.stack([result.component_distances for result in all_results]).astype(np.float32),
-            retrieval_alpha=np.stack([result.retrieval_alpha for result in all_results]).astype(np.float32),
-            retrieval_confidence=np.asarray([result.retrieval_confidence for result in all_results], dtype=np.float32),
-            reference_compatibility_score=np.stack([result.reference_compatibility_score for result in all_results]).astype(np.float32),
-            config_hash=np.asarray([self.retrieval_config_hash()], dtype=object),
+            neighbor_case_ids=np.stack([result.neighbor_case_ids for result in results]).astype(np.int64),
+            retrieval_mask=np.stack([result.retrieval_mask for result in results]).astype(np.float32),
+            retrieval_alpha=np.stack([result.retrieval_alpha for result in results]).astype(np.float32),
+            retrieval_confidence=np.asarray([result.retrieval_confidence for result in results], dtype=np.float32),
+            composite_distance=np.stack([result.composite_distance for result in results]).astype(np.float32),
+            component_distances=np.stack([result.component_distances for result in results]).astype(np.float32),
+            d_soh_state=np.stack([result.d_soh_state for result in results]).astype(np.float32),
+            d_qv_shape=np.stack([result.d_qv_shape for result in results]).astype(np.float32),
+            d_physics=np.stack([result.d_physics for result in results]).astype(np.float32),
+            d_operation=np.stack([result.d_operation for result in results]).astype(np.float32),
+            d_metadata=np.stack([result.d_metadata for result in results]).astype(np.float32),
+            d_tsfm=np.stack([result.d_tsfm for result in results]).astype(np.float32),
+            stage_distance=np.stack([np.asarray(result.stage_distance, dtype=np.float32) for result in results]).astype(np.float32),
+            missing_penalty=np.stack([np.asarray(result.missing_penalty, dtype=np.float32) for result in results]).astype(np.float32),
+            reference_compatibility_score=np.stack([np.asarray(result.reference_compatibility_score, dtype=np.float32) for result in results]).astype(np.float32),
+            mmr_diversity_score=np.stack([np.asarray(result.mmr_diversity_score, dtype=np.float32) for result in results]).astype(np.float32),
             component_names=np.asarray(COMPONENT_NAMES, dtype=object),
+            config_hash=np.asarray([self.retrieval_config_hash()], dtype=object),
         )
         return output_path

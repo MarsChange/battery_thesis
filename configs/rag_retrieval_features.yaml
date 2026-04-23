@@ -1,0 +1,290 @@
+# configs/rag_retrieval_features.yaml
+#
+# 用途：
+# 本文件控制 RAG 检索阶段使用哪些特征。
+# RAG 检索目标是为当前 query 电池窗口寻找历史 reference cases。
+# enabled: true 表示该特征或距离分量参与检索；
+# enabled: false 表示不参与检索，但仍可用于日志、诊断或可视化。
+#
+# 核心距离分量：
+# d_soh_state : SOH 状态距离，衡量当前健康状态和近期退化趋势是否相似。
+# d_qv_shape : 容量-电压曲线形状距离，衡量 Q-indexed voltage/current curve 是否相似。
+# d_physics : 物理启发特征距离，衡量 partial charging 和 relaxation 中提取的退化 proxy 是否相似。
+# d_operation : 工况距离，衡量充放电倍率、温度、DoD、协议变化等运行条件是否相似。
+# d_metadata : 元信息距离，衡量 chemistry family、数据集、电压窗口、容量规格等背景是否可比。
+# d_tsfm : 时间序列基础模型嵌入距离，衡量通用时序形态是否相似。
+#
+# 注意：
+# 所有距离数值越小表示越相似。
+# composite_distance 是 enabled=true 的距离分量加权和。
+# retrieval_confidence 是 top-k 检索结果可信度，数值越大表示检索结果越可靠。
+
+schema_version: "1.0"
+
+distance_components:
+  d_soh_state:
+    enabled: true
+    weight: 0.20
+    description: "SOH 状态距离；用于衡量 query 和 reference 在当前 SOH、近期退化斜率、退化曲率和退化阶段上的相似性。数值越小表示两个案例处于越相似的健康状态和退化阶段。"
+    normalization: "robust_zscore_from_source_train"
+    missing_policy: "required"
+    features:
+      anchor_soh:
+        enabled: true
+        description: "窗口最后一个循环的 SOH，表示当前健康状态。用于避免检索到退化阶段完全不同的历史案例。单位：无量纲比例，通常在 0 到 1 之间。"
+      recent_soh_slope:
+        enabled: true
+        description: "近期 SOH 下降斜率，表示当前窗口内的退化速度。通常为负值，绝对值越大表示退化越快。用于检索近期衰减速度相似的案例。"
+      recent_soh_curvature:
+        enabled: true
+        description: "近期 SOH 曲率或二阶趋势，表示退化是否加速或减速。用于识别 knee 之前的加速退化趋势。"
+      degradation_stage:
+        enabled: true
+        description: "退化阶段类别，例如 early、middle、late，通常由 anchor_soh 或循环阶段离散化得到。用于软约束检索案例处于相近退化阶段。"
+      normalized_cycle_index:
+        enabled: false
+        description: "归一化循环位置，表示当前窗口在完整循环寿命中的相对位置。默认不启用，因为完整寿命信息在真实部署中可能不可用。"
+
+  d_qv_shape:
+    enabled: true
+    weight: 0.25
+    description: "容量-电压曲线形状距离；用于衡量 query 和 reference 的 Q-indexed 充放电电压/电流曲线是否相似。该距离继承 BatLiNet 中使用 voltage-capacity curve 进行 inter-cell difference learning 的思想。"
+    normalization: "source_train_percentile"
+    missing_policy: "mask_available_channels"
+    features:
+      vd_curve_q:
+        enabled: true
+        description: "Vd(Q)，归一化容量 Q 轴上的放电电压曲线。用于比较放电平台、平台偏移和容量-电压形态。"
+      vc_curve_q:
+        enabled: false
+        description: "Vc(Q)，归一化容量 Q 轴上的充电电压曲线。默认不启用，避免充电协议差异过强影响检索；可在消融实验中启用。"
+      delta_v_curve_q:
+        enabled: true
+        description: "DeltaV(Q)=Vc(Q)-Vd(Q)，同一归一化容量位置上的充放电电压差。可作为极化和阻抗变化的宏观 proxy。"
+      r_curve_q:
+        enabled: true
+        description: "R(Q)=DeltaV(Q)/(Ic(Q)-Id(Q)+eps)，近似表示容量维度上的极化/等效阻抗 proxy。需要数值稳定处理和异常值截断。"
+      ic_curve_q:
+        enabled: false
+        description: "Ic(Q)，归一化容量 Q 轴上的充电电流曲线。默认不启用，因为不同充电协议可能导致电流曲线差异过大。"
+      id_curve_q:
+        enabled: false
+        description: "Id(Q)，归一化容量 Q 轴上的放电电流曲线。默认不启用，可在工况相同或电流曲线可靠时启用。"
+      qv_summary_stats:
+        enabled: true
+        description: "Q-V 曲线统计特征，包括 delta_v_mean、delta_v_std、delta_v_q95、r_mean、r_std、r_q95、vc_curve_slope_mean、vd_curve_slope_mean。用于在低维空间稳定比较曲线形态。"
+    channel_weights:
+      Vd: 0.20
+      Vc: 0.05
+      DeltaV: 0.35
+      R: 0.30
+      Ic: 0.05
+      Id: 0.05
+
+  d_physics:
+    enabled: true
+    weight: 0.20
+    description: "物理启发特征距离；用于衡量从 partial charging curve 和 relaxation voltage 中提取的低维退化状态 proxy 是否相似。该距离借鉴 iMOE 中使用 physics-informed features 驱动 degradation router 的思想。"
+    normalization: "robust_zscore_from_source_train"
+    missing_policy: "mask_available_features"
+    features:
+      q_total:
+        enabled: true
+        description: "partial charging curve 的累计输入电荷总量。反映当前充电区间内的容量接受能力。"
+      q_mean:
+        enabled: true
+        description: "partial charging curve 的均值。反映充电曲线整体水平。"
+      q_std:
+        enabled: true
+        description: "partial charging curve 的标准差。反映充电曲线在电压区间内的变化程度。"
+      q_low_voltage_slope:
+        enabled: true
+        description: "partial charging curve 在低电压区间的斜率。用于刻画低 SOC / 低电压区域的容量-电压响应。"
+      q_mid_voltage_slope:
+        enabled: true
+        description: "partial charging curve 在中电压区间的斜率。用于刻画主要平台区间的容量-电压响应。"
+      q_high_voltage_slope:
+        enabled: true
+        description: "partial charging curve 在高电压区间的斜率。用于刻画高 SOC / 高电压区域的容量-电压响应。"
+      dq_dv_peak_value:
+        enabled: true
+        description: "dq/dv 曲线峰值大小。可作为电压平台变化和反应区间变化的低维 proxy。"
+      dq_dv_peak_position:
+        enabled: true
+        description: "dq/dv 峰值所在的电压位置。用于反映电压平台或反应峰位置偏移。"
+      relaxation_delta_v:
+        enabled: true
+        description: "弛豫开始到结束的电压变化量，V_relax_start - V_relax_end。用于反映极化恢复幅度。"
+      relaxation_initial_slope:
+        enabled: true
+        description: "弛豫初期电压恢复斜率。用于反映快速极化恢复过程。"
+      relaxation_late_slope:
+        enabled: true
+        description: "弛豫后期电压恢复斜率。用于反映慢速恢复过程。"
+      relaxation_area_or_tau_proxy:
+        enabled: true
+        description: "弛豫电压曲线面积或时间常数 proxy。用于反映整体弛豫恢复程度和速度。"
+
+  d_operation:
+    enabled: true
+    weight: 0.10
+    description: "历史工况距离；用于衡量 query 和 reference 在充放电倍率、温度、DoD、协议变化和静置时间等运行条件上的相似性。数值越小表示近期运行压力越接近。"
+    normalization: "robust_zscore_from_source_train"
+    missing_policy: "mask_available_features"
+    features:
+      charge_c_rate_mean:
+        enabled: true
+        description: "历史窗口内充电倍率均值。用于衡量平均充电强度。"
+      charge_c_rate_std:
+        enabled: true
+        description: "历史窗口内充电倍率标准差。用于衡量充电倍率波动和变工况程度。"
+      discharge_c_rate_mean:
+        enabled: true
+        description: "历史窗口内放电倍率均值。用于衡量平均放电强度。"
+      discharge_c_rate_std:
+        enabled: true
+        description: "历史窗口内放电倍率标准差。用于衡量放电倍率波动和变工况程度。"
+      temperature_mean:
+        enabled: true
+        description: "历史窗口内温度均值。用于衡量平均热环境。"
+      temperature_std:
+        enabled: true
+        description: "历史窗口内温度标准差。用于衡量温度波动。"
+      temperature_max:
+        enabled: true
+        description: "历史窗口内最高温度。用于捕捉可能加速退化的高温暴露。"
+      dod_estimate:
+        enabled: false
+        description: "估计放电深度或容量摆幅。默认不启用，因为不同数据集可能无法稳定计算。"
+      protocol_change_rate:
+        enabled: true
+        description: "历史窗口内工况策略切换频率，例如倍率或温度条件改变的比例。用于刻画变工况强度。"
+      charge_duration_mean:
+        enabled: false
+        description: "平均充电时长。默认不启用，因为不同数据集时间采样和协议记录可能不一致。"
+      discharge_duration_mean:
+        enabled: false
+        description: "平均放电时长。默认不启用。"
+      rest_duration_mean:
+        enabled: false
+        description: "平均静置时长。默认不启用，可在静置数据可靠时启用。"
+      future_operation_if_known:
+        enabled: false
+        description: "未来 horizon 内已知工况，例如 future charge C-rate、future discharge C-rate、future temperature。默认不启用，避免测试时未来工况泄漏；仅在明确的 known future operation 实验设置中启用。"
+
+  d_metadata:
+    enabled: true
+    weight: 0.10
+    description: "元信息距离；用于衡量 query 和 reference 在 chemistry family、数据集来源、电压窗口、容量规格、domain label 等背景信息上是否可比。该距离是 soft penalty，不是默认硬过滤。"
+    normalization: "categorical_penalty"
+    missing_policy: "unknown_category"
+    features:
+      chemistry_family:
+        enabled: true
+        description: "电池正极化学体系，例如 LFP、NCM、NCA。用于优先检索化学体系相同或相近的案例，但默认不禁止跨化学体系检索。"
+      source_dataset:
+        enabled: false
+        description: "数据集来源，例如 TJU、HUST、MIT。默认不启用，避免模型过度依赖数据集标签；可用于诊断跨数据集偏移。"
+      domain_label:
+        enabled: true
+        description: "由 chemistry、温度、倍率、协议等组合得到的 domain 标签。用于软约束检索相似工况域。"
+      voltage_window_bucket:
+        enabled: true
+        description: "电压窗口类别，例如 2.5-4.2V、3.0-4.2V。用于避免电压曲线不可比。"
+      nominal_capacity_bucket:
+        enabled: false
+        description: "额定容量分桶。默认不启用，因为 SOH 已经做归一化；可在不同容量规格差异较大时启用。"
+      temperature_bucket:
+        enabled: false
+        description: "温度分桶。默认不启用，因为温度已经在 d_operation 中连续度量。"
+      charge_rate_bucket:
+        enabled: false
+        description: "充电倍率分桶。默认不启用，因为倍率已经在 d_operation 中连续度量。"
+    categorical_penalties:
+      chemistry_family_mismatch: 1.00
+      domain_label_mismatch: 0.50
+      voltage_window_mismatch: 0.50
+      source_dataset_mismatch: 0.10
+      nominal_capacity_mismatch: 0.20
+      temperature_bucket_mismatch: 0.10
+      charge_rate_bucket_mismatch: 0.10
+
+  d_tsfm:
+    enabled: true
+    weight: 0.15
+    description: "时间序列基础模型嵌入距离；用于衡量 query 和 reference 在 Chronos、Timer 或其他 TSFM embedding 空间中的通用时序形态相似性。该距离没有直接物理解释，主要用于 Stage-1 粗检索和补充手工特征未覆盖的时序形态。"
+    normalization: "faiss_l2_or_cosine"
+    missing_policy: "fallback_to_handcrafted_embedding"
+    features:
+      tsfm_embedding:
+        enabled: true
+        description: "由时间序列基础模型提取的固定维度 embedding。用于捕捉 SOH、容量、电压、电流、温度等序列的整体时序形态。"
+      tsfm_stage1_coarse_retrieval:
+        enabled: true
+        description: "是否使用 d_tsfm 进行 Stage-1 粗检索。建议启用，以便先从大规模历史库中高效召回 top-M 候选，再用物理启发距离重排序。"
+      tsfm_in_final_rerank:
+        enabled: true
+        description: "是否让 d_tsfm 参与最终 composite_distance。建议权重较低，避免黑箱 embedding 主导最终检索。"
+
+diagnostic_components:
+  stage_distance:
+    enabled: false
+    description: "退化阶段诊断距离。默认不进入 composite_distance，因为它和 anchor_soh、slope、curvature 信息部分重复。"
+  missing_penalty:
+    enabled: false
+    description: "缺失特征惩罚。默认不进入 composite_distance，避免数据集格式差异过度影响相似性判断；可作为诊断指标输出。"
+  reference_compatibility_score:
+    enabled: true
+    description: "参考案例适配度诊断分数。用于日志和可视化，不默认参与 composite_distance。"
+  mmr_diversity_score:
+    enabled: true
+    description: "MMR 多样性分数。用于避免 top-k 全部来自同一个 cell 或同一个 domain。只影响最终选择多样性，不改变原始距离解释。"
+
+composite_distance:
+  description: "综合检索距离，由 enabled=true 的核心距离分量加权求和得到。数值越小表示 query 和 reference 越相似。"
+  normalize_weights_over_enabled_components: true
+  lower_is_better: true
+
+retrieval_confidence:
+  description: "检索置信度，表示 top-k 检索案例是否可靠。数值越大越可信。由 top-k composite_distance 均值、距离离散程度、特征可用率和 metadata match rate 等因素计算。"
+  enabled: true
+  output_range: [0.0, 1.0]
+  factors:
+    mean_topk_composite_distance:
+      enabled: true
+      description: "top-k 综合距离均值。越小表示整体检索案例越接近 query。"
+    std_topk_composite_distance:
+      enabled: true
+      description: "top-k 综合距离标准差。越小说明 top-k 候选一致性更高。"
+    top1_distance:
+      enabled: true
+      description: "最近邻距离。越小说明至少存在一个非常相似的历史案例。"
+    feature_availability_ratio:
+      enabled: true
+      description: "参与检索的物理/曲线/工况特征可用率。可用率越高，检索置信度越高。"
+    chemistry_match_rate:
+      enabled: true
+      description: "top-k 中 chemistry family 与 query 一致的比例。比例越高表示参考案例材料体系更一致。"
+    domain_match_rate:
+      enabled: false
+      description: "top-k 中 domain label 与 query 一致的比例。默认不启用，避免过度限制跨工况迁移。"
+
+stage1_retrieval:
+  description: "Stage-1 粗检索配置。通常使用 d_tsfm 对全库进行快速候选召回，然后在 Stage-2 使用物理启发距离重排序。"
+  top_m: 200
+  use_tsfm_embedding: true
+  fallback_when_tsfm_missing: "handcrafted_state_physics_embedding"
+
+final_topk:
+  top_k: 8
+  use_mmr: true
+  mmr_lambda: 0.75
+  max_neighbors_per_cell: 2
+  same_cell_policy: "exclude"
+  allow_cross_chemistry: true
+
+logging:
+  save_component_distances: true
+  save_retrieval_confidence: true
+  save_feature_switches: true
+  save_yaml_snapshot_with_each_run: true

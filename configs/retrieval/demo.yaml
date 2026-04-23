@@ -1,0 +1,41 @@
+# ============================================================
+# Demo config for the retrieval-only framework (Phase 1)
+# ============================================================
+# Usage:
+#   python -m retrieval.cli_build  --config configs/retrieval/demo.yaml
+#   python -m retrieval.cli_search --config configs/retrieval/demo.yaml --top_k 5
+
+# --- Encoder (Chronos-2 via chronos-forecasting ≥ 2.0) ------
+encoder:
+  model_path: "autogluon/chronos-2"     # HF model ID or local path
+  pooling: "mean"                        # "mean" or "last"
+  device: "auto"                         # "auto" / "cpu" / "cuda" / "mps"
+  context_length: null                   # null = model default (8192)
+  batch_size: 64
+  torch_dtype: "float32"                 # "float32" / "bfloat16"
+
+# --- Data source ---------------------------------------------
+data:
+  source: "synthetic"        # "synthetic" or "csv"
+  # csv_path: "./datasets/ETT-small/ETTh1.csv"   # uncomment for CSV
+  # columns: null             # null = auto-detect numeric columns
+  n_series: 3                # synthetic only
+  length: 500                # synthetic only
+  seed: 42                   # synthetic only
+  lookback_length: 64
+  prediction_length: 16
+  stride: 8
+
+# --- Retrieval ------------------------------------------------
+retrieval:
+  metric: "cosine"           # "cosine" or "l2"
+  top_k: 5
+
+# --- FAISS ----------------------------------------------------
+faiss:
+  index_type: "flat"         # only flat supported in Phase 1
+  normalize_embeddings: true # redundant when metric=cosine (auto)
+
+# --- Output ---------------------------------------------------
+output_dir: "output/retrieval_db"
+db_name: "demo"

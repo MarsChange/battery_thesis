@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from forecasting.routers import BranchFusionRouter, PhysicalDegradationRouter
+from retrieval.multistage_retriever import COMPONENT_NAMES
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
@@ -133,7 +134,7 @@ class BatterySOHForecaster(nn.Module):
 
         state_dim = 3
         query_repr_dim = hidden_dim * 4 + hidden_dim + meta_embedding_dim + tsfm_dim + state_dim + physics_dim
-        pair_input_dim = query_repr_dim * 4 + self.horizon + 8 + 1
+        pair_input_dim = query_repr_dim * 4 + self.horizon + len(COMPONENT_NAMES) + 1
         expert_input_dim = hidden_dim * 5 + meta_embedding_dim + tsfm_dim + state_dim + self.horizon * 3
 
         self.generalist_head = MLPHead(hidden_dim + meta_embedding_dim + tsfm_dim, self.horizon, hidden_dim, dropout)
@@ -292,6 +293,15 @@ class BatterySOHForecaster(nn.Module):
             retrieval["ref_future_delta_soh"].to(torch.float32) * retrieval["retrieval_alpha"].to(torch.float32).unsqueeze(-1),
             dim=1,
         )
+        composite_distance = retrieval["composite_distance"].to(torch.float32)
+        retrieval_mask = retrieval["retrieval_mask"].to(torch.float32)
+        compatibility = retrieval["reference_compatibility_score"].to(torch.float32)
+        masked_composite = composite_distance.masked_fill(retrieval_mask <= 0, 0.0)
+        valid_counts = retrieval_mask.sum(dim=1).clamp_min(1.0)
+        composite_mean = masked_composite.sum(dim=1) / valid_counts
+        composite_var = ((masked_composite - composite_mean.unsqueeze(-1)) ** 2 * retrieval_mask).sum(dim=1) / valid_counts
+        composite_std = torch.sqrt(composite_var.clamp_min(0.0))
+        compatibility_mean = (compatibility * retrieval_mask).sum(dim=1) / valid_counts
 
         fm_input = torch.cat(
             [query_encoded["h_cycle"], query_encoded["meta_embedding"], query_encoded["tsfm_embedding"]],
@@ -376,10 +386,10 @@ class BatterySOHForecaster(nn.Module):
             "retrieval": torch.stack(
                 [
                     retrieval["retrieval_confidence"].to(torch.float32),
-                    retrieval["component_distances"].to(torch.float32).mean(dim=(1, 2)),
-                    retrieval["component_distances"].to(torch.float32).std(dim=(1, 2)),
+                    composite_mean,
+                    composite_std,
                     retrieval["retrieval_alpha"].to(torch.float32).max(dim=1).values,
-                    retrieval["reference_compatibility_score"].to(torch.float32).mean(dim=1),
+                    compatibility_mean,
                 ],
                 dim=-1,
             ),
@@ -406,9 +416,9 @@ class BatterySOHForecaster(nn.Module):
         expert_outputs = torch.stack([expert(expert_input) for expert in self.expert_bank], dim=1)
         moe_delta = torch.sum(expert_outputs * router_out["weights"].unsqueeze(-1), dim=1)
 
-        retrieval_dist_mean = retrieval["component_distances"].to(torch.float32).mean(dim=(1, 2))
-        retrieval_dist_std = retrieval["component_distances"].to(torch.float32).std(dim=(1, 2))
-        top1_topk_gap = retrieval["component_distances"].to(torch.float32)[:, 0].mean(dim=-1) - retrieval_dist_mean
+        retrieval_dist_mean = composite_mean
+        retrieval_dist_std = composite_std
+        top1_topk_gap = composite_distance[:, 0].masked_fill(retrieval_mask[:, 0] <= 0, 0.0) - retrieval_dist_mean
         fusion_inputs = {
             "retrieval": torch.stack(
                 [
