@@ -1,7 +1,7 @@
 """battery_data.build_case_bank
 
 构建用于少样本跨工况电池 SOH 多步预测的数值案例库。
-输出包含监督标签、Q-V 曲线特征、物理启发特征、工况特征和可选 TSFM embedding。
+输出包含监督标签、Q-V 曲线特征、ΔV/R 物理 proxy、工况特征和 LSTM expert 序列。
 """
 
 from __future__ import annotations
@@ -25,11 +25,11 @@ from battery_data.curve_features import QV_CHANNEL_NAMES, extract_q_indexed_feat
 from battery_data.domain_labeling import build_domain_label
 from battery_data.features import augment_cycle_feature_frame, recent_delta_mean
 from battery_data.physical_features import (
+    PHYSICS_FEATURE_NAMES,
     aggregate_window_physics_features,
     compute_physics_features,
     extract_partial_charge_curve,
-    extract_relaxation_curve,
-    plot_partial_charge_and_relaxation,
+    plot_partial_charge_curve,
 )
 from battery_data.schema import DEFAULT_TOKEN_FEATURES
 from battery_data.splits import assert_no_split_leakage, build_split_manifest
@@ -59,6 +59,23 @@ DEFAULT_OPERATION_FEATURES = [
     "discharge_throughput_delta_1",
     "energy_charge_delta_1",
     "energy_discharge_delta_1",
+]
+
+EXPERT_SEQ_FEATURES = [
+    "soh_t",
+    "voltage_mean_t",
+    "current_abs_mean_t",
+    "temp_mean_t",
+    "delta_v_mean_t",
+    "delta_v_std_t",
+    "r_mean_t",
+    "r_std_t",
+    "delta_v_q95_t",
+    "r_q95_t",
+    "charge_c_rate_mean_t",
+    "discharge_c_rate_mean_t",
+    "temperature_max_t",
+    "protocol_change_rate_t",
 ]
 
 
@@ -268,6 +285,49 @@ def _window_feature_summary(array: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _build_expert_seq(
+    feature_frame: pd.DataFrame,
+    physics_features_all: np.ndarray,
+    anchor_capacity_values: np.ndarray,
+) -> np.ndarray:
+    voltage_mean = pd.to_numeric(feature_frame.get("voltage_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    current_abs_mean = pd.to_numeric(feature_frame.get("current_abs_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    temp_mean = pd.to_numeric(feature_frame.get("temp_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    soh = pd.to_numeric(feature_frame.get("soh", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    delta_v_mean = pd.to_numeric(feature_frame.get("delta_v_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    delta_v_std = pd.to_numeric(feature_frame.get("delta_v_std", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    delta_v_q95 = pd.to_numeric(feature_frame.get("delta_v_q95", feature_frame.get("delta_v_max", 0.0)), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    r_mean = pd.to_numeric(feature_frame.get("r_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    r_std = pd.to_numeric(feature_frame.get("r_std", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    r_q95 = pd.to_numeric(feature_frame.get("r_q95", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    temp_max = pd.to_numeric(feature_frame.get("temp_max", feature_frame.get("temp_mean", 0.0)), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+    safe_capacity = np.maximum(np.asarray(anchor_capacity_values, dtype=np.float32), 1e-6)
+    charge_c_rate = current_abs_mean / safe_capacity
+    discharge_c_rate = current_abs_mean / safe_capacity
+    protocol_change_rate = np.zeros_like(charge_c_rate, dtype=np.float32)
+    if len(protocol_change_rate) > 1:
+        protocol_change_rate[1:] = np.abs(np.diff(charge_c_rate))
+    return np.stack(
+        [
+            soh,
+            voltage_mean,
+            current_abs_mean,
+            temp_mean,
+            delta_v_mean,
+            delta_v_std,
+            r_mean,
+            r_std,
+            delta_v_q95,
+            r_q95,
+            charge_c_rate,
+            discharge_c_rate,
+            temp_max,
+            protocol_change_rate,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+
 def _fit_normalization_stats(rows: pd.DataFrame, arrays: Dict[str, np.ndarray]) -> Dict[str, object]:
     source_idx = rows.index[rows["split"] == "source_train"].to_numpy(dtype=np.int64)
     stats: Dict[str, object] = {"fit_split": "source_train", "num_fit_cases": int(len(source_idx))}
@@ -294,7 +354,6 @@ def _hashable_missing_summary(case: CaseSample) -> Dict[str, float]:
     return {
         "qv_missing_ratio": float(1.0 - np.asarray(case.qv_masks, dtype=np.float32).mean()),
         "partial_charge_missing_ratio": float(1.0 - np.asarray(case.partial_charge_masks, dtype=np.float32).mean()),
-        "relaxation_missing_ratio": float(1.0 - np.asarray(case.relaxation_masks, dtype=np.float32).mean()),
         "physics_feature_missing_ratio": float(1.0 - np.asarray(case.physics_feature_masks, dtype=np.float32).mean()),
         "future_ops_missing_ratio": float(1.0 - np.asarray(case.future_operation_mask, dtype=np.float32).mean()) if np.asarray(case.future_operation_mask).size else 1.0,
     }
@@ -416,42 +475,37 @@ def _save_case_bank_figures(case_rows: pd.DataFrame, arrays: Dict[str, np.ndarra
         )
 
     example_idx = 0
-    plot_partial_charge_and_relaxation(
+    plot_partial_charge_curve(
         partial_charge_curve=arrays["case_partial_charge.npy"][example_idx, -1],
         partial_charge_mask=bool(arrays["case_partial_charge_mask.npy"][example_idx, -1]),
-        relaxation_curve=arrays["case_relaxation.npy"][example_idx, -1],
-        relaxation_mask=bool(arrays["case_relaxation_mask.npy"][example_idx, -1]),
-        save_path=figure_dir / "example_partial_charge_relaxation.png",
-        title="Example anchor partial-charge / relaxation features",
+        save_path=figure_dir / "example_partial_charge_curve.png",
+        title="Example anchor partial-charge feature",
     )
 
 
-def _optional_window_encoder(cfg: Dict[str, object]):
-    model_cfg = cfg.get("model", {})
-    if not bool(model_cfg.get("use_tsfm_embedding", True)):
-        return None
-    if "encoder" not in cfg:
-        return None
-    try:
-        from battery_data.cli_build_memory_bank import build_encoder_from_config
+def build_case_bank_from_cells(
+    cfg: Dict[str, object],
+    cells: List,
+    split_manifest: pd.DataFrame | None = None,
+) -> Dict[str, object]:
+    """从显式给定的 canonical cells 构建案例库。
 
-        return build_encoder_from_config(cfg)
-    except Exception as exc:
-        print(f"[CaseBank] Skip tsfm embedding build: {exc}", flush=True)
-        return None
+    该入口用于自定义子集实验：
+    - 可只把部分 cell 放进 reference database；
+    - 可手动指定 split manifest，确保 target_query 永不进入 reference DB；
+    - 保持与主流程 `build_case_bank(cfg)` 完全一致的 case bank 格式。
+    """
 
-
-def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
     output_dir = Path(cfg.get("output_dir", "output/case_bank"))
     output_dir.mkdir(parents=True, exist_ok=True)
     figure_dir = output_dir / "figures" / "preprocessing_overview"
     figure_dir.mkdir(parents=True, exist_ok=True)
 
-    cells = assign_cell_uids(load_enabled_cells(cfg), prefix=str(cfg.get("cell_uid_prefix", "cell")))
     if not cells:
         raise ValueError("No cells were loaded; cannot build case bank.")
 
-    split_manifest = build_split_manifest(cells, cfg.get("split", {}), cfg.get("domain_labeling"))
+    if split_manifest is None:
+        split_manifest = build_split_manifest(cells, cfg.get("split", {}), cfg.get("domain_labeling"))
     assert_no_split_leakage(split_manifest)
     manifest_map = split_manifest.set_index("cell_uid").to_dict(orient="index")
     canonical_cycles = combine_canonical_cycles(cells)
@@ -463,10 +517,7 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
     stride = int(memory_cfg.get("stride", 1))
     q_grid_size = int(feature_cfg.get("q_grid_size", 100))
     partial_charge_segments = int(feature_cfg.get("partial_charge_segments", 50))
-    relaxation_points = int(feature_cfg.get("relaxation_points", 30))
     rolling_window = int(feature_cfg.get("rolling_median_window", 5))
-    relax_time_max = float(feature_cfg.get("relaxation_time_max_minutes", 30))
-    current_rest_threshold = float(feature_cfg.get("current_rest_threshold", 0.02))
     future_ops_mode = str(feature_cfg.get("future_ops_mode", "known"))
 
     derived_cfg = memory_cfg.get("derived_features", {})
@@ -502,8 +553,6 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
         qv_masks_all = []
         partial_curves_all = []
         partial_masks_all = []
-        relaxation_curves_all = []
-        relaxation_masks_all = []
         physics_features_all = []
         physics_masks_all = []
         curve_stats_rows = []
@@ -524,11 +573,6 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
                     "partial_charge_mask": False,
                     "partial_charge_stats": {},
                 }
-                relax_result = {
-                    "relaxation_curve": np.zeros(relaxation_points, dtype=np.float32),
-                    "relaxation_mask": False,
-                    "relaxation_stats": {},
-                }
             else:
                 qv_result = extract_q_indexed_feature_map(
                     raw_cycle_df,
@@ -539,25 +583,15 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
                     raw_cycle_df,
                     voltage_grid_size=partial_charge_segments,
                 )
-                relax_result = extract_relaxation_curve(
-                    raw_cycle_df,
-                    relax_points=relaxation_points,
-                    relax_time_max_minutes=relax_time_max,
-                    current_rest_threshold=current_rest_threshold,
-                )
             physics_result = compute_physics_features(
                 partial_charge_curve=partial_result["partial_charge_curve"],
                 partial_charge_mask=bool(partial_result["partial_charge_mask"]),
-                relaxation_curve=relax_result["relaxation_curve"],
-                relaxation_mask=bool(relax_result["relaxation_mask"]),
                 qv_curve_stats=qv_result["curve_stats"],
             )
             qv_maps_all.append(np.asarray(qv_result["qv_map"], dtype=np.float32))
             qv_masks_all.append(np.asarray(qv_result["qv_mask"], dtype=np.float32))
             partial_curves_all.append(np.asarray(partial_result["partial_charge_curve"], dtype=np.float32))
             partial_masks_all.append(float(bool(partial_result["partial_charge_mask"])))
-            relaxation_curves_all.append(np.asarray(relax_result["relaxation_curve"], dtype=np.float32))
-            relaxation_masks_all.append(float(bool(relax_result["relaxation_mask"])))
             physics_features_all.append(np.asarray(physics_result["physics_features"], dtype=np.float32))
             physics_masks_all.append(np.asarray(physics_result["physics_feature_mask"], dtype=np.float32))
             curve_stats_rows.append(qv_result["curve_stats"])
@@ -565,7 +599,6 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
                 {
                     "qv_available": float(np.asarray(qv_result["qv_mask"]).mean() > 0),
                     "partial_charge_available": float(bool(partial_result["partial_charge_mask"])),
-                    "relaxation_available": float(bool(relax_result["relaxation_mask"])),
                 }
             )
 
@@ -583,10 +616,13 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
         qv_masks_all = np.stack(qv_masks_all).astype(np.float32)
         partial_curves_all = np.stack(partial_curves_all).astype(np.float32)
         partial_masks_all = np.asarray(partial_masks_all, dtype=np.float32)
-        relaxation_curves_all = np.stack(relaxation_curves_all).astype(np.float32)
-        relaxation_masks_all = np.asarray(relaxation_masks_all, dtype=np.float32)
         physics_features_all = np.stack(physics_features_all).astype(np.float32)
         physics_masks_all = np.stack(physics_masks_all).astype(np.float32)
+        expert_seq_all = _build_expert_seq(
+            feature_frame=feature_frame,
+            physics_features_all=physics_features_all,
+            anchor_capacity_values=np.where(np.isfinite(capacity_values), capacity_values, 1.0),
+        )
 
         max_start = len(cell_cycles) - lookback - horizon + 1
         if max_start <= 0:
@@ -627,7 +663,6 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
             missing_summary = {
                 "qv": (1.0 - qv_masks_all[start:window_end].mean(axis=0)).astype(float).tolist(),
                 "partial_charge": float(1.0 - partial_masks_all[start:window_end].mean()),
-                "relaxation": float(1.0 - relaxation_masks_all[start:window_end].mean()),
                 "physics_features": (1.0 - physics_masks_all[start:window_end].mean(axis=0)).astype(float).tolist(),
                 "future_ops": float(1.0 - future_ops_mask.mean()) if future_ops_mask.size else 1.0,
             }
@@ -668,15 +703,13 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
                 qv_masks=qv_masks_all[start:window_end].astype(np.float32),
                 partial_charge_curves=partial_curves_all[start:window_end].astype(np.float32),
                 partial_charge_masks=partial_masks_all[start:window_end].astype(np.float32),
-                relaxation_curves=relaxation_curves_all[start:window_end].astype(np.float32),
-                relaxation_masks=relaxation_masks_all[start:window_end].astype(np.float32),
                 physics_features=physics_features_all[start:window_end].astype(np.float32),
                 physics_feature_masks=physics_masks_all[start:window_end].astype(np.float32),
                 anchor_physics_features=window_physics["anchor_physics_features"].astype(np.float32),
                 operation_seq=operation_seq_full[start:window_end].astype(np.float32),
+                expert_seq=expert_seq_all[start:window_end].astype(np.float32),
                 future_operation_seq=np.nan_to_num(future_ops, nan=0.0).astype(np.float32),
                 future_operation_mask=np.nan_to_num(future_ops_mask, nan=0.0).astype(np.float32),
-                tsfm_embedding=None,
                 metadata={
                     "q_grid": q_grid.tolist(),
                     "split_manifest_domain": split_row["domain_label"],
@@ -685,13 +718,8 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
                 feature_names={
                     "cycle_stats": cycle_feature_names,
                     "operation": operation_names,
-                    "physics_feature_names": compute_physics_features(
-                        np.zeros(partial_charge_segments, dtype=np.float32),
-                        False,
-                        np.zeros(relaxation_points, dtype=np.float32),
-                        False,
-                        {},
-                    )["physics_feature_names"],
+                    "expert_seq": EXPERT_SEQ_FEATURES,
+                    "physics_feature_names": list(PHYSICS_FEATURE_NAMES),
                     "qv_channels": QV_CHANNEL_NAMES,
                 },
                 missing_mask=missing_summary,
@@ -706,24 +734,6 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
 
     rows_df = pd.DataFrame(case_rows).sort_values("case_id").reset_index(drop=True)
 
-    encoder = _optional_window_encoder(cfg)
-    tsfm_embeddings = None
-    if encoder is not None:
-        try:
-            encoder_input = np.stack(
-                [
-                    np.concatenate([case.soh_seq[:, None], case.cycle_stats], axis=-1).astype(np.float32)
-                    for case in cases
-                ]
-            )
-            tsfm_embeddings = encoder.encode(encoder_input).astype(np.float32)
-            for case_idx, case in enumerate(cases):
-                case.tsfm_embedding = tsfm_embeddings[case_idx]
-            rows_df["has_tsfm_embedding"] = True
-        except Exception as exc:
-            print(f"[CaseBank] Skip tsfm embedding encoding: {exc}", flush=True)
-            tsfm_embeddings = None
-
     arrays = {
         "case_cycle_stats.npy": np.stack([case.cycle_stats for case in cases]).astype(np.float32),
         "case_soh_seq.npy": np.stack([case.soh_seq for case in cases]).astype(np.float32),
@@ -731,19 +741,16 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
         "case_qv_masks.npy": np.stack([case.qv_masks for case in cases]).astype(np.float32),
         "case_partial_charge.npy": np.stack([case.partial_charge_curves for case in cases]).astype(np.float32),
         "case_partial_charge_mask.npy": np.stack([case.partial_charge_masks for case in cases]).astype(np.float32),
-        "case_relaxation.npy": np.stack([case.relaxation_curves for case in cases]).astype(np.float32),
-        "case_relaxation_mask.npy": np.stack([case.relaxation_masks for case in cases]).astype(np.float32),
         "case_physics_features.npy": np.stack([case.physics_features for case in cases]).astype(np.float32),
         "case_physics_feature_masks.npy": np.stack([case.physics_feature_masks for case in cases]).astype(np.float32),
         "case_anchor_physics_features.npy": np.stack([case.anchor_physics_features for case in cases]).astype(np.float32),
         "case_operation_seq.npy": np.stack([case.operation_seq for case in cases]).astype(np.float32),
+        "case_expert_seq.npy": np.stack([case.expert_seq for case in cases]).astype(np.float32),
         "case_future_ops.npy": np.stack([case.future_operation_seq for case in cases]).astype(np.float32),
         "case_future_ops_mask.npy": np.stack([case.future_operation_mask for case in cases]).astype(np.float32),
         "case_future_delta_soh.npy": np.stack([case.target_delta_soh for case in cases]).astype(np.float32),
         "case_future_soh.npy": np.stack([case.target_soh for case in cases]).astype(np.float32),
     }
-    if tsfm_embeddings is not None:
-        arrays["case_tsfm_embeddings.npy"] = tsfm_embeddings.astype(np.float32)
 
     _save_case_rows(rows_df, output_dir)
     for name, values in arrays.items():
@@ -758,7 +765,6 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
             "anchor_physics_features": arrays["case_anchor_physics_features.npy"],
             "operation_seq": arrays["case_operation_seq.npy"],
             "future_ops": arrays["case_future_ops.npy"],
-            **({"tsfm_embeddings": tsfm_embeddings} if tsfm_embeddings is not None else {}),
         },
     )
     (output_dir / "normalization_stats.json").write_text(json.dumps(normalization_stats, indent=2, ensure_ascii=True))
@@ -766,11 +772,13 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
     feature_names = {
         "cycle_stats": cycle_feature_names,
         "qv_channels": QV_CHANNEL_NAMES,
-        "physics_feature_names": cases[0].feature_names["physics_feature_names"],
+        "physics_feature_names": list(PHYSICS_FEATURE_NAMES),
         "operation": DEFAULT_OPERATION_FEATURES,
         "future_operation": DEFAULT_OPERATION_FEATURES,
+        "expert_seq": EXPERT_SEQ_FEATURES,
     }
     (output_dir / "feature_names.json").write_text(json.dumps(feature_names, indent=2, ensure_ascii=True))
+    (output_dir / "case_expert_seq_feature_names.json").write_text(json.dumps(EXPERT_SEQ_FEATURES, indent=2, ensure_ascii=True))
 
     build_log = {
         "total_cases": int(len(rows_df)),
@@ -779,13 +787,11 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
         "cases_by_chemistry": {k: int(v) for k, v in rows_df["chemistry_family"].value_counts().to_dict().items()},
         "qv_map_availability": float(arrays["case_qv_masks.npy"].mean()),
         "partial_charge_availability": float(arrays["case_partial_charge_mask.npy"].mean()),
-        "relaxation_availability": float(arrays["case_relaxation_mask.npy"].mean()),
         "physics_feature_availability": float(arrays["case_physics_feature_masks.npy"].mean()),
         "future_ops_availability": float(arrays["case_future_ops_mask.npy"].mean()),
         "missingness_summary": {
             "qv": (1.0 - arrays["case_qv_masks.npy"].mean(axis=(0, 1))).astype(float).tolist(),
             "partial_charge": float(1.0 - arrays["case_partial_charge_mask.npy"].mean()),
-            "relaxation": float(1.0 - arrays["case_relaxation_mask.npy"].mean()),
             "physics_features": (1.0 - arrays["case_physics_feature_masks.npy"].mean(axis=(0, 1))).astype(float).tolist(),
             "future_ops": float(1.0 - arrays["case_future_ops_mask.npy"].mean()),
         },
@@ -803,8 +809,14 @@ def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
         "output_dir": str(output_dir),
         "num_cases": int(len(rows_df)),
         "splits": build_log["cases_by_split"],
-        "has_tsfm_embeddings": bool(tsfm_embeddings is not None),
     }
+
+
+def build_case_bank(cfg: Dict[str, object]) -> Dict[str, object]:
+    """按配置加载启用数据集并构建标准案例库。"""
+
+    cells = assign_cell_uids(load_enabled_cells(cfg), prefix=str(cfg.get("cell_uid_prefix", "cell")))
+    return build_case_bank_from_cells(cfg, cells)
 
 
 def main(argv: List[str] | None = None) -> None:

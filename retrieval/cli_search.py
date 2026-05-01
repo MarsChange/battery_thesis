@@ -1,5 +1,5 @@
 """
-cli_search.py — CLI entry point: query a FAISS retrieval database.
+cli_search.py — CLI entry point: query a numerical FAISS retrieval database.
 
 Usage:
     python -m retrieval.cli_search --config configs/retrieval/demo.yaml --top_k 5
@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from .encoder_chronos2 import Chronos2RetrieverEncoder
 from .search import RetrieverSearcher
 
 
@@ -32,17 +31,6 @@ def main(argv=None):
     cfg = load_config(args.config)
     top_k = args.top_k or cfg.get("retrieval", {}).get("top_k", 5)
 
-    # Build encoder
-    enc_cfg = cfg["encoder"]
-    encoder = Chronos2RetrieverEncoder(
-        model_path=enc_cfg.get("model_path", "autogluon/chronos-2"),
-        pooling=enc_cfg.get("pooling", "mean"),
-        device=enc_cfg.get("device", "auto"),
-        context_length=enc_cfg.get("context_length"),
-        batch_size=enc_cfg.get("batch_size", 256),
-        torch_dtype=enc_cfg.get("torch_dtype", "float32"),
-    )
-
     # Load searcher
     output_dir = cfg.get("output_dir", "output/retrieval_db")
     db_name = cfg.get("db_name", "db")
@@ -52,7 +40,7 @@ def main(argv=None):
         db_dir=output_dir,
         name=db_name,
         metric=metric,
-        encoder=encoder,
+        encoder=None,
     )
     print(f"Database loaded: {searcher.size} vectors")
 

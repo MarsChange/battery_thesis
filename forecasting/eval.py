@@ -98,7 +98,8 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
                     record[f"fm_delta_h{h+1}"] = float(outputs["fm_delta"][idx, h].detach().cpu().item())
                     record[f"rag_delta_h{h+1}"] = float(outputs["rag_delta"][idx, h].detach().cpu().item())
                     record[f"pair_delta_h{h+1}"] = float(outputs["pair_delta"][idx, h].detach().cpu().item())
-                    record[f"moe_delta_h{h+1}"] = float(outputs["moe_delta"][idx, h].detach().cpu().item())
+                    record[f"base_delta_h{h+1}"] = float(outputs["base_delta"][idx, h].detach().cpu().item())
+                    record[f"residual_h{h+1}"] = float(outputs["moe_residual"][idx, h].detach().cpu().item())
                 prediction_rows.append(record)
 
                 expert_rows.append({"case_id": case_id, **{f"expert_{i+1}": float(v) for i, v in enumerate(outputs["expert_weights"][idx].detach().cpu().numpy())}})

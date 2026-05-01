@@ -12,7 +12,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from forecasting.data import BatterySOHForecastDataset
-from forecasting.losses import compute_total_loss
+from forecasting.losses import compute_base_model_loss
 from forecasting.metrics import horizon_metrics, regression_metrics
 from forecasting.model import BatterySOHForecaster
 from forecasting.visualization import plot_training_curves
@@ -57,8 +57,7 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "meta_dim": len(dataset.meta_fields),
         "qv_width": int(arrays["qv_maps"].shape[-1]),
         "partial_charge_points": int(arrays["partial_charge"].shape[-1]),
-        "relaxation_points": int(arrays["relaxation"].shape[-1]),
-        "tsfm_dim": int(arrays["tsfm_embedding"].shape[-1]) if arrays["tsfm_embedding"] is not None else 0,
+        "expert_seq_dim": int(arrays["expert_seq"].shape[-1]) if arrays.get("expert_seq") is not None else 14,
         "hidden_dim": int(model_cfg.get("hidden_dim", 256)),
         "dropout": float(model_cfg.get("dropout", 0.1)),
         "meta_embedding_dim": int(model_cfg.get("meta_embedding_dim", 16)),
@@ -89,7 +88,7 @@ def run_epoch(
         for batch in loader:
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
-            loss_dict = compute_total_loss(outputs, batch, loss_cfg)
+            loss_dict = compute_base_model_loss(outputs, batch, loss_cfg)
             if is_train:
                 optimizer.zero_grad()
                 loss_dict["loss"].backward()
@@ -210,11 +209,11 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
             "epoch": epoch,
             "val_loss": val_metrics["loss"],
         }
-        torch.save(checkpoint, checkpoint_dir / "last.pt")
+        torch.save(checkpoint, checkpoint_dir / "base_model_last.pt")
         if val_metrics["loss"] < best_val:
             best_val = float(val_metrics["loss"])
             best_epoch = epoch
-            torch.save(checkpoint, checkpoint_dir / "best.pt")
+            torch.save(checkpoint, checkpoint_dir / "base_model_best.pt")
         if epoch - best_epoch >= patience:
             break
 
@@ -224,8 +223,8 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
     plot_training_curves(history, figure_dir)
     return {
         "output_dir": str(output_dir),
-        "best_checkpoint": str(checkpoint_dir / "best.pt"),
-        "last_checkpoint": str(checkpoint_dir / "last.pt"),
+        "best_checkpoint": str(checkpoint_dir / "base_model_best.pt"),
+        "last_checkpoint": str(checkpoint_dir / "base_model_last.pt"),
         "best_val_loss": float(best_val),
         "epochs_completed": int(len(history_rows)),
     }

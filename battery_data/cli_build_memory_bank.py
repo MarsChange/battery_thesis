@@ -14,17 +14,10 @@ def load_config(path: str) -> dict:
 
 
 def build_encoder_from_config(cfg: dict):
-    from retrieval.encoder_chronos2 import Chronos2RetrieverEncoder
+    from retrieval.statistical_encoder import StatisticalWindowEncoder
 
-    enc_cfg = cfg["encoder"]
-    return Chronos2RetrieverEncoder(
-        model_path=enc_cfg.get("model_path", "autogluon/chronos-2"),
-        pooling=enc_cfg.get("pooling", "mean"),
-        device=enc_cfg.get("device", "auto"),
-        context_length=enc_cfg.get("context_length"),
-        batch_size=enc_cfg.get("batch_size", 256),
-        torch_dtype=enc_cfg.get("torch_dtype", "float32"),
-    )
+    enc_cfg = cfg.get("encoder", {})
+    return StatisticalWindowEncoder(eps=float(enc_cfg.get("eps", 1e-8)))
 
 
 def main(argv=None):

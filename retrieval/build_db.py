@@ -1,18 +1,17 @@
-"""
-build_db.py — Build a FAISS retrieval database from time series data.
+"""Build a FAISS retrieval database from numerically encoded time series windows.
 
-Pipeline:  raw data → sliding window → Chronos2 encode → FAISS index + sidecar.
+This module is kept for legacy vector-index utilities. The main battery SOH
+pipeline uses the case-bank retriever and interpretable distance components.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from tqdm import tqdm
 
-from .encoder_chronos2 import Chronos2RetrieverEncoder
 from .index import FAISSIndex
 from .io import save_sidecar
 from .schema import WindowSample
@@ -60,7 +59,7 @@ def slice_windows(
 
 def build_database(
     samples: List[WindowSample],
-    encoder: Chronos2RetrieverEncoder,
+    encoder: Any,
     metric: str = "cosine",
     encode_batch_size: int = 256,
 ) -> tuple[FAISSIndex, np.ndarray]:
@@ -106,7 +105,7 @@ def build_database(
 
 def build_and_save(
     samples: List[WindowSample],
-    encoder: Chronos2RetrieverEncoder,
+    encoder: Any,
     output_dir: str | Path,
     name: str = "db",
     metric: str = "cosine",

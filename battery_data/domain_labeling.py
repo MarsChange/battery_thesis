@@ -1,6 +1,15 @@
+"""battery_data.domain_labeling
+
+为电池样本构造 domain label。
+
+默认模式会把 chemistry、协议族和 full/partial 信息组合成更细粒度的 domain。
+当实验只需要 chemistry 级别的 domain 时，可通过 `rules={"mode": "chemistry_only"}`
+把 domain label 压缩为 `LFP`、`NCA`、`NCM` 这一类纯 chemistry 标签。
+"""
+
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable
+from typing import Any, Dict
 
 
 DEFAULT_RULES = {
@@ -10,6 +19,7 @@ DEFAULT_RULES = {
     "fallback_chemistry": "Unknown",
     "fallback_policy": "regular",
     "fallback_full": "full",
+    "mode": "protocol_aware",
 }
 
 
@@ -31,6 +41,12 @@ def build_domain_label(
     chemistry = _canonicalize_token(metadata.get("chemistry_family"), cfg["fallback_chemistry"])
     policy = _canonicalize_token(metadata.get("discharge_policy_family"), cfg["fallback_policy"])
     full_or_partial = _canonicalize_token(metadata.get("full_or_partial"), cfg["fallback_full"])
+    mode = _canonicalize_token(cfg.get("mode"), "protocol_aware").lower()
+
+    if mode == "chemistry_only":
+        return chemistry
+    if mode == "chemistry_policy":
+        return f"{chemistry}_{policy}"
 
     fastcharge_policies = set(cfg["fastcharge_policies"])
     multistage_policies = set(cfg["multistage_policies"])

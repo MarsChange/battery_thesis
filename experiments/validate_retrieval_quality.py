@@ -24,7 +24,7 @@ from retrieval.retrieval_diagnostics import (
     rag_only_prediction,
     save_component_distance_bar,
     save_metadata_table,
-    save_partial_relax_overlay,
+    save_partial_charge_overlay,
     save_qv_overlay,
     save_soh_history_figure,
     summarize_retrieval_result,
@@ -72,7 +72,6 @@ def _component_row(
         "d_physics": float(bundle["d_physics"]),
         "d_operation": float(bundle["d_operation"]),
         "d_metadata": float(bundle["d_metadata"]),
-        "d_tsfm": float(bundle["d_tsfm"]),
         "composite_distance": float(bundle["composite_distance"]),
         "retrieval_confidence": float(retrieval_confidence),
     }
@@ -86,7 +85,6 @@ def _mean_bundle(bundles: List[Dict[str, float]], prefix: str) -> Dict[str, floa
             f"{prefix}_mean_d_physics": np.nan,
             f"{prefix}_mean_d_operation": np.nan,
             f"{prefix}_mean_d_metadata": np.nan,
-            f"{prefix}_mean_d_tsfm": np.nan,
             f"{prefix}_mean_composite_distance": np.nan,
         }
     frame = pd.DataFrame(bundles)
@@ -96,7 +94,6 @@ def _mean_bundle(bundles: List[Dict[str, float]], prefix: str) -> Dict[str, floa
         f"{prefix}_mean_d_physics": float(frame["d_physics"].mean()),
         f"{prefix}_mean_d_operation": float(frame["d_operation"].mean()),
         f"{prefix}_mean_d_metadata": float(frame["d_metadata"].mean()),
-        f"{prefix}_mean_d_tsfm": float(frame["d_tsfm"].mean()),
         f"{prefix}_mean_composite_distance": float(frame["composite_distance"].mean()),
     }
 
@@ -144,7 +141,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
     figure_dir = ensure_dir(output_dir / "figures")
 
     retrieval_cfg = dict(cfg.get("retrieval", {}))
-    retrieval_config_path = str(retrieval_cfg.get("retrieval_feature_config_path", "configs/rag_retrieval_features.yaml"))
+    retrieval_config_path = str(retrieval_cfg.get("retrieval_feature_config_path", "configs/retrieval_features.yaml"))
     retriever = MultiStageBatteryRetriever(
         case_bank_dir=case_bank_dir,
         retrieval_config_path=retrieval_config_path,
@@ -155,7 +152,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
         same_cell_policy=str(retrieval_cfg.get("same_cell_policy", "exclude")),
         allow_cross_chemistry=bool(retrieval_cfg.get("allow_cross_chemistry", True)),
         metric=str(retrieval_cfg.get("metric", "cosine")),
-        stage1_embedding_name=str(retrieval_cfg.get("stage1_embedding", "tsfm")),
+        stage1_embedding_name=str(retrieval_cfg.get("stage1_embedding", "handcrafted")),
         retrieval_temperature=float(retrieval_cfg.get("retrieval_temperature", 0.1)),
         mmr={
             "use_mmr": bool(retrieval_cfg.get("use_mmr", True)),
@@ -170,7 +167,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
 
         (output_dir / "run_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
         if bool(retriever.rag_config.get("logging", {}).get("save_yaml_snapshot_with_each_run", True)):
-            (output_dir / "rag_retrieval_features.yaml").write_text(Path(retrieval_config_path).read_text())
+            (output_dir / "retrieval_features.yaml").write_text(Path(retrieval_config_path).read_text())
     except Exception:
         (output_dir / "run_config.yaml").write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
     (output_dir / "run_metadata.json").write_text(
@@ -225,7 +222,6 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
                 "d_physics": float(result.d_physics[pos]),
                 "d_operation": float(result.d_operation[pos]),
                 "d_metadata": float(result.d_metadata[pos]),
-                "d_tsfm": float(result.d_tsfm[pos]),
                 "composite_distance": float(result.composite_distance[pos]),
             }
             retrieved_bundles.append(bundle)
@@ -277,7 +273,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
             query_dir = ensure_dir(figure_dir / f"query_{case_id}")
             save_soh_history_figure(query_idx, query_row, result, retriever, query_dir / "soh_history_and_topk_future.png")
             save_qv_overlay(query_idx, result, retriever, query_dir / "qv_map_overlay.png")
-            save_partial_relax_overlay(query_idx, result, retriever, query_dir / "partial_charge_relaxation_overlay.png")
+            save_partial_charge_overlay(query_idx, result, retriever, query_dir / "partial_charge_overlay.png")
             save_component_distance_bar(result, query_dir / "retrieval_component_distance_bar.png")
             save_metadata_table(query_row, result, retriever, query_dir / "retrieval_metadata_table.csv")
 
@@ -396,24 +392,22 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
             cmap="magma",
         )
 
-    enabled_components = [
-        name
-        for name in COMPONENT_NAMES
-        if bool(dict(retriever.rag_config.get("distance_components", {}).get(name, {}) or {}).get("enabled", False))
-    ]
-    enabled_feature_summary = {}
-    for component_name in enabled_components:
-        features_cfg = dict(retriever.rag_config.get("distance_components", {}).get(component_name, {}).get("features", {}) or {})
-        enabled_feature_summary[component_name] = [
-            feature_name
-            for feature_name, feature_cfg in features_cfg.items()
-            if bool(dict(feature_cfg or {}).get("enabled", False))
-        ]
-    d_tsfm_cfg = dict(retriever.rag_config.get("distance_components", {}).get("d_tsfm", {}) or {})
-    d_tsfm_features = dict(d_tsfm_cfg.get("features", {}) or {})
-    d_tsfm_enabled = bool(d_tsfm_cfg.get("enabled", False))
-    coarse_tsfm = bool(dict(d_tsfm_features.get("tsfm_stage1_coarse_retrieval", {}) or {}).get("enabled", True))
-    rerank_tsfm = bool(dict(d_tsfm_features.get("tsfm_in_final_rerank", {}) or {}).get("enabled", True))
+    enabled_components = [name for name in COMPONENT_NAMES if bool(retriever.rag_config.get(name, False))]
+    enabled_feature_summary = {
+        "d_soh_state": ["anchor_soh", "recent_soh_slope", "recent_soh_curvature", "degradation_stage"],
+        "d_qv_shape": ["Vd(Q)", "DeltaV(Q)", "R(Q)", "qv_summary_stats"],
+        "d_physics": ["delta_v_mean", "delta_v_std", "delta_v_q95", "r_mean", "r_std", "r_q95"],
+        "d_operation": ["disabled by default", "legacy compatibility output"],
+        "d_metadata": [
+            "chemistry_family",
+            "domain_label",
+            "voltage_window_bucket",
+            "charge_current_seq",
+            "discharge_current_seq",
+            "temperature_seq",
+            "normalized_capacity_delta_seq",
+        ],
+    }
     retrieved_better_than_random = bool(
         len(compare_df)
         and float(compare_df["retrieved_mean_composite_distance"].mean()) < float(compare_df["random_mean_composite_distance"].mean())
@@ -443,7 +437,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
         if float(compare_df["retrieved_mean_d_qv_shape"].mean()) >= float(compare_df["random_mean_d_qv_shape"].mean()):
             suggestion = "提高 d_qv_shape 权重或增强 qv 曲线摘要特征。"
         elif float(compare_df["retrieved_mean_d_physics"].mean()) >= float(compare_df["random_mean_d_physics"].mean()):
-            suggestion = "提高 d_physics 权重或检查 partial charge / relaxation 特征可用率。"
+            suggestion = "提高 d_physics 权重或检查 ΔV/R 物理 proxy 的可用率。"
 
     summary_lines = [
         "# 检索质量验证总结",
@@ -451,9 +445,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
         f"- 当前启用的 RAG 检索特征分量：{enabled_components}",
         f"- 当前启用的底层检索特征：{enabled_feature_summary}",
         f"- composite_distance 由以下距离分量组成：{enabled_components}",
-        f"- d_tsfm 是否启用：{d_tsfm_enabled}",
-        f"- d_tsfm 是否用于 Stage-1 粗检索：{coarse_tsfm}",
-        f"- d_tsfm 是否参与最终 rerank：{rerank_tsfm}",
+        "- 当前检索不使用外部时序基础模型 embedding；Stage-1 使用 handcrafted battery embedding。",
         f"- retrieved top-k 是否比 random top-k 更相似：{retrieved_better_than_random}",
         f"- RAG-only 是否优于 random RAG：{rag_better_than_random}",
         f"- RAG-only 是否优于 persistence baseline：{rag_better_than_persistence}",

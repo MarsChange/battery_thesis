@@ -1,9 +1,9 @@
 """retrieval.multistage_retriever
 
 实现用于电池 SOH 任务的多阶段历史案例检索器。
-该检索器遵守 `configs/rag_retrieval_features.yaml` 中的显式开关：
+该检索器遵守 `configs/retrieval_features.yaml` 中的显式开关：
 1. Stage 0: hard filtering，确保 target_query 不进入 reference DB，且排除 self-retrieval。
-2. Stage 1: coarse retrieval，优先用 d_tsfm 或回退到手工 embedding 召回候选。
+2. Stage 1: coarse retrieval，默认用 handcrafted battery embedding 召回候选。
 3. Stage 2: physics-aware reranking，计算命名距离分量并生成 composite_distance。
 4. Stage 3: optional diversity selection，用 MMR 控制 top-k 多样性。
 """
@@ -20,7 +20,10 @@ import numpy as np
 import pandas as pd
 
 from retrieval.physics_distance import (
-    CORE_DISTANCE_NAMES,
+    ALL_COMPONENT_NAMES,
+    CORE_COMPONENT_NAMES,
+    OPTIONAL_COMPONENT_NAMES,
+    QV_CHANNEL_TO_INDEX,
     compute_composite_distance,
     compute_metadata_distance,
     compute_operation_distance,
@@ -28,7 +31,6 @@ from retrieval.physics_distance import (
     compute_qv_shape_distance,
     compute_retrieval_confidence,
     compute_soh_state_distance,
-    compute_tsfm_distance,
     degradation_stage_distance,
 )
 
@@ -38,7 +40,9 @@ except Exception:  # pragma: no cover - fallback path is enough for tests withou
     FAISSIndex = None
 
 
-COMPONENT_NAMES = list(CORE_DISTANCE_NAMES)
+CORE_COMPONENTS = list(CORE_COMPONENT_NAMES)
+COMPONENT_NAMES = list(ALL_COMPONENT_NAMES)
+OPTIONAL_COMPONENTS = list(OPTIONAL_COMPONENT_NAMES)
 
 
 def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
@@ -108,7 +112,6 @@ class RetrievalResult:
     d_physics: np.ndarray
     d_operation: np.ndarray
     d_metadata: np.ndarray
-    d_tsfm: np.ndarray
     composite_distance: np.ndarray
     retrieval_confidence: float
     retrieval_alpha: np.ndarray
@@ -129,7 +132,6 @@ class RetrievalResult:
                 self.d_physics,
                 self.d_operation,
                 self.d_metadata,
-                self.d_tsfm,
             ],
             axis=-1,
         ).astype(np.float32)
@@ -147,12 +149,13 @@ class MultiStageBatteryRetriever:
     def __init__(
         self,
         case_bank_dir: str | Path,
-        retrieval_config_path: str | Path = "configs/rag_retrieval_features.yaml",
+        retrieval_config_path: str | Path = "configs/retrieval_features.yaml",
         db_splits: List[str] | None = None,
         query_splits: List[str] | None = None,
         top_m: int | None = None,
         top_k: int | None = None,
         same_cell_policy: str | None = None,
+        exclude_query_case: bool = True,
         allow_cross_chemistry: bool | None = None,
         metric: str = "cosine",
         stage1_embedding_name: str | None = None,
@@ -182,6 +185,7 @@ class MultiStageBatteryRetriever:
         self.top_m = int(top_m if top_m is not None else stage1_cfg.get("top_m", 200))
         self.top_k = int(top_k if top_k is not None else final_topk_cfg.get("top_k", 8))
         self.same_cell_policy = str(same_cell_policy or hard_filter.get("same_cell_policy") or final_topk_cfg.get("same_cell_policy", "exclude"))
+        self.exclude_query_case = bool(exclude_query_case)
         self.allow_cross_chemistry = bool(
             allow_cross_chemistry if allow_cross_chemistry is not None else final_topk_cfg.get("allow_cross_chemistry", True)
         )
@@ -190,7 +194,7 @@ class MultiStageBatteryRetriever:
         self.mmr_lambda = float(mmr.get("mmr_lambda", final_topk_cfg.get("mmr_lambda", 0.75)))
         self.max_neighbors_per_cell = int(mmr.get("max_neighbors_per_cell", final_topk_cfg.get("max_neighbors_per_cell", 2)))
         self.max_neighbors_per_domain = mmr.get("max_neighbors_per_domain", final_topk_cfg.get("max_neighbors_per_domain"))
-        self.stage1_embedding_name = str(stage1_embedding_name or ("tsfm" if bool(stage1_cfg.get("use_tsfm_embedding", True)) else "handcrafted"))
+        self.stage1_embedding_name = "handcrafted"
 
         if rerank_weights:
             for distance_name, weight in rerank_weights.items():
@@ -201,6 +205,16 @@ class MultiStageBatteryRetriever:
             qv_cfg["channel_weights"] = dict(qv_cfg.get("channel_weights", {}) or {})
             qv_cfg["channel_weights"].update({key: float(value) for key, value in qv_channel_weights.items()})
             self.rag_config["distance_components"]["d_qv_shape"] = qv_cfg
+        self.core_component_names = list(CORE_COMPONENTS)
+        self.optional_component_names = list(OPTIONAL_COMPONENTS)
+        if "distance_components" in self.rag_config:
+            self.enabled_component_names = [
+                name
+                for name in COMPONENT_NAMES
+                if bool(dict(self.rag_config.get("distance_components", {}).get(name, {}) or {}).get("enabled", False))
+            ]
+        else:
+            self.enabled_component_names = [name for name in COMPONENT_NAMES if bool(self.rag_config.get(name, False))]
 
         self.feature_names = dict(_read_json(self.case_bank_dir / "feature_names.json", {}))
         self.arrays = self._load_case_arrays()
@@ -211,7 +225,8 @@ class MultiStageBatteryRetriever:
         self.db_indices = np.flatnonzero(self.db_mask).astype(np.int64)
         self.db_case_ids = self.case_rows.loc[self.db_indices, "case_id"].to_numpy(dtype=np.int64)
 
-        self.handcrafted_embeddings = self._build_handcrafted_embeddings()
+        self.handcrafted_retrieval_embedding = self._build_handcrafted_embeddings()
+        self.handcrafted_embeddings = self.handcrafted_retrieval_embedding
         self.stage1_embeddings = self._build_stage1_embeddings()
         self.db_stage1_embeddings = self.stage1_embeddings[self.db_indices]
         self._build_index()
@@ -226,8 +241,6 @@ class MultiStageBatteryRetriever:
             "qv_masks": np.load(self.case_bank_dir / "case_qv_masks.npy"),
             "partial_charge": np.load(self.case_bank_dir / "case_partial_charge.npy"),
             "partial_charge_mask": np.load(self.case_bank_dir / "case_partial_charge_mask.npy"),
-            "relaxation": np.load(self.case_bank_dir / "case_relaxation.npy"),
-            "relaxation_mask": np.load(self.case_bank_dir / "case_relaxation_mask.npy"),
             "physics_features": np.load(self.case_bank_dir / "case_physics_features.npy"),
             "physics_feature_masks": np.load(self.case_bank_dir / "case_physics_feature_masks.npy"),
             "anchor_physics_features": np.load(self.case_bank_dir / "case_anchor_physics_features.npy"),
@@ -235,8 +248,6 @@ class MultiStageBatteryRetriever:
             "future_ops": np.load(self.case_bank_dir / "case_future_ops.npy"),
             "future_ops_mask": np.load(self.case_bank_dir / "case_future_ops_mask.npy"),
         }
-        tsfm_path = self.case_bank_dir / "case_tsfm_embeddings.npy"
-        arrays["tsfm_embeddings"] = np.load(tsfm_path) if tsfm_path.exists() else None
         return arrays
 
     def _build_index(self) -> None:
@@ -255,6 +266,7 @@ class MultiStageBatteryRetriever:
             "top_m": self.top_m,
             "top_k": self.top_k,
             "same_cell_policy": self.same_cell_policy,
+            "exclude_query_case": self.exclude_query_case,
             "allow_cross_chemistry": self.allow_cross_chemistry,
             "metric": self.metric,
             "stage1_embedding_name": self.stage1_embedding_name,
@@ -326,71 +338,54 @@ class MultiStageBatteryRetriever:
         }
 
     def _operation_feature_dict(self, idx: int) -> Dict[str, object]:
-        op_seq = np.asarray(self.arrays["operation_seq"][idx], dtype=np.float32)
-        future_ops = np.asarray(self.arrays["future_ops"][idx], dtype=np.float32)
-        op_names = list(self.feature_names.get("operation", []))
-        name_to_series = {name: op_seq[:, pos] for pos, name in enumerate(op_names[: op_seq.shape[1]])}
-        row = self.case_rows.iloc[idx]
-        anchor_capacity = max(float(row.get("anchor_capacity", 1.0) or 1.0), 1e-6)
+        """Return a disabled compatibility payload for the legacy d_operation field.
 
-        current_abs_series = name_to_series.get("current_abs_mean")
-        temp_mean_series = name_to_series.get("temp_mean")
-        cc_time_series = name_to_series.get("cc_time")
-        cv_time_series = name_to_series.get("cv_time")
-        current_based_c_rate = current_abs_series / anchor_capacity if current_abs_series is not None else None
+        Raw operating signals used for retrieval are represented in `_metadata_dict`
+        as charge/discharge current, temperature and normalized-capacity-change
+        sequences.
+        """
 
-        def _mask_for(series: np.ndarray | None) -> float:
-            return 1.0 if series is not None and np.isfinite(series).any() else 0.0
-
-        protocol_change_rate = 0.0
-        protocol_mask = 0.0
-        if current_based_c_rate is not None and len(current_based_c_rate) > 1:
-            delta = np.abs(np.diff(current_based_c_rate))
-            protocol_change_rate = float(np.mean(delta > max(0.05, 0.1 * float(np.nanmean(np.abs(current_based_c_rate)) + 1e-6))))
-            protocol_mask = 1.0
-        elif temp_mean_series is not None and len(temp_mean_series) > 1:
-            delta = np.abs(np.diff(temp_mean_series))
-            protocol_change_rate = float(np.mean(delta > 1.0))
-            protocol_mask = 1.0
-
-        future_ops_mask = np.asarray(self.arrays["future_ops_mask"][idx], dtype=np.float32)
-        future_known_score = float(np.mean(np.abs(future_ops) * future_ops_mask)) if future_ops.size else 0.0
-
-        values = {
-            "charge_c_rate_mean": float(np.nanmean(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
-            "charge_c_rate_std": float(np.nanstd(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
-            "discharge_c_rate_mean": float(np.nanmean(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
-            "discharge_c_rate_std": float(np.nanstd(current_based_c_rate)) if current_based_c_rate is not None else 0.0,
-            "temperature_mean": float(np.nanmean(temp_mean_series)) if temp_mean_series is not None else 0.0,
-            "temperature_std": float(np.nanstd(temp_mean_series)) if temp_mean_series is not None else 0.0,
-            "temperature_max": float(np.nanmax(temp_mean_series)) if temp_mean_series is not None else 0.0,
-            "dod_estimate": 0.0,
-            "protocol_change_rate": protocol_change_rate,
-            "charge_duration_mean": float(np.nanmean(cc_time_series)) if cc_time_series is not None else 0.0,
-            "discharge_duration_mean": float(np.nanmean(cv_time_series)) if cv_time_series is not None else 0.0,
-            "rest_duration_mean": 0.0,
-            "future_operation_if_known": future_known_score,
-        }
-        mask = {
-            "charge_c_rate_mean": _mask_for(current_based_c_rate),
-            "charge_c_rate_std": _mask_for(current_based_c_rate),
-            "discharge_c_rate_mean": _mask_for(current_based_c_rate),
-            "discharge_c_rate_std": _mask_for(current_based_c_rate),
-            "temperature_mean": _mask_for(temp_mean_series),
-            "temperature_std": _mask_for(temp_mean_series),
-            "temperature_max": _mask_for(temp_mean_series),
-            "dod_estimate": 0.0,
-            "protocol_change_rate": protocol_mask,
-            "charge_duration_mean": _mask_for(cc_time_series),
-            "discharge_duration_mean": _mask_for(cv_time_series),
-            "rest_duration_mean": 0.0,
-            "future_operation_if_known": float(np.mean(future_ops_mask) > 0) if future_ops_mask.size else 0.0,
-        }
-        values["operation_mask"] = mask
-        return values
+        return {"operation_mask": {}}
 
     def _metadata_dict(self, idx: int) -> Dict[str, object]:
         row = self.case_rows.iloc[idx]
+        qv_maps = np.asarray(self.arrays["qv_maps"][idx], dtype=np.float32)
+        qv_masks = np.asarray(self.arrays["qv_masks"][idx], dtype=np.float32)
+        op_seq = np.asarray(self.arrays["operation_seq"][idx], dtype=np.float32)
+        op_names = list(self.feature_names.get("operation", []))
+        op_name_to_series = {name: op_seq[:, pos] for pos, name in enumerate(op_names[: op_seq.shape[1]])}
+        soh_seq = np.asarray(self.arrays["soh_seq"][idx], dtype=np.float32).reshape(-1)
+
+        def _qv_channel_sequence(channel_idx: int, *, absolute: bool = False) -> np.ndarray:
+            if qv_maps.ndim != 3 or qv_maps.shape[1] <= channel_idx:
+                return np.zeros(0, dtype=np.float32)
+            values = qv_maps[:, channel_idx, :]
+            if absolute:
+                values = np.abs(values)
+            channel_mask = (
+                qv_masks[:, channel_idx] > 0
+                if qv_masks.ndim == 2 and qv_masks.shape[1] > channel_idx
+                else np.ones(values.shape[0], dtype=bool)
+            )
+            seq = np.full(values.shape[0], np.nan, dtype=np.float32)
+            for cycle_pos in range(values.shape[0]):
+                if not bool(channel_mask[cycle_pos]):
+                    continue
+                finite = values[cycle_pos][np.isfinite(values[cycle_pos])]
+                if finite.size:
+                    seq[cycle_pos] = float(np.mean(finite))
+            return seq
+
+        def _operation_sequence(name: str) -> np.ndarray:
+            series = op_name_to_series.get(name)
+            if series is None:
+                return np.zeros(0, dtype=np.float32)
+            return np.asarray(series, dtype=np.float32).reshape(-1)
+
+        capacity_delta = np.zeros_like(soh_seq, dtype=np.float32)
+        if soh_seq.size > 1:
+            capacity_delta[1:] = np.diff(soh_seq)
+            capacity_delta[~np.isfinite(capacity_delta)] = np.nan
         return {
             "chemistry_family": row.get("chemistry_family", "unknown"),
             "source_dataset": row.get("source_dataset", "unknown"),
@@ -399,25 +394,83 @@ class MultiStageBatteryRetriever:
             "nominal_capacity_bucket": row.get("nominal_capacity_bucket", "unknown"),
             "temperature_bucket": row.get("temperature_bucket", "unknown"),
             "charge_rate_bucket": row.get("charge_rate_bucket", "unknown"),
+            "charge_current_seq": _qv_channel_sequence(QV_CHANNEL_TO_INDEX["Ic"], absolute=True),
+            "discharge_current_seq": _qv_channel_sequence(QV_CHANNEL_TO_INDEX["Id"], absolute=True),
+            "temperature_seq": _operation_sequence("temp_mean"),
+            "normalized_capacity_delta_seq": capacity_delta,
         }
+
+    def _metadata_numeric_summary(self, idx: int) -> np.ndarray:
+        qv_maps = np.asarray(self.arrays["qv_maps"][idx], dtype=np.float32)
+        qv_masks = np.asarray(self.arrays["qv_masks"][idx], dtype=np.float32)
+        op_seq = np.asarray(self.arrays["operation_seq"][idx], dtype=np.float32)
+        op_names = list(self.feature_names.get("operation", []))
+        op_name_to_pos = {name: pos for pos, name in enumerate(op_names[: op_seq.shape[1]])}
+        soh_seq = np.asarray(self.arrays["soh_seq"][idx], dtype=np.float32).reshape(-1)
+
+        def _qv_mean_sequence(channel_idx: int) -> np.ndarray:
+            if qv_maps.ndim != 3 or qv_maps.shape[1] <= channel_idx:
+                return np.zeros(0, dtype=np.float32)
+            values = np.abs(qv_maps[:, channel_idx, :]).astype(np.float32)
+            channel_mask = (
+                qv_masks[:, channel_idx] > 0
+                if qv_masks.ndim == 2 and qv_masks.shape[1] > channel_idx
+                else np.ones(values.shape[0], dtype=bool)
+            )
+            values = np.where(np.isfinite(values), values, np.nan)
+            seq = np.nanmean(values, axis=1).astype(np.float32)
+            seq[~channel_mask] = np.nan
+            return seq
+
+        def _operation_sequence(name: str) -> np.ndarray:
+            pos = op_name_to_pos.get(name)
+            if pos is None:
+                return np.zeros(0, dtype=np.float32)
+            return np.asarray(op_seq[:, pos], dtype=np.float32).reshape(-1)
+
+        capacity_delta = np.zeros_like(soh_seq, dtype=np.float32)
+        if soh_seq.size > 1:
+            capacity_delta[1:] = np.diff(soh_seq)
+            capacity_delta[~np.isfinite(capacity_delta)] = np.nan
+        metadata = {
+            "charge_current_seq": _qv_mean_sequence(QV_CHANNEL_TO_INDEX["Ic"]),
+            "discharge_current_seq": _qv_mean_sequence(QV_CHANNEL_TO_INDEX["Id"]),
+            "temperature_seq": _operation_sequence("temp_mean"),
+            "normalized_capacity_delta_seq": capacity_delta,
+        }
+        values: list[float] = []
+        for name in ["charge_current_seq", "discharge_current_seq", "temperature_seq", "normalized_capacity_delta_seq"]:
+            seq = np.asarray(metadata.get(name, []), dtype=np.float32).reshape(-1)
+            finite = seq[np.isfinite(seq)]
+            if finite.size:
+                values.extend([float(np.mean(finite)), float(np.std(finite)), float(finite[-1])])
+            else:
+                values.extend([0.0, 0.0, 0.0])
+        return np.asarray(values, dtype=np.float32)
 
     def _feature_availability_ratio(self, query_idx: int, ref_idx: int) -> float:
         q_qv = np.asarray(self.arrays["qv_masks"][query_idx, -1], dtype=np.float32)
         r_qv = np.asarray(self.arrays["qv_masks"][ref_idx, -1], dtype=np.float32)
         q_phy = np.asarray(self.arrays["physics_feature_masks"][query_idx, -1], dtype=np.float32)
         r_phy = np.asarray(self.arrays["physics_feature_masks"][ref_idx, -1], dtype=np.float32)
-        q_op_mask = self._operation_feature_dict(query_idx)["operation_mask"]
-        r_op_mask = self._operation_feature_dict(ref_idx)["operation_mask"]
-        op_keys = sorted(set(q_op_mask.keys()) | set(r_op_mask.keys()))
-        op_common = np.asarray(
-            [1.0 if float(q_op_mask.get(key, 0.0)) > 0 and float(r_op_mask.get(key, 0.0)) > 0 else 0.0 for key in op_keys],
+        q_metadata = self._metadata_dict(query_idx)
+        r_metadata = self._metadata_dict(ref_idx)
+        metadata_keys = ["charge_current_seq", "discharge_current_seq", "temperature_seq", "normalized_capacity_delta_seq"]
+        metadata_common = np.asarray(
+            [
+                1.0
+                if np.isfinite(np.asarray(q_metadata.get(key, []), dtype=np.float32)).any()
+                and np.isfinite(np.asarray(r_metadata.get(key, []), dtype=np.float32)).any()
+                else 0.0
+                for key in metadata_keys
+            ],
             dtype=np.float32,
         )
         availability = np.concatenate(
             [
                 ((q_qv > 0) & (r_qv > 0)).astype(np.float32),
                 ((q_phy > 0) & (r_phy > 0)).astype(np.float32),
-                op_common,
+                metadata_common,
             ]
         )
         return float(availability.mean()) if availability.size else 0.0
@@ -428,7 +481,12 @@ class MultiStageBatteryRetriever:
         chemistry_bonus = 0.1 if str(query_row["chemistry_family"]) == str(ref_row["chemistry_family"]) else -0.05
         domain_bonus = 0.05 if str(query_row["domain_label"]) == str(ref_row["domain_label"]) else 0.0
         stage_bonus = 0.1 if str(query_row["degradation_stage"]) == str(ref_row["degradation_stage"]) else -0.05
-        core_mean = float(np.mean([component_distances[name] for name in COMPONENT_NAMES]))
+        core_values = [
+            float(component_distances[name])
+            for name in CORE_COMPONENTS
+            if np.isfinite(float(component_distances.get(name, np.nan)))
+        ]
+        core_mean = float(np.mean(core_values)) if core_values else 1.0
         raw_score = 1.0 - core_mean + chemistry_bonus + domain_bonus + stage_bonus - 0.2 * float(missing_penalty)
         return float(np.clip(raw_score, 0.0, 1.0))
 
@@ -436,19 +494,22 @@ class MultiStageBatteryRetriever:
         rows = []
         for row_idx in range(len(self.case_rows)):
             state = self._state_dict(row_idx)
+            qv_summary = self._qv_summary_stats(row_idx)
             physics = np.asarray(self.arrays["anchor_physics_features"][row_idx], dtype=np.float32)
-            operation = self._operation_feature_dict(row_idx)
-            op_names = [
-                "charge_c_rate_mean",
-                "charge_c_rate_std",
-                "discharge_c_rate_mean",
-                "discharge_c_rate_std",
-                "temperature_mean",
-                "temperature_std",
-                "temperature_max",
-                "protocol_change_rate",
-            ]
-            op_vec = np.asarray([float(operation.get(name, 0.0)) for name in op_names], dtype=np.float32)
+            metadata_numeric_vec = self._metadata_numeric_summary(row_idx)
+            qv_vec = np.asarray(
+                [
+                    float(qv_summary.get("delta_v_mean", 0.0)),
+                    float(qv_summary.get("delta_v_std", 0.0)),
+                    float(qv_summary.get("delta_v_q95", 0.0)),
+                    float(qv_summary.get("r_mean", 0.0)),
+                    float(qv_summary.get("r_std", 0.0)),
+                    float(qv_summary.get("r_q95", 0.0)),
+                    float(qv_summary.get("vc_curve_slope_mean", 0.0)),
+                    float(qv_summary.get("vd_curve_slope_mean", 0.0)),
+                ],
+                dtype=np.float32,
+            )
             rows.append(
                 np.concatenate(
                     [
@@ -460,25 +521,15 @@ class MultiStageBatteryRetriever:
                             ],
                             dtype=np.float32,
                         ),
+                        qv_vec,
                         physics.astype(np.float32),
-                        op_vec,
+                        metadata_numeric_vec,
                     ]
                 )
             )
         return np.asarray(rows, dtype=np.float32)
 
     def _build_stage1_embeddings(self) -> np.ndarray:
-        tsfm_cfg = dict(self.rag_config.get("distance_components", {}).get("d_tsfm", {}) or {})
-        tsfm_features_cfg = dict(tsfm_cfg.get("features", {}) or {})
-        tsfm_embeddings = self.arrays["tsfm_embeddings"]
-        use_tsfm = (
-            self.stage1_embedding_name == "tsfm"
-            and bool(tsfm_cfg.get("enabled", False))
-            and bool(dict(tsfm_features_cfg.get("tsfm_stage1_coarse_retrieval", {}) or {}).get("enabled", True))
-            and tsfm_embeddings is not None
-        )
-        if use_tsfm:
-            return np.asarray(tsfm_embeddings, dtype=np.float32)
         return np.asarray(self.handcrafted_embeddings, dtype=np.float32)
 
     def _coarse_candidates(self, query_idx: int) -> np.ndarray:
@@ -500,7 +551,7 @@ class MultiStageBatteryRetriever:
         for case_id in np.asarray(candidate_case_ids, dtype=np.int64).tolist():
             ref_idx = self.case_id_to_index[int(case_id)]
             ref_row = self.case_rows.iloc[ref_idx]
-            if int(ref_row["case_id"]) == query_case_id:
+            if self.exclude_query_case and int(ref_row["case_id"]) == query_case_id:
                 continue
             if str(ref_row["split"]) == "target_query":
                 continue
@@ -533,32 +584,27 @@ class MultiStageBatteryRetriever:
         d_soh_state = compute_soh_state_distance(
             query_state,
             ref_state,
-            self.rag_config["distance_components"]["d_soh_state"],
+            self.rag_config,
         )
         d_qv_shape = compute_qv_shape_distance(
             query_qv,
             ref_qv,
-            self.rag_config["distance_components"]["d_qv_shape"],
+            self.rag_config,
         )
         d_physics = compute_physics_distance(
             query_physics,
             ref_physics,
-            self.rag_config["distance_components"]["d_physics"],
+            self.rag_config,
         )
-        d_operation = compute_operation_distance(
-            query_operation,
-            ref_operation,
-            self.rag_config["distance_components"]["d_operation"],
+        d_operation = (
+            compute_operation_distance(query_operation, ref_operation, self.rag_config)
+            if "d_operation" in self.enabled_component_names
+            else np.nan
         )
         d_metadata = compute_metadata_distance(
             query_metadata,
             ref_metadata,
-            self.rag_config["distance_components"]["d_metadata"],
-        )
-        d_tsfm = compute_tsfm_distance(
-            self.stage1_embeddings[query_idx],
-            self.stage1_embeddings[ref_idx],
-            self.rag_config["distance_components"]["d_tsfm"],
+            self.rag_config,
         )
         components = {
             "d_soh_state": float(d_soh_state),
@@ -566,7 +612,6 @@ class MultiStageBatteryRetriever:
             "d_physics": float(d_physics),
             "d_operation": float(d_operation),
             "d_metadata": float(d_metadata),
-            "d_tsfm": float(d_tsfm),
         }
         composite_distance = compute_composite_distance(components, self.rag_config)
         stage_distance = degradation_stage_distance(
@@ -649,15 +694,15 @@ class MultiStageBatteryRetriever:
                 d_physics=zeros.copy(),
                 d_operation=zeros.copy(),
                 d_metadata=zeros.copy(),
-                d_tsfm=zeros.copy(),
                 composite_distance=np.full(self.top_k, np.inf, dtype=np.float32),
                 retrieval_confidence=0.0,
                 retrieval_alpha=zeros.copy(),
                 neighbor_future_delta_soh=np.zeros((self.top_k, horizon), dtype=np.float32),
                 neighbor_metadata=[{} for _ in range(self.top_k)],
                 explain_json={
-                    "component_names": COMPONENT_NAMES,
-                    "enabled_distance_components": [name for name in COMPONENT_NAMES if bool(self.rag_config["distance_components"][name]["enabled"])],
+                    "core_component_names": CORE_COMPONENTS,
+                    "optional_component_names": OPTIONAL_COMPONENTS,
+                    "enabled_distance_components": self.enabled_component_names,
                     "warning": "No valid neighbors after hard filtering.",
                 },
                 stage_distance=zeros.copy(),
@@ -690,7 +735,10 @@ class MultiStageBatteryRetriever:
         neighbor_case_ids = np.full(self.top_k, -1, dtype=np.int64)
         retrieval_mask = np.zeros(self.top_k, dtype=np.float32)
         composite_distance = np.full(self.top_k, np.inf, dtype=np.float32)
-        named_distance_arrays = {name: np.zeros(self.top_k, dtype=np.float32) for name in COMPONENT_NAMES}
+        named_distance_arrays = {
+            name: (np.full(self.top_k, np.nan, dtype=np.float32) if name in OPTIONAL_COMPONENTS else np.zeros(self.top_k, dtype=np.float32))
+            for name in COMPONENT_NAMES
+        }
         stage_distance = np.zeros(self.top_k, dtype=np.float32)
         missing_penalty = np.zeros(self.top_k, dtype=np.float32)
         reference_compatibility_score = np.zeros(self.top_k, dtype=np.float32)
@@ -738,12 +786,9 @@ class MultiStageBatteryRetriever:
         retrieval_confidence = compute_retrieval_confidence(confidence_payload, self.rag_config) if k > 0 else 0.0
 
         explain_json = {
-            "component_names": COMPONENT_NAMES,
-            "enabled_distance_components": [
-                name
-                for name in COMPONENT_NAMES
-                if bool(dict(self.rag_config.get("distance_components", {}).get(name, {}) or {}).get("enabled", False))
-            ],
+            "core_component_names": CORE_COMPONENTS,
+            "optional_component_names": OPTIONAL_COMPONENTS,
+            "enabled_distance_components": self.enabled_component_names,
             "candidate_count_after_filter": int(len(candidate_case_ids)),
             "selected_neighbors": [
                 {
@@ -770,7 +815,6 @@ class MultiStageBatteryRetriever:
             d_physics=named_distance_arrays["d_physics"],
             d_operation=named_distance_arrays["d_operation"],
             d_metadata=named_distance_arrays["d_metadata"],
-            d_tsfm=named_distance_arrays["d_tsfm"],
             composite_distance=composite_distance,
             retrieval_confidence=float(retrieval_confidence),
             retrieval_alpha=retrieval_alpha,
@@ -801,7 +845,6 @@ class MultiStageBatteryRetriever:
             d_physics=np.stack([result.d_physics for result in results]).astype(np.float32),
             d_operation=np.stack([result.d_operation for result in results]).astype(np.float32),
             d_metadata=np.stack([result.d_metadata for result in results]).astype(np.float32),
-            d_tsfm=np.stack([result.d_tsfm for result in results]).astype(np.float32),
             stage_distance=np.stack([np.asarray(result.stage_distance, dtype=np.float32) for result in results]).astype(np.float32),
             missing_penalty=np.stack([np.asarray(result.missing_penalty, dtype=np.float32) for result in results]).astype(np.float32),
             reference_compatibility_score=np.stack([np.asarray(result.reference_compatibility_score, dtype=np.float32) for result in results]).astype(np.float32),

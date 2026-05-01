@@ -9,3 +9,4 @@ tests
 models
 .DS_Store
 PROJECT_CODE.md
+$TMPDIR

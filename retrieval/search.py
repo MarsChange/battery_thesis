@@ -1,18 +1,15 @@
-"""
-search.py — Query a FAISS retrieval database and return structured results.
-"""
+"""Query a FAISS retrieval database and return structured numerical results."""
 
 from __future__ import annotations
 
 import ast
 import json
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
 
-from .encoder_chronos2 import Chronos2RetrieverEncoder
 from .index import FAISSIndex
 from .io import load_sidecar
 from .schema import SearchResult
@@ -30,8 +27,9 @@ class RetrieverSearcher:
         Prefix used when saving (default ``"db"``).
     metric : ``"cosine"`` | ``"l2"``
         Must match what was used at build time.
-    encoder : Chronos2RetrieverEncoder | None
-        If provided, raw time series windows can be passed directly.
+    encoder : object | None
+        Optional numerical encoder with an ``encode(windows)`` method. The
+        current project does not attach external sequence foundation encoders.
     """
 
     def __init__(
@@ -39,7 +37,7 @@ class RetrieverSearcher:
         db_dir: str | Path,
         name: str = "db",
         metric: Literal["cosine", "l2"] = "cosine",
-        encoder: Optional[Chronos2RetrieverEncoder] = None,
+        encoder: Optional[Any] = None,
     ):
         self.db_dir = Path(db_dir)
         self.name = name

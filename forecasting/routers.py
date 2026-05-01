@@ -56,15 +56,22 @@ class GroupedAdditiveRouter(nn.Module):
 
 class PhysicalDegradationRouter(GroupedAdditiveRouter):
     REQUIRED_GROUPS = [
-        "state",
-        "curve",
-        "partial_charge",
-        "relaxation",
+        "soh_state",
+        "qv_polarization",
         "operation",
         "chemistry",
         "retrieval",
-        "availability",
+        "neighbor_vote",
     ]
+
+    GROUP_DESCRIPTIONS = {
+        "soh_state": "anchor_soh、recent_soh_slope、recent_soh_curvature，用于判断相对退化状态和趋势。",
+        "qv_polarization": "DeltaV(Q) 与 R(Q) 统计 proxy，用于表示极化和内阻相关状态。",
+        "operation": "充放电倍率、温度统计和 protocol_change_rate，用于表示运行压力。",
+        "chemistry": "电池 chemistry metadata embedding，用于材料体系上下文。",
+        "retrieval": "RAG confidence、top-k 距离统计和参考适配度，用于判断历史案例是否可靠。",
+        "neighbor_vote": "top-k 邻居物理模式投票，用于把检索邻居的模式信息传给专家路由。",
+    }
 
     def __init__(self, group_dims: Dict[str, int], num_experts: int, top_k_experts: int = 2):
         super().__init__(group_dims=group_dims, num_outputs=num_experts, top_k=top_k_experts)

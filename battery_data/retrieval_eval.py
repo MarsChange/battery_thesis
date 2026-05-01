@@ -49,7 +49,7 @@ def ensure_memory_bank_ready(
     if encoder is None:
         raise ValueError(
             "Memory-bank artifacts are incomplete and no encoder was provided. "
-            "Build the bank first or rerun with an available Chronos-2 encoder."
+            "Build the bank first or rerun with the numerical statistical encoder."
         )
     print(
         f"[Eval] Retrieval artifacts for '{db_name}' are incomplete. "

@@ -1,5 +1,5 @@
 """
-cli_build.py — CLI entry point: build a FAISS retrieval database.
+cli_build.py — CLI entry point: build a numerical FAISS retrieval database.
 
 Usage:
     python -m retrieval.cli_build --config configs/retrieval/demo.yaml
@@ -15,7 +15,7 @@ import numpy as np
 import yaml
 
 from .build_db import build_and_save, slice_windows
-from .encoder_chronos2 import Chronos2RetrieverEncoder
+from .statistical_encoder import StatisticalWindowEncoder
 
 
 def load_config(path: str) -> dict:
@@ -60,16 +60,8 @@ def main(argv=None):
 
     cfg = load_config(args.config)
 
-    # Build encoder
-    enc_cfg = cfg["encoder"]
-    encoder = Chronos2RetrieverEncoder(
-        model_path=enc_cfg.get("model_path", "autogluon/chronos-2"),
-        pooling=enc_cfg.get("pooling", "mean"),
-        device=enc_cfg.get("device", "auto"),
-        context_length=enc_cfg.get("context_length"),
-        batch_size=enc_cfg.get("batch_size", 256),
-        torch_dtype=enc_cfg.get("torch_dtype", "float32"),
-    )
+    enc_cfg = cfg.get("encoder", {})
+    encoder = StatisticalWindowEncoder(eps=float(enc_cfg.get("eps", 1e-8)))
 
     # Load data
     series_dict = _load_data(cfg)
@@ -96,7 +88,6 @@ def main(argv=None):
     print(f"Total windows: {len(all_samples)}")
 
     # Build and save
-    faiss_cfg = cfg.get("faiss", {})
     ret_cfg = cfg.get("retrieval", {})
     output_dir = cfg.get("output_dir", "output/retrieval_db")
 

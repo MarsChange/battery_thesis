@@ -52,6 +52,7 @@ class BatterySOHForecastDataset(Dataset):
         self.case_bank_dir = Path(case_bank_dir)
         self.case_rows = _read_case_rows(self.case_bank_dir).sort_values("case_id").reset_index(drop=True)
         self.case_rows["case_id"] = self.case_rows["case_id"].astype(int)
+        self.case_id_to_row_index = {int(case_id): row_idx for row_idx, case_id in enumerate(self.case_rows["case_id"].tolist())}
         self.meta_fields = list(meta_fields or DEFAULT_META_FIELDS)
         self.retrieval_cfg = retrieval_cfg or {}
 
@@ -77,8 +78,6 @@ class BatterySOHForecastDataset(Dataset):
             "qv_masks": np.load(self.case_bank_dir / "case_qv_masks.npy"),
             "partial_charge": np.load(self.case_bank_dir / "case_partial_charge.npy"),
             "partial_charge_mask": np.load(self.case_bank_dir / "case_partial_charge_mask.npy"),
-            "relaxation": np.load(self.case_bank_dir / "case_relaxation.npy"),
-            "relaxation_mask": np.load(self.case_bank_dir / "case_relaxation_mask.npy"),
             "physics_features": np.load(self.case_bank_dir / "case_physics_features.npy"),
             "physics_feature_masks": np.load(self.case_bank_dir / "case_physics_feature_masks.npy"),
             "anchor_physics_features": np.load(self.case_bank_dir / "case_anchor_physics_features.npy"),
@@ -88,8 +87,12 @@ class BatterySOHForecastDataset(Dataset):
             "future_delta_soh": np.load(self.case_bank_dir / "case_future_delta_soh.npy"),
             "future_soh": np.load(self.case_bank_dir / "case_future_soh.npy"),
         }
-        tsfm_path = self.case_bank_dir / "case_tsfm_embeddings.npy"
-        arrays["tsfm_embedding"] = np.load(tsfm_path) if tsfm_path.exists() else None
+        expert_seq_path = self.case_bank_dir / "case_expert_seq.npy"
+        arrays["expert_seq"] = np.load(expert_seq_path) if expert_seq_path.exists() else None
+        baseline_path = self.case_bank_dir / "case_baseline_delta_oof.npy"
+        residual_path = self.case_bank_dir / "case_residual_target_oof.npy"
+        arrays["baseline_delta_oof"] = np.load(baseline_path) if baseline_path.exists() else None
+        arrays["residual_target_oof"] = np.load(residual_path) if residual_path.exists() else None
         return arrays
 
     @staticmethod
@@ -120,10 +123,10 @@ class BatterySOHForecastDataset(Dataset):
     def _load_or_build_retrieval_cache(self, auto_build_retrieval_cache: bool) -> Dict[str, np.ndarray]:
         retriever = MultiStageBatteryRetriever(
             case_bank_dir=self.case_bank_dir,
-            retrieval_config_path=str(self.retrieval_cfg.get("retrieval_feature_config_path", "configs/rag_retrieval_features.yaml")),
+            retrieval_config_path=str(self.retrieval_cfg.get("retrieval_feature_config_path", "configs/retrieval_features.yaml")),
             db_splits=list(self.retrieval_cfg.get("db_splits", ["source_train"])),
             metric=str(self.retrieval_cfg.get("metric", "cosine")),
-            stage1_embedding_name=str(self.retrieval_cfg.get("stage1_embedding", self.retrieval_cfg.get("stage1_embedding_name", "tsfm"))),
+            stage1_embedding_name=str(self.retrieval_cfg.get("stage1_embedding", self.retrieval_cfg.get("stage1_embedding_name", "handcrafted"))),
             top_m=int(self.retrieval_cfg.get("top_m", 200)),
             top_k=int(self.retrieval_cfg.get("top_k", 8)),
             same_cell_policy=str(self.retrieval_cfg.get("same_cell_policy", "exclude")),
@@ -151,7 +154,6 @@ class BatterySOHForecastDataset(Dataset):
         return int(len(self.indices))
 
     def _zero_retrieval_dict(self, horizon: int, top_k: int) -> Dict[str, np.ndarray]:
-        tsfm_dim = int(self.arrays["tsfm_embedding"].shape[-1]) if self.arrays["tsfm_embedding"] is not None else 0
         zero_component = np.zeros((top_k, len(COMPONENT_NAMES)), dtype=np.float32)
         return {
             "neighbor_case_ids": np.full(top_k, -1, dtype=np.int64),
@@ -165,18 +167,17 @@ class BatterySOHForecastDataset(Dataset):
             "d_physics": np.zeros(top_k, dtype=np.float32),
             "d_operation": np.zeros(top_k, dtype=np.float32),
             "d_metadata": np.zeros(top_k, dtype=np.float32),
-            "d_tsfm": np.zeros(top_k, dtype=np.float32),
             "reference_compatibility_score": np.zeros(top_k, dtype=np.float32),
             "ref_future_delta_soh": np.zeros((top_k, horizon), dtype=np.float32),
             "ref_cycle_stats": np.zeros((top_k,) + self.arrays["cycle_stats"].shape[1:], dtype=np.float32),
+            "ref_soh_seq": np.zeros((top_k, self.arrays["soh_seq"].shape[1], 1), dtype=np.float32),
+            "ref_anchor_soh": np.zeros(top_k, dtype=np.float32),
             "ref_qv_maps": np.zeros((top_k,) + self.arrays["qv_maps"].shape[1:], dtype=np.float32),
             "ref_partial_charge": np.zeros((top_k,) + self.arrays["partial_charge"].shape[1:], dtype=np.float32),
-            "ref_relaxation": np.zeros((top_k,) + self.arrays["relaxation"].shape[1:], dtype=np.float32),
             "ref_physics_features": np.zeros((top_k,) + self.arrays["physics_features"].shape[1:], dtype=np.float32),
             "ref_anchor_physics_features": np.zeros((top_k,) + self.arrays["anchor_physics_features"].shape[1:], dtype=np.float32),
             "ref_operation_seq": np.zeros((top_k,) + self.arrays["operation_seq"].shape[1:], dtype=np.float32),
             "ref_meta_ids": np.zeros((top_k, len(self.meta_fields)), dtype=np.int64),
-            "ref_tsfm_embedding": np.zeros((top_k, tsfm_dim), dtype=np.float32),
         }
 
     def __getitem__(self, item: int) -> Dict[str, Dict[str, np.ndarray | int | str]]:
@@ -184,11 +185,6 @@ class BatterySOHForecastDataset(Dataset):
         row = self.case_rows.iloc[row_idx]
         case_id = int(row["case_id"])
         horizon = int(self.arrays["future_delta_soh"].shape[1])
-        tsfm_embedding = (
-            np.asarray(self.arrays["tsfm_embedding"][row_idx], dtype=np.float32)
-            if self.arrays["tsfm_embedding"] is not None
-            else np.zeros(0, dtype=np.float32)
-        )
 
         query = {
             "case_id": case_id,
@@ -203,8 +199,6 @@ class BatterySOHForecastDataset(Dataset):
             "qv_masks": np.asarray(self.arrays["qv_masks"][row_idx], dtype=np.float32),
             "partial_charge": np.asarray(self.arrays["partial_charge"][row_idx], dtype=np.float32),
             "partial_charge_mask": np.asarray(self.arrays["partial_charge_mask"][row_idx], dtype=np.float32),
-            "relaxation": np.asarray(self.arrays["relaxation"][row_idx], dtype=np.float32),
-            "relaxation_mask": np.asarray(self.arrays["relaxation_mask"][row_idx], dtype=np.float32),
             "physics_features": np.asarray(self.arrays["physics_features"][row_idx], dtype=np.float32),
             "physics_feature_masks": np.asarray(self.arrays["physics_feature_masks"][row_idx], dtype=np.float32),
             "anchor_physics_features": np.asarray(self.arrays["anchor_physics_features"][row_idx], dtype=np.float32),
@@ -212,8 +206,13 @@ class BatterySOHForecastDataset(Dataset):
             "future_ops": np.asarray(self.arrays["future_ops"][row_idx], dtype=np.float32),
             "future_ops_mask": np.asarray(self.arrays["future_ops_mask"][row_idx], dtype=np.float32),
             "meta_ids": np.asarray(self.meta_ids_all[row_idx], dtype=np.int64),
-            "tsfm_embedding": tsfm_embedding,
         }
+        if self.arrays["expert_seq"] is not None:
+            query["expert_seq"] = np.asarray(self.arrays["expert_seq"][row_idx], dtype=np.float32)
+        if self.arrays["baseline_delta_oof"] is not None:
+            query["baseline_delta_oof"] = np.asarray(self.arrays["baseline_delta_oof"][row_idx], dtype=np.float32)
+        if self.arrays["residual_target_oof"] is not None:
+            query["residual_target_oof"] = np.asarray(self.arrays["residual_target_oof"][row_idx], dtype=np.float32)
 
         if self.retrieval_cache is None:
             top_k = int(self.retrieval_cfg.get("top_k", 8)) if self.retrieval_cfg else 8
@@ -224,11 +223,7 @@ class BatterySOHForecastDataset(Dataset):
             retrieval_mask = np.asarray(self.retrieval_cache["retrieval_mask"][local_idx], dtype=np.float32)
             component_distances = np.asarray(self.retrieval_cache["component_distances"][local_idx], dtype=np.float32)
             ref_indices = np.where(neighbor_case_ids >= 0, neighbor_case_ids, 0).astype(np.int64)
-            ref_tsfm = (
-                np.asarray(self.arrays["tsfm_embedding"][ref_indices], dtype=np.float32)
-                if self.arrays["tsfm_embedding"] is not None
-                else np.zeros((len(ref_indices), 0), dtype=np.float32)
-            )
+            ref_row_indices = np.asarray([self.case_id_to_row_index[int(case_id)] for case_id in ref_indices.tolist()], dtype=np.int64)
             retrieval = {
                 "neighbor_case_ids": neighbor_case_ids,
                 "retrieval_mask": retrieval_mask,
@@ -261,20 +256,16 @@ class BatterySOHForecastDataset(Dataset):
                     self.retrieval_cache["d_metadata"][local_idx] if "d_metadata" in self.retrieval_cache else component_distances[:, 4],
                     dtype=np.float32,
                 ),
-                "d_tsfm": np.asarray(
-                    self.retrieval_cache["d_tsfm"][local_idx] if "d_tsfm" in self.retrieval_cache else component_distances[:, 5],
-                    dtype=np.float32,
-                ),
                 "reference_compatibility_score": np.asarray(self.retrieval_cache["reference_compatibility_score"][local_idx], dtype=np.float32),
-                "ref_future_delta_soh": np.asarray(self.arrays["future_delta_soh"][ref_indices], dtype=np.float32),
-                "ref_cycle_stats": np.asarray(self.arrays["cycle_stats"][ref_indices], dtype=np.float32),
-                "ref_qv_maps": np.asarray(self.arrays["qv_maps"][ref_indices], dtype=np.float32),
-                "ref_partial_charge": np.asarray(self.arrays["partial_charge"][ref_indices], dtype=np.float32),
-                "ref_relaxation": np.asarray(self.arrays["relaxation"][ref_indices], dtype=np.float32),
-                "ref_physics_features": np.asarray(self.arrays["physics_features"][ref_indices], dtype=np.float32),
-                "ref_anchor_physics_features": np.asarray(self.arrays["anchor_physics_features"][ref_indices], dtype=np.float32),
-                "ref_operation_seq": np.asarray(self.arrays["operation_seq"][ref_indices], dtype=np.float32),
-                "ref_meta_ids": np.asarray(self.meta_ids_all[ref_indices], dtype=np.int64),
-                "ref_tsfm_embedding": ref_tsfm,
+                "ref_future_delta_soh": np.asarray(self.arrays["future_delta_soh"][ref_row_indices], dtype=np.float32),
+                "ref_cycle_stats": np.asarray(self.arrays["cycle_stats"][ref_row_indices], dtype=np.float32),
+                "ref_soh_seq": np.asarray(self.arrays["soh_seq"][ref_row_indices][:, :, None], dtype=np.float32),
+                "ref_anchor_soh": np.asarray(self.case_rows.iloc[ref_row_indices]["anchor_soh"].to_numpy(dtype=np.float32), dtype=np.float32),
+                "ref_qv_maps": np.asarray(self.arrays["qv_maps"][ref_row_indices], dtype=np.float32),
+                "ref_partial_charge": np.asarray(self.arrays["partial_charge"][ref_row_indices], dtype=np.float32),
+                "ref_physics_features": np.asarray(self.arrays["physics_features"][ref_row_indices], dtype=np.float32),
+                "ref_anchor_physics_features": np.asarray(self.arrays["anchor_physics_features"][ref_row_indices], dtype=np.float32),
+                "ref_operation_seq": np.asarray(self.arrays["operation_seq"][ref_row_indices], dtype=np.float32),
+                "ref_meta_ids": np.asarray(self.meta_ids_all[ref_row_indices], dtype=np.int64),
             }
         return {"query": query, "retrieval": retrieval}

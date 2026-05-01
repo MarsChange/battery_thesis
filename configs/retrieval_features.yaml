@@ -1,0 +1,84 @@
+# configs/retrieval_features.yaml
+#
+# 控制 RAG 历史案例检索使用哪些数值特征。
+# 每个 d_* 为布尔开关：true 表示参与 composite_distance，false 表示不参与。
+# RAG 只使用 battery-specific numerical features，不使用外部序列基础模型嵌入。
+
+schema_version: "1.0"
+
+# SOH 状态距离：anchor_soh、recent_soh_slope、recent_soh_curvature 和退化阶段。
+d_soh_state: true
+
+# 容量-电压曲线形状距离：Vd(Q)、DeltaV(Q)、R(Q) 和 Q-V 统计量。
+d_qv_shape: true
+
+# 物理 proxy 距离：DeltaV(Q) 与 R(Q) 的均值、标准差、高分位和曲线斜率。
+d_physics: true
+
+# 工况距离已默认关闭：
+# 原 `d_operation` 的细项不再作为独立检索分量使用。
+# 充放电电流、温度、归一化容量变化这些原始滑窗数值已并入 d_metadata 的 numeric raw matching。
+d_operation: false
+
+# 元信息距离：类别 metadata penalty + 原始滑窗数值匹配。
+# 数值匹配包括充电电流序列、放电电流序列、温度序列和归一化容量变化序列。
+d_metadata: true
+
+weights:
+  d_soh_state: 0.25
+  d_qv_shape: 0.30
+  d_physics: 0.20
+  d_operation: 0.00
+  d_metadata: 0.25
+
+stage1_retrieval:
+  # Stage-1 粗检索固定使用 handcrafted battery embedding：
+  # anchor SOH + SOH slope/curvature + Q-V summary + ΔV/R proxy + metadata raw numeric matching features。
+  top_m: 200
+
+final_topk:
+  top_k: 8
+  use_mmr: true
+  mmr_lambda: 0.75
+  max_neighbors_per_cell: 2
+  same_cell_policy: "exclude"
+  allow_cross_chemistry: true
+
+qv_shape:
+  channel_weights:
+    Vd: 0.25
+    DeltaV: 0.40
+    R: 0.35
+  use_vc: false
+  use_ic: false
+  use_id: false
+  use_summary_stats: true
+
+metadata_penalties:
+  chemistry_family_mismatch: 1.00
+  domain_label_mismatch: 0.50
+  voltage_window_mismatch: 0.50
+
+metadata_distance_weights:
+  categorical: 0.40
+  raw_numeric: 0.60
+
+metadata_numeric_weights:
+  # 充电电流原始滑窗序列，来自 Q-V feature map 的 Ic(Q) 通道按 cycle 聚合。
+  charge_current_seq: 0.25
+  # 放电电流原始滑窗序列，来自 Q-V feature map 的 Id(Q) 通道按 cycle 聚合后取绝对值。
+  discharge_current_seq: 0.25
+  # 温度原始滑窗序列，来自 per-cycle temp_mean / operation sequence。
+  temperature_seq: 0.20
+  # 归一化容量变化序列，使用 SOH/capacity ratio 的 cycle-to-cycle 差分。
+  normalized_capacity_delta_seq: 0.30
+
+retrieval_confidence:
+  enabled: true
+  factors:
+    mean_topk_composite_distance: true
+    std_topk_composite_distance: true
+    top1_distance: true
+    feature_availability_ratio: true
+    chemistry_match_rate: true
+    domain_match_rate: false

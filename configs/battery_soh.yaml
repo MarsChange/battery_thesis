@@ -6,14 +6,6 @@ adapter_cache: true
 nominal_capacity_window: 5
 soh_skip_initial_cycles: 0
 
-encoder:
-  model_path: models/chronos-2
-  pooling: mean
-  device: auto
-  context_length: null
-  batch_size: 32
-  torch_dtype: float32
-
 datasets:
   xjtu:
     enabled: true
@@ -78,19 +70,15 @@ memory:
 features:
   q_grid_size: 100
   partial_charge_segments: 50
-  relaxation_points: 30
-  relaxation_time_max_minutes: 30
-  current_rest_threshold: 0.02
   rolling_median_window: 5
   normalize_using: source_train
-  use_batlinet_qv_map: true
+  use_qv_feature_map: true
   use_partial_charge_curve: true
-  use_relaxation_curve: true
   use_physics_features: true
   future_ops_mode: known
 
 retrieval:
-  retrieval_feature_config_path: configs/rag_retrieval_features.yaml
+  retrieval_feature_config_path: configs/retrieval_features.yaml
   db_splits: ["source_train"]
   metric: cosine
   top_m: 200
@@ -98,7 +86,7 @@ retrieval:
   same_cell_policy: exclude
   allow_cross_chemistry: true
   retrieval_temperature: 0.1
-  stage1_embedding: tsfm
+  stage1_embedding: handcrafted
   use_mmr: true
   mmr_lambda: 0.75
   max_neighbors_per_cell: 2
@@ -107,25 +95,35 @@ model:
   hidden_dim: 256
   dropout: 0.1
   meta_embedding_dim: 16
-  use_tsfm_embedding: true
   use_qv_encoder: true
   use_partial_charge_encoder: true
-  use_relaxation_encoder: true
   use_pairwise_branch: true
   use_moe_branch: true
   use_future_ops_encoder: true
   expert_names:
-    - shared
     - LFP
     - NCM
     - NCA
     - slow_linear
     - accelerating
     - high_polarization
-    - relaxation_impedance
+    - curve_polarization_expert
   top_k_experts: 2
   router_type: grouped_additive
   fusion_router_type: grouped_additive
+
+train_base:
+  enabled: true
+
+generate_oof_baseline:
+  enabled: true
+  num_folds: 5
+
+train_residual_experts:
+  enabled: true
+  lr: 0.0005
+  epochs: 60
+  patience: 12
 
 loss:
   criterion: huber
@@ -153,12 +151,6 @@ train:
 fewshot:
   enabled: true
   support_splits: ["target_support"]
-  freeze_generalist_head: true
-  freeze_curve_encoders: true
-  train_router: true
-  train_fusion_router: true
-  train_experts: true
-  train_pairwise_branch: true
   lr: 0.0003
   epochs: 50
   patience: 10

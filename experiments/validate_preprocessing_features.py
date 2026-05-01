@@ -41,8 +41,6 @@ def _load_case_bank(case_bank_dir: Path) -> Tuple[pd.DataFrame, Dict[str, np.nda
         "qv_masks": np.load(case_bank_dir / "case_qv_masks.npy"),
         "partial_charge": np.load(case_bank_dir / "case_partial_charge.npy"),
         "partial_charge_mask": np.load(case_bank_dir / "case_partial_charge_mask.npy"),
-        "relaxation": np.load(case_bank_dir / "case_relaxation.npy"),
-        "relaxation_mask": np.load(case_bank_dir / "case_relaxation_mask.npy"),
         "physics_features": np.load(case_bank_dir / "case_physics_features.npy"),
         "physics_feature_masks": np.load(case_bank_dir / "case_physics_feature_masks.npy"),
         "anchor_physics_features": np.load(case_bank_dir / "case_anchor_physics_features.npy"),
@@ -52,8 +50,6 @@ def _load_case_bank(case_bank_dir: Path) -> Tuple[pd.DataFrame, Dict[str, np.nda
         "future_delta_soh": np.load(case_bank_dir / "case_future_delta_soh.npy"),
         "future_soh": np.load(case_bank_dir / "case_future_soh.npy"),
     }
-    tsfm_path = case_bank_dir / "case_tsfm_embeddings.npy"
-    arrays["tsfm_embedding"] = np.load(tsfm_path) if tsfm_path.exists() else None
     feature_names = json.loads((case_bank_dir / "feature_names.json").read_text())
     return rows, arrays, feature_names
 
@@ -72,11 +68,9 @@ def _availability_rows(rows: pd.DataFrame, arrays: Dict[str, np.ndarray]) -> pd.
                 "qv_curve_stats": float(np.isfinite(arrays["cycle_stats"][idx, -1]).mean()),
                 "qv_map": float(arrays["qv_masks"][idx].mean()),
                 "partial_charge": float(arrays["partial_charge_mask"][idx].mean()),
-                "relaxation": float(arrays["relaxation_mask"][idx].mean()),
                 "physics_12d": float(arrays["physics_feature_masks"][idx].mean()),
                 "operation": float(np.isfinite(arrays["operation_seq"][idx]).mean()),
                 "future_operation": float(arrays["future_ops_mask"][idx].mean()),
-                "tsfm_embedding": float(np.isfinite(arrays["tsfm_embedding"][idx]).mean()) if arrays["tsfm_embedding"] is not None else 0.0,
             }
         )
     return pd.DataFrame(result)
@@ -100,7 +94,6 @@ def _flat_feature_table(rows: pd.DataFrame, arrays: Dict[str, np.ndarray], featu
         anchor_cycle = arrays["cycle_stats"][idx, -1]
         qv_anchor = arrays["qv_maps"][idx, -1]
         partial_anchor = arrays["partial_charge"][idx, -1]
-        relax_anchor = arrays["relaxation"][idx, -1]
         physics_anchor = arrays["anchor_physics_features"][idx]
         record = {
             "case_id": int(row["case_id"]),
@@ -116,8 +109,6 @@ def _flat_feature_table(rows: pd.DataFrame, arrays: Dict[str, np.ndarray], featu
         record["qv_map_std"] = float(qv_anchor.std())
         record["partial_charge_mean"] = float(partial_anchor.mean())
         record["partial_charge_std"] = float(partial_anchor.std())
-        record["relaxation_mean"] = float(relax_anchor.mean())
-        record["relaxation_std"] = float(relax_anchor.std())
         for feat_idx, name in enumerate(feature_names["physics_feature_names"]):
             record[f"physics_{name}"] = float(physics_anchor[feat_idx])
         op_mean = arrays["operation_seq"][idx].mean(axis=0)
@@ -127,9 +118,6 @@ def _flat_feature_table(rows: pd.DataFrame, arrays: Dict[str, np.ndarray], featu
             future_name = future_operation_names[op_idx] if op_idx < len(future_operation_names) else f"unknown_future_operation_feature_{op_idx}"
             record[f"operation_{op_name}"] = float(op_mean[op_idx])
             record[f"future_operation_{future_name}"] = float(future_op_mean[op_idx])
-        if arrays["tsfm_embedding"] is not None:
-            for dim_idx in range(min(8, arrays["tsfm_embedding"].shape[-1])):
-                record[f"tsfm_{dim_idx}"] = float(arrays["tsfm_embedding"][idx, dim_idx])
         records.append(record)
     table = pd.DataFrame(records)
     targets = _target_views(arrays)
@@ -243,7 +231,6 @@ def _feature_group_matrix(table: pd.DataFrame, group: str) -> Tuple[np.ndarray, 
         "qv_curve_stats_only": [col for col in table.columns if col.startswith("cycle_delta_v") or col.startswith("cycle_r_") or col.startswith("cycle_vc_") or col.startswith("cycle_vd_")],
         "qv_map_pooled_stats": [col for col in table.columns if col.startswith("qv_map_")],
         "partial_charge_only": [col for col in table.columns if col.startswith("partial_charge_")],
-        "relaxation_only": [col for col in table.columns if col.startswith("relaxation_")],
         "physics_12d_only": [col for col in table.columns if col.startswith("physics_")],
         "operation_only": [col for col in table.columns if col.startswith("operation_") or col.startswith("future_operation_")],
     }
@@ -251,18 +238,8 @@ def _feature_group_matrix(table: pd.DataFrame, group: str) -> Tuple[np.ndarray, 
         cols = columns_map["soh_only"] + columns_map["operation_only"]
     elif group == "soh_plus_qv_physics":
         cols = columns_map["soh_only"] + columns_map["qv_curve_stats_only"] + columns_map["physics_12d_only"]
-    elif group == "all_physics_no_tsfm":
-        cols = columns_map["cycle_stats_only"] + columns_map["qv_map_pooled_stats"] + columns_map["partial_charge_only"] + columns_map["relaxation_only"] + columns_map["physics_12d_only"] + columns_map["operation_only"]
-    elif group == "all_features_with_tsfm":
-        cols = (
-            columns_map["cycle_stats_only"]
-            + columns_map["qv_map_pooled_stats"]
-            + columns_map["partial_charge_only"]
-            + columns_map["relaxation_only"]
-            + columns_map["physics_12d_only"]
-            + columns_map["operation_only"]
-            + [col for col in table.columns if col.startswith("tsfm_")]
-        )
+    elif group == "all_numerical_features":
+        cols = columns_map["cycle_stats_only"] + columns_map["qv_map_pooled_stats"] + columns_map["partial_charge_only"] + columns_map["physics_12d_only"] + columns_map["operation_only"]
     else:
         cols = columns_map[group]
     cols = [col for col in cols if col in table.columns]
@@ -419,15 +396,12 @@ def validate_preprocessing_features(cfg: Dict[str, object]) -> Dict[str, object]
         "qv_curve_stats_only",
         "qv_map_pooled_stats",
         "partial_charge_only",
-        "relaxation_only",
         "physics_12d_only",
         "operation_only",
         "soh_plus_operation",
         "soh_plus_qv_physics",
-        "all_physics_no_tsfm",
+        "all_numerical_features",
     ]
-    if arrays["tsfm_embedding"] is not None:
-        feature_groups.append("all_features_with_tsfm")
     ablation_rows = []
     importance_rows = []
     best_permutation_context = None

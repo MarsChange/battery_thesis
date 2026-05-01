@@ -44,15 +44,13 @@ class CaseSample:
     qv_masks: np.ndarray
     partial_charge_curves: np.ndarray
     partial_charge_masks: np.ndarray
-    relaxation_curves: np.ndarray
-    relaxation_masks: np.ndarray
     physics_features: np.ndarray
     physics_feature_masks: np.ndarray
     anchor_physics_features: np.ndarray
     operation_seq: np.ndarray
+    expert_seq: np.ndarray
     future_operation_seq: np.ndarray
     future_operation_mask: np.ndarray
-    tsfm_embedding: np.ndarray | None = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     feature_names: Dict[str, Any] = field(default_factory=dict)
     missing_mask: Dict[str, Any] = field(default_factory=dict)
@@ -89,13 +87,11 @@ class CaseSample:
             "target_horizon": int(np.asarray(self.target_delta_soh).shape[0]),
             "lookback_length": int(np.asarray(self.soh_seq).shape[0]),
             "qv_width": int(np.asarray(self.qv_maps).shape[-1]),
-            "relaxation_points": int(np.asarray(self.relaxation_curves).shape[-1]),
             "physics_dim": int(np.asarray(self.physics_features).shape[-1]),
             "operation_dim": int(np.asarray(self.operation_seq).shape[-1]),
+            "expert_seq_dim": int(np.asarray(self.expert_seq).shape[-1]),
             "future_operation_dim": int(np.asarray(self.future_operation_seq).shape[-1]),
-            "has_tsfm_embedding": bool(self.tsfm_embedding is not None),
             "partial_charge_availability": float(np.asarray(self.partial_charge_masks, dtype=np.float32).mean()) if np.asarray(self.partial_charge_masks).size else 0.0,
-            "relaxation_availability": float(np.asarray(self.relaxation_masks, dtype=np.float32).mean()) if np.asarray(self.relaxation_masks).size else 0.0,
             "qv_availability": float(np.asarray(self.qv_masks, dtype=np.float32).mean()) if np.asarray(self.qv_masks).size else 0.0,
             "physics_feature_availability": float(np.asarray(self.physics_feature_masks, dtype=np.float32).mean()) if np.asarray(self.physics_feature_masks).size else 0.0,
             "metadata_json": json.dumps(self.metadata, ensure_ascii=True, sort_keys=True),

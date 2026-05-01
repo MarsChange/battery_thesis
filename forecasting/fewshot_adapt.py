@@ -14,32 +14,17 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from forecasting.data import BatterySOHForecastDataset
-from forecasting.losses import compute_total_loss
+from forecasting.losses import expert_load_balance_loss, forecast_loss, monotonic_loss, smoothness_loss
 from forecasting.model import BatterySOHForecaster
 from forecasting.train import load_config, move_batch_to_device, resolve_device
 
 
 def _freeze_modules(model: BatterySOHForecaster, cfg: Dict[str, object]) -> None:
-    fewshot_cfg = cfg.get("fewshot", {})
-    if bool(fewshot_cfg.get("freeze_curve_encoders", True)):
-        for module in [model.qv_encoder, model.partial_charge_encoder, model.relaxation_encoder]:
-            for param in module.parameters():
-                param.requires_grad = False
-    if bool(fewshot_cfg.get("freeze_generalist_head", True)):
-        for param in model.generalist_head.parameters():
-            param.requires_grad = False
-    if not bool(fewshot_cfg.get("train_router", True)):
-        for param in model.physical_router.parameters():
-            param.requires_grad = False
-    if not bool(fewshot_cfg.get("train_fusion_router", True)):
-        for param in model.fusion_router.parameters():
-            param.requires_grad = False
-    if not bool(fewshot_cfg.get("train_experts", True)):
-        for param in model.expert_bank.parameters():
-            param.requires_grad = False
-    if not bool(fewshot_cfg.get("train_pairwise_branch", True)):
-        for param in model.pairwise_branch.parameters():
-            param.requires_grad = False
+    for param in model.parameters():
+        param.requires_grad = False
+    for module in [model.physical_router, model.expert_bank]:
+        for param in module.parameters():
+            param.requires_grad = True
 
 
 def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[str, object]:
@@ -79,11 +64,18 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
         for batch in loader:
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
-            loss_dict = compute_total_loss(outputs, batch, cfg.get("loss", {}))
+            target_delta = batch["query"]["target_delta_soh"]
+            pred_soh = batch["query"]["anchor_soh"].unsqueeze(-1) + outputs["pred_delta"]
+            loss = (
+                forecast_loss(outputs["pred_delta"], target_delta, criterion=str(cfg.get("loss", {}).get("criterion", "huber")))
+                + float(cfg.get("loss", {}).get("monotonic", 0.05)) * monotonic_loss(pred_soh, epsilon=float(cfg.get("loss", {}).get("monotonic_epsilon", 5e-4)))
+                + float(cfg.get("loss", {}).get("smoothness", 0.01)) * smoothness_loss(pred_soh)
+                + float(cfg.get("loss", {}).get("expert_balance", 0.01)) * expert_load_balance_loss(outputs["expert_weights"])
+            )
             optimizer.zero_grad()
-            loss_dict["loss"].backward()
+            loss.backward()
             optimizer.step()
-            epoch_losses.append(float(loss_dict["loss"].detach().cpu().item()))
+            epoch_losses.append(float(loss.detach().cpu().item()))
         mean_loss = float(sum(epoch_losses) / max(len(epoch_losses), 1))
         logs.append({"epoch": epoch, "support_loss": mean_loss})
         checkpoint_payload = {

@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from retrieval.multistage_retriever import COMPONENT_NAMES, MultiStageBatteryRetriever, RetrievalResult
+from retrieval.multistage_retriever import COMPONENT_NAMES, CORE_COMPONENTS, MultiStageBatteryRetriever, RetrievalResult
 
 
 def rag_only_prediction(result: RetrievalResult) -> np.ndarray:
@@ -71,13 +71,11 @@ def summarize_retrieval_result(query_row: pd.Series, result: RetrievalResult, re
         "topk_mean_d_physics": float(component_mean[2]),
         "topk_mean_d_operation": float(component_mean[3]),
         "topk_mean_d_metadata": float(component_mean[4]),
-        "topk_mean_d_tsfm": float(component_mean[5]),
         "topk_std_d_soh_state": float(component_std[0]),
         "topk_std_d_qv_shape": float(component_std[1]),
         "topk_std_d_physics": float(component_std[2]),
         "topk_std_d_operation": float(component_std[3]),
         "topk_std_d_metadata": float(component_std[4]),
-        "topk_std_d_tsfm": float(component_std[5]),
         "topk_mean_composite_distance": float(result.composite_distance[valid].mean()) if valid.size else np.nan,
         "topk_std_composite_distance": float(result.composite_distance[valid].std()) if valid.size else np.nan,
         "retrieval_confidence": float(result.retrieval_confidence),
@@ -95,11 +93,13 @@ def save_component_distance_bar(result: RetrievalResult, save_path: str | Path) 
     if valid.size == 0:
         axis.text(0.5, 0.5, "No valid neighbors", ha="center", va="center", transform=axis.transAxes)
     else:
+        active_component_names = list(CORE_COMPONENTS)
         width = 0.11
         x = np.arange(len(valid))
-        for comp_idx, comp_name in enumerate(COMPONENT_NAMES):
-            axis.bar(x + comp_idx * width, result.component_distances[valid, comp_idx], width=width, label=comp_name)
-        axis.set_xticks(x + width * (len(COMPONENT_NAMES) - 1) / 2)
+        for comp_plot_idx, comp_name in enumerate(active_component_names):
+            comp_idx = COMPONENT_NAMES.index(comp_name)
+            axis.bar(x + comp_plot_idx * width, result.component_distances[valid, comp_idx], width=width, label=comp_name)
+        axis.set_xticks(x + width * (len(active_component_names) - 1) / 2)
         axis.set_xticklabels([f"neighbor_{rank}" for rank in range(1, len(valid) + 1)])
     axis.set_title("Top-k retrieval component distances")
     axis.set_ylabel("Distance (lower is better)")
@@ -130,7 +130,6 @@ def save_metadata_table(query_row: pd.Series, result: RetrievalResult, retriever
             "d_physics": 0.0,
             "d_operation": 0.0,
             "d_metadata": 0.0,
-            "d_tsfm": 0.0,
             "composite_distance": 0.0,
         }
     ]
@@ -153,7 +152,6 @@ def save_metadata_table(query_row: pd.Series, result: RetrievalResult, retriever
                 "d_physics": float(result.d_physics[pos]),
                 "d_operation": float(result.d_operation[pos]),
                 "d_metadata": float(result.d_metadata[pos]),
-                "d_tsfm": float(result.d_tsfm[pos]),
                 "composite_distance": float(result.composite_distance[pos]),
             }
         )
@@ -252,44 +250,33 @@ def save_qv_overlay(
     plt.close(figure)
 
 
-def save_partial_relax_overlay(
+def save_partial_charge_overlay(
     query_idx: int,
     result: RetrievalResult,
     retriever: MultiStageBatteryRetriever,
     save_path: str | Path,
 ) -> None:
-    """保存 query 与 top-k reference 的 partial charge / relaxation 叠加图。"""
+    """保存 query 与 top-k reference 的 partial charge 叠加图。"""
 
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5), dpi=180)
+    figure, axis = plt.subplots(figsize=(6.5, 4.5), dpi=180)
     query_pc = retriever.arrays["partial_charge"][query_idx, -1]
-    query_relax = retriever.arrays["relaxation"][query_idx, -1]
     query_pc_mask = retriever.arrays["partial_charge_mask"][query_idx, -1]
-    query_relax_mask = retriever.arrays["relaxation_mask"][query_idx, -1]
     if query_pc_mask > 0:
-        axes[0].plot(query_pc, label="query", linewidth=2.0, color="black")
+        axis.plot(query_pc, label="query", linewidth=2.0, color="black")
     else:
-        axes[0].text(0.5, 0.5, "query partial charge unavailable", ha="center", va="center", transform=axes[0].transAxes)
-    if query_relax_mask > 0:
-        axes[1].plot(query_relax, label="query", linewidth=2.0, color="black")
-    else:
-        axes[1].text(0.5, 0.5, "query relaxation unavailable", ha="center", va="center", transform=axes[1].transAxes)
+        axis.text(0.5, 0.5, "query partial charge unavailable", ha="center", va="center", transform=axis.transAxes)
     valid = np.flatnonzero(result.retrieval_mask > 0)
     for _, pos in enumerate(valid.tolist(), start=1):
         ref_case_id = int(result.neighbor_case_ids[pos])
         ref_idx = retriever.case_id_to_index[ref_case_id]
         ref_pc_mask = retriever.arrays["partial_charge_mask"][ref_idx, -1]
-        ref_relax_mask = retriever.arrays["relaxation_mask"][ref_idx, -1]
         if ref_pc_mask > 0:
-            axes[0].plot(retriever.arrays["partial_charge"][ref_idx, -1], alpha=0.4, linewidth=1.0)
-        if ref_relax_mask > 0:
-            axes[1].plot(retriever.arrays["relaxation"][ref_idx, -1], alpha=0.4, linewidth=1.0)
-    axes[0].set_title("Partial charge overlay")
-    axes[1].set_title("Relaxation overlay")
-    for axis in axes:
-        axis.grid(True, alpha=0.25)
-        handles, labels = axis.get_legend_handles_labels()
-        if labels:
-            axis.legend(fontsize=8)
+            axis.plot(retriever.arrays["partial_charge"][ref_idx, -1], alpha=0.4, linewidth=1.0)
+    axis.set_title("Partial charge overlay")
+    axis.grid(True, alpha=0.25)
+    handles, labels = axis.get_legend_handles_labels()
+    if labels:
+        axis.legend(fontsize=8)
     figure.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
