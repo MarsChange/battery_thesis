@@ -62,8 +62,19 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "dropout": float(model_cfg.get("dropout", 0.1)),
         "meta_embedding_dim": int(model_cfg.get("meta_embedding_dim", 16)),
         "expert_names": list(model_cfg.get("expert_names", [])),
+        "chemistry_families": list(model_cfg.get("chemistry_families", ["LFP", "NCM", "NCA"])),
         "top_k_experts": int(model_cfg.get("top_k_experts", 2)),
     }
+
+
+def freeze_for_base_training(model: BatterySOHForecaster) -> None:
+    """Stage A trains only the general sequence, pairwise and base-fusion modules."""
+
+    for param in model.parameters():
+        param.requires_grad = True
+    for module in [model.semantic_router, model.expert_bank]:
+        for param in module.parameters():
+            param.requires_grad = False
 
 
 def run_epoch(
@@ -96,7 +107,7 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
             loss_accumulator.append({key: float(value.detach().cpu().item()) for key, value in loss_dict.items()})
-            all_pred.append(outputs["pred_delta"].detach().cpu().numpy())
+            all_pred.append(outputs["base_delta"].detach().cpu().numpy())
             all_target.append(batch["query"]["target_delta_soh"].detach().cpu().numpy())
             expert_weights.append(outputs["expert_weights"].detach().cpu().numpy())
             fusion_weights.append(outputs["fusion_weights"].detach().cpu().numpy())
@@ -142,12 +153,13 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
     train_dataset, val_dataset = build_datasets(cfg)
     model_init = infer_model_init_from_dataset(train_dataset, cfg)
     model = BatterySOHForecaster(**model_init)
+    freeze_for_base_training(model)
 
     train_cfg = cfg.get("train", {})
     device = resolve_device(str(train_cfg.get("device", "auto")))
     model.to(device)
     optimizer = AdamW(
-        model.parameters(),
+        [param for param in model.parameters() if param.requires_grad],
         lr=float(train_cfg.get("lr", 1e-3)),
         weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )

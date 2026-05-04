@@ -11,7 +11,25 @@ import torch
 import torch.nn.functional as F
 
 
-def forecast_loss(pred_delta: torch.Tensor, target_delta: torch.Tensor, criterion: str = "huber") -> torch.Tensor:
+def horizon_weights(horizon: int, device: torch.device, dtype: torch.dtype, end_weight: float = 1.2) -> torch.Tensor:
+    if horizon <= 1:
+        return torch.ones(horizon, device=device, dtype=dtype)
+    return torch.linspace(1.0, float(end_weight), horizon, device=device, dtype=dtype)
+
+
+def weighted_mse_forecast_loss(pred_delta: torch.Tensor, target_delta: torch.Tensor, end_weight: float = 1.2) -> torch.Tensor:
+    weights = horizon_weights(pred_delta.shape[-1], pred_delta.device, pred_delta.dtype, end_weight=end_weight)
+    return ((pred_delta - target_delta).pow(2) * weights.unsqueeze(0)).mean()
+
+
+def forecast_loss(
+    pred_delta: torch.Tensor,
+    target_delta: torch.Tensor,
+    criterion: str = "weighted_mse",
+    horizon_end_weight: float = 1.2,
+) -> torch.Tensor:
+    if criterion in {"weighted_mse", "mse_weighted"}:
+        return weighted_mse_forecast_loss(pred_delta, target_delta, end_weight=horizon_end_weight)
     if criterion == "mse":
         return F.mse_loss(pred_delta, target_delta)
     return F.huber_loss(pred_delta, target_delta)
@@ -52,6 +70,14 @@ def expert_load_balance_loss(expert_weights: torch.Tensor) -> torch.Tensor:
     return F.kl_div((mean_weight + 1e-8).log(), uniform, reduction="batchmean")
 
 
+def route_kl_loss(final_prior: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
+    """KL(stopgrad semantic prior || final expert weights)."""
+
+    prior = final_prior.detach().clamp_min(1e-8)
+    weights = expert_weights.clamp_min(1e-8)
+    return F.kl_div(weights.log(), prior, reduction="batchmean")
+
+
 def retrieval_consistency_loss(
     base_delta: torch.Tensor,
     rag_delta: torch.Tensor,
@@ -64,9 +90,10 @@ def retrieval_consistency_loss(
 def residual_supervision_loss(
     moe_residual: torch.Tensor,
     residual_target: torch.Tensor,
-    criterion: str = "huber",
+    criterion: str = "weighted_mse",
+    horizon_end_weight: float = 1.2,
 ) -> torch.Tensor:
-    return forecast_loss(moe_residual, residual_target, criterion=criterion)
+    return forecast_loss(moe_residual, residual_target, criterion=criterion, horizon_end_weight=horizon_end_weight)
 
 
 def compute_base_model_loss(
@@ -80,7 +107,12 @@ def compute_base_model_loss(
     if anchor_soh is None:
         anchor_soh = torch.zeros(base_delta.shape[0], device=base_delta.device, dtype=base_delta.dtype)
     base_soh = anchor_soh.unsqueeze(-1) + base_delta
-    forecast = forecast_loss(base_delta, target_delta, criterion=str(loss_cfg.get("criterion", "huber")))
+    forecast = forecast_loss(
+        base_delta,
+        target_delta,
+        criterion=str(loss_cfg.get("criterion", "weighted_mse")),
+        horizon_end_weight=float(loss_cfg.get("horizon_end_weight", 1.2)),
+    )
     pairwise = pairwise_aux_loss(
         outputs["pair_residual"],
         target_delta,
@@ -124,15 +156,23 @@ def compute_residual_expert_loss(
     residual_loss = residual_supervision_loss(
         outputs["moe_residual"],
         residual_target,
-        criterion=str(loss_cfg.get("criterion", "huber")),
+        criterion=str(loss_cfg.get("criterion", "weighted_mse")),
+        horizon_end_weight=float(loss_cfg.get("horizon_end_weight", 1.2)),
     )
-    final_forecast = forecast_loss(pred_delta, target_delta, criterion=str(loss_cfg.get("criterion", "huber")))
+    final_forecast = forecast_loss(
+        pred_delta,
+        target_delta,
+        criterion=str(loss_cfg.get("criterion", "weighted_mse")),
+        horizon_end_weight=float(loss_cfg.get("horizon_end_weight", 1.2)),
+    )
     mono = monotonic_loss(pred_soh, epsilon=float(loss_cfg.get("monotonic_epsilon", 5e-4)))
     smooth = smoothness_loss(pred_soh)
     expert_balance = expert_load_balance_loss(outputs["expert_weights"])
+    route_kl = route_kl_loss(outputs["final_router_prior"], outputs["expert_weights"])
     total = (
         float(loss_cfg.get("forecast", 1.0)) * final_forecast
         + float(loss_cfg.get("residual", 1.0)) * residual_loss
+        + float(loss_cfg.get("route_kl", loss_cfg.get("route", 0.01))) * route_kl
         + float(loss_cfg.get("monotonic", 0.05)) * mono
         + float(loss_cfg.get("smoothness", 0.01)) * smooth
         + float(loss_cfg.get("expert_balance", 0.01)) * expert_balance
@@ -144,6 +184,7 @@ def compute_residual_expert_loss(
         "monotonic_loss": mono,
         "smoothness_loss": smooth,
         "expert_load_balance_loss": expert_balance,
+        "route_kl_loss": route_kl,
     }
 
 

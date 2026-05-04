@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.metrics import horizon_metrics, regression_metrics
 from forecasting.model import BatterySOHForecaster
+from forecasting.routers import CHEMISTRY_FAMILIES, SEMANTIC_CONCEPT_NAMES
 from forecasting.train import load_config, move_batch_to_device, resolve_device
 from forecasting.visualization import plot_group_bar, plot_horizon_error, plot_weight_heatmap
 from retrieval.multistage_retriever import component_matrix_to_named_list
@@ -30,6 +31,55 @@ def _group_metrics(frame: pd.DataFrame, pred_cols: List[str], true_cols: List[st
         metrics = regression_metrics(pred, true)
         rows.append({group_col: group, **metrics})
     return pd.DataFrame(rows)
+
+
+def _to_cpu_tree(value):
+    """Move nested torch tensors to CPU once per batch.
+
+    MPS synchronizes on every scalar `.cpu().item()` call. Evaluation writes many
+    per-sample diagnostics, so moving the whole output tree once per batch keeps
+    MPS useful for forward passes and avoids thousands of tiny synchronization
+    points.
+    """
+
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _to_cpu_tree(subvalue) for key, subvalue in value.items()}
+    return value
+
+
+def _semantic_explanation(outputs: Dict[str, torch.Tensor], model: BatterySOHForecaster, idx: int) -> Dict[str, object]:
+    chemistry_id = int(outputs["chemistry_branch_id"][idx].detach().cpu().item())
+    chemistry_branch = model.chemistry_families[min(max(chemistry_id, 0), len(model.chemistry_families) - 1)]
+    weights = outputs["expert_weights"][idx].detach().cpu().numpy().astype(float)
+    concepts = outputs["semantic_concepts"][idx].detach().cpu().numpy().astype(float)
+    mode_weights = {name: float(weights[pos]) for pos, name in enumerate(model.expert_names)}
+    dominant_idx = int(weights.argmax())
+    dominant_mode = model.expert_names[dominant_idx]
+    concept_map = {name: float(concepts[pos]) for pos, name in enumerate(SEMANTIC_CONCEPT_NAMES)}
+    evidence = {}
+    if concept_map.get("concept_accelerating", 0.0) >= 0.55:
+        evidence["recent_soh_slope"] = "degradation trend supports accelerating mode"
+        evidence["recent_soh_curvature"] = "curvature signal supports accelerating mode"
+    if concept_map.get("concept_high_polarization", 0.0) >= 0.55:
+        evidence["r_q95"] = "resistance proxy is elevated"
+    if concept_map.get("concept_curve_polarization", 0.0) >= 0.55:
+        evidence["delta_v_q95"] = "strong local curve polarization appears"
+    if concept_map.get("concept_high_operation_stress", 0.0) >= 0.55:
+        evidence["operation_stress"] = "current, temperature or protocol variation is high"
+    if concept_map.get("concept_low_retrieval_reliability", 0.0) >= 0.55:
+        evidence["retrieval_confidence"] = "retrieved cases are less reliable"
+    else:
+        evidence["retrieval_confidence"] = "retrieved cases are reliable enough for semantic voting"
+    evidence["neighbor_vote"] = "top-k reference cases contribute a semantic mode prior"
+    return {
+        "chemistry_branch": chemistry_branch,
+        "mode_weights": mode_weights,
+        "dominant_mode": dominant_mode,
+        "semantic_concepts": concept_map,
+        "semantic_evidence": evidence,
+    }
 
 
 def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | None = None) -> Dict[str, object]:
@@ -62,14 +112,18 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
         for batch in loader:
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
+            outputs = _to_cpu_tree(outputs)
+            query_batch = _to_cpu_tree(batch["query"])
+            retrieval_batch = _to_cpu_tree(batch["retrieval"])
             batch_size = outputs["pred_delta"].shape[0]
             for idx in range(batch_size):
-                case_id = int(batch["query"]["case_id"][idx])
-                row = dataset.case_rows.iloc[dataset.case_rows.index[dataset.case_rows["case_id"] == case_id][0]]
-                pred_delta = outputs["pred_delta"][idx].detach().cpu().numpy()
-                pred_soh = outputs["pred_soh"][idx].detach().cpu().numpy()
-                true_delta = batch["query"]["target_delta_soh"][idx].detach().cpu().numpy()
-                true_soh = batch["query"]["target_soh"][idx].detach().cpu().numpy()
+                case_id = int(query_batch["case_id"][idx])
+                row = dataset.case_rows.iloc[dataset.case_id_to_row_index[case_id]]
+                pred_delta = outputs["pred_delta"][idx].numpy()
+                pred_soh = outputs["pred_soh"][idx].numpy()
+                true_delta = query_batch["target_delta_soh"][idx].numpy()
+                true_soh = query_batch["target_soh"][idx].numpy()
+                explanation = _semantic_explanation(outputs, model, idx)
                 record = {
                     "case_id": case_id,
                     "cell_uid": row["cell_uid"],
@@ -79,44 +133,48 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
                     "window_start": int(row["window_start"]),
                     "window_end": int(row["window_end"]),
                     "anchor_soh": float(row["anchor_soh"]),
-                    "expert_weights_json": json.dumps(outputs["expert_weights"][idx].detach().cpu().numpy().astype(float).tolist()),
-                    "fusion_weights_json": json.dumps(outputs["fusion_weights"][idx].detach().cpu().numpy().astype(float).tolist()),
-                    "expert_router_contributions_json": json.dumps({k: v[idx].detach().cpu().numpy().astype(float).tolist() for k, v in outputs["expert_router_contributions"].items()}),
-                    "fusion_router_contributions_json": json.dumps({k: v[idx].detach().cpu().numpy().astype(float).tolist() for k, v in outputs["fusion_router_contributions"].items()}),
-                    "topk_neighbor_case_ids_json": json.dumps(batch["retrieval"]["neighbor_case_ids"][idx].detach().cpu().numpy().astype(int).tolist()),
+                    "chemistry_branch": explanation["chemistry_branch"],
+                    "expert_weights_json": json.dumps(outputs["expert_weights"][idx].numpy().astype(float).tolist()),
+                    "dominant_expert": explanation["dominant_mode"],
+                    "fusion_weights_json": json.dumps(outputs["fusion_weights"][idx].numpy().astype(float).tolist()),
+                    "expert_router_contributions_json": json.dumps({k: v[idx].numpy().astype(float).tolist() for k, v in outputs["expert_router_contributions"].items()}),
+                    "router_contributions_json": json.dumps({k: v[idx].numpy().astype(float).tolist() for k, v in outputs["expert_router_contributions"].items()}),
+                    "semantic_explanation_json": json.dumps(explanation, ensure_ascii=True),
+                    "fusion_router_contributions_json": json.dumps({k: v[idx].numpy().astype(float).tolist() for k, v in outputs["fusion_router_contributions"].items()}),
+                    "topk_neighbor_case_ids_json": json.dumps(retrieval_batch["neighbor_case_ids"][idx].numpy().astype(int).tolist()),
                     "topk_component_distances_json": json.dumps(
-                        component_matrix_to_named_list(batch["retrieval"]["component_distances"][idx].detach().cpu().numpy().astype(float))
+                        component_matrix_to_named_list(retrieval_batch["component_distances"][idx].numpy().astype(float))
                     ),
-                    "topk_composite_distance_json": json.dumps(batch["retrieval"]["composite_distance"][idx].detach().cpu().numpy().astype(float).tolist()),
-                    "retrieval_confidence": float(outputs["retrieval_confidence"][idx].detach().cpu().item()),
+                    "topk_composite_distance_json": json.dumps(retrieval_batch["composite_distance"][idx].numpy().astype(float).tolist()),
+                    "retrieval_confidence": float(outputs["retrieval_confidence"][idx].item()),
                 }
                 for h in range(len(pred_delta)):
                     record[f"true_soh_h{h+1}"] = float(true_soh[h])
                     record[f"pred_soh_h{h+1}"] = float(pred_soh[h])
                     record[f"true_delta_h{h+1}"] = float(true_delta[h])
                     record[f"pred_delta_h{h+1}"] = float(pred_delta[h])
-                    record[f"fm_delta_h{h+1}"] = float(outputs["fm_delta"][idx, h].detach().cpu().item())
-                    record[f"rag_delta_h{h+1}"] = float(outputs["rag_delta"][idx, h].detach().cpu().item())
-                    record[f"pair_delta_h{h+1}"] = float(outputs["pair_delta"][idx, h].detach().cpu().item())
-                    record[f"base_delta_h{h+1}"] = float(outputs["base_delta"][idx, h].detach().cpu().item())
-                    record[f"residual_h{h+1}"] = float(outputs["moe_residual"][idx, h].detach().cpu().item())
+                    record[f"fm_delta_h{h+1}"] = float(outputs["fm_delta"][idx, h].item())
+                    record[f"rag_delta_h{h+1}"] = float(outputs["rag_delta"][idx, h].item())
+                    record[f"pair_delta_h{h+1}"] = float(outputs["pair_delta"][idx, h].item())
+                    record[f"base_delta_h{h+1}"] = float(outputs["base_delta"][idx, h].item())
+                    record[f"residual_h{h+1}"] = float(outputs["moe_residual"][idx, h].item())
                 prediction_rows.append(record)
 
-                expert_rows.append({"case_id": case_id, **{f"expert_{i+1}": float(v) for i, v in enumerate(outputs["expert_weights"][idx].detach().cpu().numpy())}})
-                fusion_rows.append({"case_id": case_id, **{f"branch_{i+1}": float(v) for i, v in enumerate(outputs["fusion_weights"][idx].detach().cpu().numpy())}})
+                expert_rows.append({"case_id": case_id, **{model.expert_names[i]: float(v) for i, v in enumerate(outputs["expert_weights"][idx].numpy())}})
+                fusion_rows.append({"case_id": case_id, **{f"branch_{i+1}": float(v) for i, v in enumerate(outputs["fusion_weights"][idx].numpy())}})
                 for group_name, value in outputs["expert_router_contributions"].items():
-                    router_rows.append({"case_id": case_id, "router": "expert", "group": group_name, "values_json": json.dumps(value[idx].detach().cpu().numpy().astype(float).tolist())})
+                    router_rows.append({"case_id": case_id, "router": "expert", "group": group_name, "values_json": json.dumps(value[idx].numpy().astype(float).tolist())})
                 for group_name, value in outputs["fusion_router_contributions"].items():
-                    router_rows.append({"case_id": case_id, "router": "fusion", "group": group_name, "values_json": json.dumps(value[idx].detach().cpu().numpy().astype(float).tolist())})
+                    router_rows.append({"case_id": case_id, "router": "fusion", "group": group_name, "values_json": json.dumps(value[idx].numpy().astype(float).tolist())})
                 retrieval_rows.append(
                     {
                         "case_id": case_id,
-                        "neighbor_case_ids_json": json.dumps(batch["retrieval"]["neighbor_case_ids"][idx].detach().cpu().numpy().astype(int).tolist()),
+                        "neighbor_case_ids_json": json.dumps(retrieval_batch["neighbor_case_ids"][idx].numpy().astype(int).tolist()),
                         "component_distances_json": json.dumps(
-                            component_matrix_to_named_list(batch["retrieval"]["component_distances"][idx].detach().cpu().numpy().astype(float))
+                            component_matrix_to_named_list(retrieval_batch["component_distances"][idx].numpy().astype(float))
                         ),
-                        "composite_distance_json": json.dumps(batch["retrieval"]["composite_distance"][idx].detach().cpu().numpy().astype(float).tolist()),
-                        "retrieval_confidence": float(outputs["retrieval_confidence"][idx].detach().cpu().item()),
+                        "composite_distance_json": json.dumps(retrieval_batch["composite_distance"][idx].numpy().astype(float).tolist()),
+                        "retrieval_confidence": float(outputs["retrieval_confidence"][idx].item()),
                     }
                 )
 

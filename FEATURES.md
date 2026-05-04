@@ -192,24 +192,50 @@ RAG reference database 默认只允许 `source_train`，`target_query` 不得进
 
 ## Router 输入特征
 
-`PhysicalDegradationRouter` 是 grouped additive router。它不使用黑箱 TSFM embedding，而是按语义分组输入，每组对每个专家 logit 有可导出的 contribution。
+当前主线使用 `SemanticHierarchicalRouter`，它不是 chemistry classifier。第一层直接读取 metadata 中已知的 `chemistry_family`，hard route 到 `LFP`、`NCM` 或 `NCA` branch；第二层只在选中的 chemistry branch 内，对 4 个 residual expert modes 做 soft routing。
+
+第二层 Router 严格区分：
+
+| layer | 中文含义 | 说明 |
+| --- | --- | --- |
+| raw feature groups | 原始命名特征组 | 状态、Q-V 极化、partial charge、工况、检索可靠性和邻居投票。 |
+| semantic concepts | 语义概念分数 | 用平滑函数从 raw features 构造，范围约为 `[0,1]`。 |
+| semantic prior | 专家语义先验 | 由 concept vector 映射到 4 个 mode experts。 |
+| final expert weights | 最终专家权重 | semantic prior、RAG semantic vote 和小校准器共同得到。 |
+
+### Router raw feature groups
 
 | router group | 中文含义 | 具体输入 | 作用 |
 | --- | --- | --- | --- |
-| `soh_state` | SOH 状态组 | `anchor_soh`, `recent_soh_slope`, `recent_soh_curvature` | 判断当前窗口处于什么健康状态、退化速度是否快、是否存在加速退化。 |
-| `qv_polarization` | Q-V 极化组 | `anchor_physics_features` 的前 8 维：`delta_v_*`, `r_*`, `vc/vd_curve_slope_mean` | 让 router 根据极化、内阻 proxy 和平台斜率选择曲线/极化相关专家。 |
-| `operation` | 工况组 | operation summary，当前包括 `current_abs_mean/temp_mean/cc_time/cv_time/throughput/energy` 相关统计和 `protocol_change_rate` proxy | 表示运行压力和协议变化强度。 |
-| `chemistry` | 化学体系组 | `chemistry_family` 的 metadata embedding | 区分 LFP/NCM/NCA 等材料体系专家。 |
-| `retrieval` | 检索可靠性组 | `retrieval_confidence`, top-k `composite_distance` 均值和标准差、top-1 权重、reference compatibility 均值 | 检索越可靠时，router 可以更相信 reference-conditioned 信息。 |
-| `neighbor_vote` | 邻居物理模式投票组 | top-k neighbor 的 chemistry/stage/模式统计 | 把历史参考案例的模式分布传给 router。 |
+| `soh_state` | SOH 状态组 | `anchor_soh`, `recent_soh_slope`, `recent_soh_curvature` | 判断当前窗口健康状态、近期退化速度和加速趋势。 |
+| `qv_polarization` | Q-V 极化组 | `delta_v_mean`, `delta_v_std`, `delta_v_q95`, `r_mean`, `r_std`, `r_q95`, `vc_curve_slope_mean`, `vd_curve_slope_mean` | 判断极化强度、内阻 proxy、平台偏移和曲线形态。 |
+| `partial_charge_shape` | partial charge 形态组 | `q_total`, `q_mean`, `q_std`, `dq_dv_peak_value` | 判断充电曲线容量接受能力、曲线波动和局部峰值。 |
+| `operation_stress` | 工况压力组 | `current_abs_mean`, `temp_mean`, `cc_time`, `cv_time`, throughput/energy 变化和 `protocol_change_rate` summary | 表示电流、温度、充电策略和协议切换压力。 |
+| `retrieval` | 检索可靠性组 | `retrieval_confidence`, top-k `composite_distance` 均值/标准差、top-1 distance、feature availability、chemistry match ratio | 检索越可靠时，Router 可以更信任 reference-conditioned 信息和 neighbor vote。 |
+| `neighbor_vote` | 邻居语义模式投票组 | top-k reference 的 semantic mode prior 按 retrieval alpha 加权 | 把历史相似案例支持的退化模式传给当前样本。 |
+
+### Semantic concepts
+
+| concept | 中文含义 | 主要证据 | 倾向专家 |
+| --- | --- | --- | --- |
+| `concept_slow_linear` | 慢速近线性退化 | slope/curvature 小，operation stress 低，曲线极化不强 | `slow_linear` |
+| `concept_accelerating` | 加速退化 | 负斜率增大、曲率增大、工况波动增强 | `accelerating` |
+| `concept_high_polarization` | 高极化/高阻抗 proxy | `r_mean`, `r_q95`, 电流或温度压力偏高 | `high_polarization` |
+| `concept_curve_polarization` | Q-V 曲线极化异常 | `delta_v_std`, `delta_v_q95`, 曲线斜率或 `dq_dv_peak_value` 偏高 | `curve_polarization_expert` |
+| `concept_high_operation_stress` | 高工况压力 | 电流、温度、吞吐量、能量变化或协议切换偏高 | 辅助 `accelerating` / `high_polarization` |
+| `concept_low_retrieval_reliability` | 检索低可信 | `retrieval_confidence` 低或 top-k 距离偏大 | 降低 neighbor vote 影响 |
 
 Router 输出：
 
 | output | shape | 含义 |
 | --- | --- | --- |
-| `expert_logits` | `[batch, num_experts]` | 每个专家的未归一化选择分数。 |
-| `expert_weights` | `[batch, num_experts]` | Top-k softmax 后的专家权重。 |
-| `expert_router_contributions` | `dict[group, [batch, num_experts]]` | 每个语义组对专家 logits 的贡献，供解释使用。 |
+| `expert_logits` | `[batch, 4]` | 选中 chemistry branch 内 4 个 mode experts 的未归一化选择分数。 |
+| `expert_weights` | `[batch, 4]` | 4 个 mode experts 的 softmax 权重。 |
+| `semantic_concepts` | `[batch, 6]` | 六个语义概念分数。 |
+| `semantic_prior` | `[batch, 4]` | query 自身语义先验。 |
+| `rag_semantic_prior` | `[batch, 4]` | top-k reference 语义先验加权投票。 |
+| `expert_router_contributions` | `dict[group, [batch, 4]]` | 每个输入分组和 semantic prior/calibrator 对 mode logits 的贡献。 |
+| `semantic_explanation_json` | JSON string | chemistry branch、dominant mode、mode 权重和自然语言式语义证据。 |
 
 ## LSTM 小专家输入特征
 

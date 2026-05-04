@@ -359,6 +359,98 @@ def _hashable_missing_summary(case: CaseSample) -> Dict[str, float]:
     }
 
 
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values.astype(np.float32), -20.0, 20.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
+def _robust_z(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    center = float(np.median(finite))
+    q25, q75 = np.quantile(finite, [0.25, 0.75])
+    scale = float(q75 - q25)
+    if scale < 1e-6:
+        scale = float(np.std(finite)) if float(np.std(finite)) > 1e-6 else 1.0
+    return np.nan_to_num((arr - center) / scale, nan=0.0).astype(np.float32)
+
+
+def _attach_semantic_labels(rows_df: pd.DataFrame, arrays: Dict[str, np.ndarray]) -> pd.DataFrame:
+    """Attach deterministic semantic labels and text explanations to case rows.
+
+    These labels are not produced by a language model. They are rule-based
+    annotations derived from named numeric features and are used for inspection,
+    router diagnostics, and neighbor semantic vote summaries.
+    """
+
+    rows = rows_df.copy()
+    anchor_physics = np.asarray(arrays["case_anchor_physics_features.npy"], dtype=np.float32)
+    operation_seq = np.asarray(arrays["case_operation_seq.npy"], dtype=np.float32)
+    slope_z = _robust_z(-pd.to_numeric(rows["recent_soh_slope"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32))
+    curvature_z = _robust_z(-pd.to_numeric(rows["recent_soh_curvature"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32))
+    delta_v_std_z = _robust_z(anchor_physics[:, 1] if anchor_physics.shape[1] > 1 else np.zeros(len(rows), dtype=np.float32))
+    delta_v_q95_z = _robust_z(anchor_physics[:, 2] if anchor_physics.shape[1] > 2 else np.zeros(len(rows), dtype=np.float32))
+    r_mean_z = _robust_z(anchor_physics[:, 3] if anchor_physics.shape[1] > 3 else np.zeros(len(rows), dtype=np.float32))
+    r_q95_z = _robust_z(anchor_physics[:, 5] if anchor_physics.shape[1] > 5 else np.zeros(len(rows), dtype=np.float32))
+    dq_dv_peak_z = _robust_z(anchor_physics[:, 11] if anchor_physics.shape[1] > 11 else np.zeros(len(rows), dtype=np.float32))
+    operation_abs = np.nan_to_num(np.abs(operation_seq).mean(axis=(1, 2)), nan=0.0)
+    operation_z = _robust_z(operation_abs)
+
+    concept_slow_linear = np.exp(-np.abs(slope_z)) * np.exp(-np.abs(curvature_z)) * np.exp(-np.maximum(operation_z, 0.0))
+    concept_accelerating = _sigmoid(0.9 * slope_z + 1.0 * curvature_z + 0.35 * operation_z)
+    concept_high_polarization = _sigmoid(0.9 * r_mean_z + 1.1 * r_q95_z + 0.25 * operation_z)
+    concept_curve_polarization = _sigmoid(0.8 * delta_v_std_z + 1.0 * delta_v_q95_z + 0.7 * dq_dv_peak_z)
+    concept_high_operation_stress = _sigmoid(operation_z)
+
+    mode_scores = np.stack(
+        [
+            concept_slow_linear,
+            concept_accelerating + 0.15 * concept_high_operation_stress,
+            concept_high_polarization + 0.10 * concept_high_operation_stress,
+            concept_curve_polarization,
+        ],
+        axis=-1,
+    )
+    mode_names = np.asarray(["slow_linear", "accelerating", "high_polarization", "curve_polarization_expert"], dtype=object)
+    mode_indices = np.argmax(mode_scores, axis=-1)
+
+    concept_rows = []
+    text_rows = []
+    for idx, mode_idx in enumerate(mode_indices.tolist()):
+        concepts = {
+            "concept_slow_linear": float(concept_slow_linear[idx]),
+            "concept_accelerating": float(concept_accelerating[idx]),
+            "concept_high_polarization": float(concept_high_polarization[idx]),
+            "concept_curve_polarization": float(concept_curve_polarization[idx]),
+            "concept_high_operation_stress": float(concept_high_operation_stress[idx]),
+        }
+        scores = {str(mode_names[pos]): float(mode_scores[idx, pos]) for pos in range(len(mode_names))}
+        concept_rows.append(json.dumps({"concepts": concepts, "mode_scores": scores}, ensure_ascii=True))
+        dominant = str(mode_names[mode_idx])
+        chemistry = str(rows.iloc[idx].get("chemistry_family", "unknown"))
+        evidence = []
+        if concept_accelerating[idx] >= 0.55:
+            evidence.append("recent SOH trend suggests accelerating degradation")
+        if concept_high_polarization[idx] >= 0.55:
+            evidence.append("R(Q) proxy is elevated")
+        if concept_curve_polarization[idx] >= 0.55:
+            evidence.append("DeltaV(Q)/dQ-dV shape indicates curve polarization")
+        if concept_high_operation_stress[idx] >= 0.55:
+            evidence.append("operation stress proxy is high")
+        if not evidence:
+            evidence.append("SOH slope and curvature are relatively smooth")
+        text_rows.append(f"chemistry={chemistry}; semantic_mode={dominant}; evidence=" + "; ".join(evidence))
+
+    rows["chemistry_branch_label"] = rows["chemistry_family"].astype(str)
+    rows["semantic_mode_label"] = mode_names[mode_indices]
+    rows["semantic_concept_scores_json"] = concept_rows
+    rows["semantic_text_description"] = text_rows
+    rows["semantic_label_source"] = "deterministic_numeric_rules_v1"
+    return rows
+
+
 def _bar_plot(data: Dict[str, float], title: str, xlabel: str, ylabel: str, save_path: Path) -> None:
     figure, axis = plt.subplots(figsize=(8, 4.5), dpi=180)
     labels = list(data.keys())
@@ -532,6 +624,8 @@ def build_case_bank_from_cells(
 
     for cell in cells:
         cell_uid = str(cell.cycles["cell_uid"].iloc[0])
+        if cell_uid not in manifest_map:
+            continue
         cell_cycles = cell.cycles.sort_values("cycle_idx").reset_index(drop=True)
         split_row = manifest_map[cell_uid]
         split = str(split_row["split"])
@@ -726,13 +820,15 @@ def build_case_bank_from_cells(
             )
             row = case.to_row_dict()
             row.update(_hashable_missing_summary(case))
+            if "condition_label" in split_row:
+                row["condition_label"] = str(split_row["condition_label"])
+            if "split_stratum" in split_row:
+                row["split_stratum"] = str(split_row["split_stratum"])
             cases.append(case)
             case_rows.append(row)
 
     if not cases:
         raise ValueError("No case samples were built; check dataset size and config.")
-
-    rows_df = pd.DataFrame(case_rows).sort_values("case_id").reset_index(drop=True)
 
     arrays = {
         "case_cycle_stats.npy": np.stack([case.cycle_stats for case in cases]).astype(np.float32),
@@ -751,6 +847,9 @@ def build_case_bank_from_cells(
         "case_future_delta_soh.npy": np.stack([case.target_delta_soh for case in cases]).astype(np.float32),
         "case_future_soh.npy": np.stack([case.target_soh for case in cases]).astype(np.float32),
     }
+
+    rows_df = pd.DataFrame(case_rows).sort_values("case_id").reset_index(drop=True)
+    rows_df = _attach_semantic_labels(rows_df, arrays)
 
     _save_case_rows(rows_df, output_dir)
     for name, values in arrays.items():

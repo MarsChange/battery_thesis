@@ -10,21 +10,20 @@ from __future__ import annotations
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from forecasting.routers import BranchFusionRouter, PhysicalDegradationRouter
+from forecasting.routers import (
+    CHEMISTRY_FAMILIES,
+    SEMANTIC_EXPERT_MODES,
+    BranchFusionRouter,
+    SemanticHierarchicalRouter,
+)
 from retrieval.multistage_retriever import COMPONENT_NAMES
 
 
-DEFAULT_EXPERT_NAMES = [
-    "LFP",
-    "NCM",
-    "NCA",
-    "slow_linear",
-    "accelerating",
-    "high_polarization",
-    "curve_polarization_expert",
-]
+DEFAULT_CHEMISTRY_FAMILIES = list(CHEMISTRY_FAMILIES)
+DEFAULT_EXPERT_NAMES = list(SEMANTIC_EXPERT_MODES)
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
@@ -34,6 +33,27 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Te
     summed = (values * weight).sum(dim=dim)
     denom = weight.sum(dim=dim).clamp_min(1e-6)
     return summed / denom
+
+
+def _fixed_bin_mean_1d(values: torch.Tensor, bins: int) -> torch.Tensor:
+    """MPS-safe 1-D mean pooling into a fixed number of bins."""
+
+    length = int(values.shape[-1])
+    pooled = []
+    for bin_idx in range(int(bins)):
+        start = int(round(bin_idx * length / bins))
+        end = int(round((bin_idx + 1) * length / bins))
+        if end <= start:
+            end = min(length, start + 1)
+        pooled.append(values[..., start:end].mean(dim=-1))
+    return torch.stack(pooled, dim=-1)
+
+
+def _fixed_bin_mean_2d(values: torch.Tensor, width_bins: int) -> torch.Tensor:
+    """MPS-safe 2-D pooling over curve channels and fixed width bins."""
+
+    values = values.mean(dim=-2)
+    return _fixed_bin_mean_1d(values, width_bins)
 
 
 class CycleStatsEncoder(nn.Module):
@@ -60,13 +80,13 @@ class QVMapEncoder(nn.Module):
             nn.ReLU(),
             nn.Conv2d(8, 16, kernel_size=(3, 5), padding=(1, 2)),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 4)),
         )
         self.proj = nn.Linear(16 * 4, hidden_dim)
 
     def forward(self, qv_maps: torch.Tensor, qv_masks: torch.Tensor) -> torch.Tensor:
         batch, steps, channels, width = qv_maps.shape
-        feat = self.net(qv_maps.reshape(batch * steps, 1, channels, width)).reshape(batch, steps, -1)
+        conv = self.net(qv_maps.reshape(batch * steps, 1, channels, width))
+        feat = _fixed_bin_mean_2d(conv, 4).reshape(batch, steps, -1)
         feat = self.proj(feat)
         cycle_mask = (qv_masks.sum(dim=-1) > 0).to(qv_maps.dtype)
         return _masked_mean(feat, cycle_mask, dim=1)
@@ -82,13 +102,13 @@ class SequenceCurveEncoder(nn.Module):
             nn.ReLU(),
             nn.Conv1d(8, 16, kernel_size=5, padding=2),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(4),
         )
         self.proj = nn.Linear(16 * 4, hidden_dim)
 
     def forward(self, values: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
         batch, steps, length = values.shape
-        feat = self.net(values.reshape(batch * steps, 1, length)).reshape(batch, steps, -1)
+        conv = self.net(values.reshape(batch * steps, 1, length))
+        feat = _fixed_bin_mean_1d(conv, 4).reshape(batch, steps, -1)
         feat = self.proj(feat)
         return _masked_mean(feat, masks, dim=1)
 
@@ -180,6 +200,7 @@ class BatterySOHForecaster(nn.Module):
         dropout: float = 0.1,
         meta_embedding_dim: int = 16,
         expert_names: List[str] | None = None,
+        chemistry_families: List[str] | None = None,
         top_k_experts: int = 2,
     ):
         super().__init__()
@@ -191,7 +212,12 @@ class BatterySOHForecaster(nn.Module):
         self.future_operation_dim = int(future_operation_dim)
         self.meta_dim = int(meta_dim)
         self.expert_seq_dim = int(expert_seq_dim)
-        self.expert_names = list(expert_names or DEFAULT_EXPERT_NAMES)
+        requested_experts = list(expert_names or DEFAULT_EXPERT_NAMES)
+        self.expert_names = [name for name in requested_experts if name in SEMANTIC_EXPERT_MODES]
+        if not self.expert_names:
+            self.expert_names = list(DEFAULT_EXPERT_NAMES)
+        self.chemistry_families = list(chemistry_families or DEFAULT_CHEMISTRY_FAMILIES)
+        self.chemistry_families = [name for name in self.chemistry_families if name in CHEMISTRY_FAMILIES] or list(DEFAULT_CHEMISTRY_FAMILIES)
         self.pairwise_uses_raw_external_embedding = False
         self.experts_use_raw_external_embedding = False
 
@@ -208,32 +234,41 @@ class BatterySOHForecaster(nn.Module):
 
         self.generalist_head = MLPHead(hidden_dim * 4 + meta_embedding_dim + state_dim + physics_dim, self.horizon, hidden_dim, dropout)
         self.pairwise_branch = MLPHead(pair_input_dim, self.horizon, hidden_dim, dropout)
-        self.expert_bank = nn.ModuleList(
-            [
-                ResidualLSTMExpert(
-                    expert_seq_dim=self.expert_seq_dim,
-                    expert_context_dim=expert_context_dim,
-                    horizon=self.horizon,
-                    future_operation_dim=self.future_operation_dim,
-                    hidden_dim=hidden_dim,
-                    dropout=dropout,
+        self.expert_bank = nn.ModuleDict(
+            {
+                chemistry: nn.ModuleDict(
+                    {
+                        mode_name: ResidualLSTMExpert(
+                            expert_seq_dim=self.expert_seq_dim,
+                            expert_context_dim=expert_context_dim,
+                            horizon=self.horizon,
+                            future_operation_dim=self.future_operation_dim,
+                            hidden_dim=hidden_dim,
+                            dropout=dropout,
+                        )
+                        for mode_name in self.expert_names
+                    }
                 )
-                for _ in self.expert_names
-            ]
+                for chemistry in self.chemistry_families
+            }
         )
 
-        self.physical_router = PhysicalDegradationRouter(
+        self.semantic_router = SemanticHierarchicalRouter(
             group_dims={
                 "soh_state": 3,
                 "qv_polarization": min(8, physics_dim),
-                "operation": operation_dim * 2 + future_operation_dim,
-                "chemistry": meta_embedding_dim,
-                "retrieval": 5,
+                "partial_charge_shape": max(physics_dim - 8, 0),
+                "operation_stress": operation_dim * 2 + future_operation_dim,
+                "retrieval": 6,
                 "neighbor_vote": len(self.expert_names),
             },
-            num_experts=len(self.expert_names),
-            top_k_experts=top_k_experts,
+            mode_names=self.expert_names,
+            gamma=0.2,
+            rag_eta=0.5,
         )
+        # Compatibility alias for older training utilities/tests. This is the
+        # semantic router, not the old opaque hidden-state router.
+        self.physical_router = self.semantic_router
         self.base_fusion_router = BranchFusionRouter(
             group_dims={
                 "retrieval": 4,
@@ -272,6 +307,12 @@ class BatterySOHForecaster(nn.Module):
             if vote.shape[-1] == len(self.expert_names):
                 return vote
         return torch.zeros(batch_size, len(self.expert_names), device=device)
+
+    def _chemistry_ids(self, query: Dict[str, torch.Tensor], batch_size: int, device: torch.device) -> torch.Tensor:
+        if "chemistry_id" in query:
+            ids = query["chemistry_id"].to(device).long().reshape(-1)
+            return ids.clamp(0, len(self.chemistry_families) - 1)
+        return torch.zeros(batch_size, device=device, dtype=torch.long)
 
     def _fallback_expert_seq(self, query: Dict[str, torch.Tensor]) -> torch.Tensor:
         seq = torch.cat(
@@ -355,6 +396,13 @@ class BatterySOHForecaster(nn.Module):
         composite_var = ((masked_composite - composite_mean.unsqueeze(-1)) ** 2 * retrieval_mask).sum(dim=1) / valid_counts
         composite_std = torch.sqrt(composite_var.clamp_min(0.0))
         compatibility_mean = (compatibility * retrieval_mask).sum(dim=1) / valid_counts
+        top1_distance = composite_distance[:, 0].masked_fill(retrieval_mask[:, 0] <= 0, 0.0)
+        chemistry_ids = self._chemistry_ids(query, anchor_soh.shape[0], device)
+        if "ref_chemistry_id" in retrieval:
+            ref_chemistry_id = retrieval["ref_chemistry_id"].to(device).long()
+            chemistry_match_ratio = ((ref_chemistry_id == chemistry_ids[:, None]).to(torch.float32) * retrieval_alpha * retrieval_mask).sum(dim=1) / valid_counts
+        else:
+            chemistry_match_ratio = torch.zeros_like(composite_mean)
 
         fm_input = torch.cat(
             [
@@ -436,25 +484,55 @@ class BatterySOHForecaster(nn.Module):
         base_stack = torch.stack([fm_delta, rag_delta, pair_delta], dim=1)
         base_delta = torch.sum(base_stack * fusion_out["weights"].unsqueeze(-1), dim=1)
 
+        retrieval_features = torch.stack(
+            [
+                retrieval["retrieval_confidence"].to(torch.float32),
+                composite_mean,
+                composite_std,
+                top1_distance,
+                availability.mean(dim=-1),
+                chemistry_match_ratio,
+            ],
+            dim=-1,
+        )
+
+        ref_state = self._state_features(
+            retrieval["ref_anchor_soh"].reshape(batch_size * top_k).to(torch.float32),
+            retrieval["ref_soh_seq"].reshape(batch_size * top_k, *retrieval["ref_soh_seq"].shape[2:]).to(torch.float32),
+        )
+        ref_anchor_physics = retrieval["ref_anchor_physics_features"].reshape(batch_size * top_k, -1).to(torch.float32)
+        ref_operation_seq = retrieval["ref_operation_seq"].reshape(batch_size * top_k, *retrieval["ref_operation_seq"].shape[2:]).to(torch.float32)
+        zero_future_summary = torch.zeros(batch_size * top_k, self.future_operation_dim, device=device, dtype=torch.float32)
+        ref_operation_group = torch.cat([ref_operation_seq.mean(dim=1), ref_operation_seq.std(dim=1), zero_future_summary], dim=-1)
+        ref_retrieval_features = torch.zeros(batch_size * top_k, 6, device=device, dtype=torch.float32)
+        ref_retrieval_features[:, 0] = 1.0
+        ref_retrieval_features[:, 4] = 1.0
+        if "ref_chemistry_id" in retrieval:
+            ref_retrieval_features[:, 5] = (ref_chemistry_id.reshape(-1) == chemistry_ids[:, None].expand(-1, top_k).reshape(-1)).to(torch.float32)
+        ref_prior_payload = self.semantic_router.semantic_prior_from_groups(
+            {
+                "soh_state": ref_state,
+                "qv_polarization": ref_anchor_physics[..., : min(8, self.physics_dim)],
+                "partial_charge_shape": ref_anchor_physics[..., 8:],
+                "operation_stress": ref_operation_group,
+                "retrieval": ref_retrieval_features,
+            }
+        )
+        ref_semantic_prior = ref_prior_payload["semantic_prior"].view(batch_size, top_k, -1)
+        rag_semantic_prior = torch.sum(ref_semantic_prior * retrieval_alpha.unsqueeze(-1), dim=1)
         neighbor_vote = self._neighbor_vote(retrieval, batch_size, device)
+        neighbor_vote = neighbor_vote + rag_semantic_prior
+        neighbor_vote = neighbor_vote / neighbor_vote.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
         router_inputs = {
             "soh_state": state_features,
             "qv_polarization": query["anchor_physics_features"].to(torch.float32)[..., : min(8, self.physics_dim)],
-            "operation": operation_group,
-            "chemistry": query_encoded["meta_embedding"],
-            "retrieval": torch.stack(
-                [
-                    retrieval["retrieval_confidence"].to(torch.float32),
-                    composite_mean,
-                    composite_std,
-                    retrieval_alpha.max(dim=1).values,
-                    compatibility_mean,
-                ],
-                dim=-1,
-            ),
+            "partial_charge_shape": query["anchor_physics_features"].to(torch.float32)[..., 8:],
+            "operation_stress": operation_group,
+            "retrieval": retrieval_features,
             "neighbor_vote": neighbor_vote,
         }
-        router_out = self.physical_router(router_inputs)
+        router_out = self.semantic_router(router_inputs, rag_semantic_prior=rag_semantic_prior)
 
         baseline_detached = base_delta.detach()
         baseline_summary = torch.stack([baseline_detached.mean(dim=-1), baseline_detached.std(dim=-1), baseline_detached[:, -1]], dim=-1)
@@ -479,19 +557,24 @@ class BatterySOHForecaster(nn.Module):
             ],
             dim=-1,
         )
-        expert_outputs = torch.stack(
-            [
-                expert(
-                    expert_seq=expert_seq,
-                    expert_context=expert_context,
-                    baseline_delta_detached=baseline_detached,
-                    future_ops=query["future_ops"].to(torch.float32),
-                    future_ops_mask=query["future_ops_mask"].to(torch.float32),
+        chemistry_outputs = []
+        for chemistry in self.chemistry_families:
+            mode_outputs = []
+            for mode_name in self.expert_names:
+                expert = self.expert_bank[chemistry][mode_name]
+                mode_outputs.append(
+                    expert(
+                        expert_seq=expert_seq,
+                        expert_context=expert_context,
+                        baseline_delta_detached=baseline_detached,
+                        future_ops=query["future_ops"].to(torch.float32),
+                        future_ops_mask=query["future_ops_mask"].to(torch.float32),
+                    )
                 )
-                for expert in self.expert_bank
-            ],
-            dim=1,
-        )
+            chemistry_outputs.append(torch.stack(mode_outputs, dim=1))
+        all_expert_outputs = torch.stack(chemistry_outputs, dim=1)
+        chemistry_one_hot = F.one_hot(chemistry_ids, num_classes=len(self.chemistry_families)).to(all_expert_outputs.dtype)
+        expert_outputs = torch.sum(all_expert_outputs * chemistry_one_hot[:, :, None, None], dim=1)
         moe_residual = torch.sum(expert_outputs * router_out["weights"].unsqueeze(-1), dim=1)
         pred_delta = base_delta + moe_residual
         pred_soh = anchor_soh.unsqueeze(-1) + pred_delta
@@ -511,6 +594,12 @@ class BatterySOHForecaster(nn.Module):
             "expert_weights": router_out["weights"],
             "expert_logits": router_out["logits"],
             "expert_router_contributions": router_out["contributions"],
+            "semantic_concepts": router_out["concept_scores"],
+            "semantic_prior": router_out["semantic_prior"],
+            "rag_semantic_prior": router_out["rag_semantic_prior"],
+            "final_router_prior": router_out["final_prior"],
+            "chemistry_branch_id": chemistry_ids,
+            "selected_mode_residuals": expert_outputs,
             "fusion_weights": fusion_out["weights"],
             "base_fusion_weights": fusion_out["weights"],
             "fusion_router_contributions": fusion_out["contributions"],

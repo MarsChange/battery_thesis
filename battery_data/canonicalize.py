@@ -70,11 +70,26 @@ def _try_load_adapter_cache(
     except Exception:
         return None
 
+    cache_keys = [meta.get("cache_cell_key") for meta in cell_metas]
+    use_cache_key = bool(cache_keys) and all(cache_keys) and "_cache_cell_key" in df.columns
+    if not use_cache_key:
+        raw_ids = [meta.get("raw_cell_id") for meta in cell_metas]
+        if len(raw_ids) != len(set(raw_ids)):
+            # Older caches used raw_cell_id as the only join key. TJU has the
+            # same file stem in multiple chemistry folders, so such caches mix
+            # cells across folders and must be rebuilt.
+            return None
+
     # Reconstruct CanonicalCell objects
     cells: List[CanonicalCell] = []
     for meta in cell_metas:
-        cell_uid_or_id = meta["raw_cell_id"]
-        cell_df = df[df["_raw_cell_id"] == cell_uid_or_id].drop(columns=["_raw_cell_id"]).reset_index(drop=True)
+        if use_cache_key:
+            cell_uid_or_id = meta["cache_cell_key"]
+            drop_columns = [col for col in ["_raw_cell_id", "_cache_cell_key"] if col in df.columns]
+            cell_df = df[df["_cache_cell_key"] == cell_uid_or_id].drop(columns=drop_columns).reset_index(drop=True)
+        else:
+            cell_uid_or_id = meta["raw_cell_id"]
+            cell_df = df[df["_raw_cell_id"] == cell_uid_or_id].drop(columns=["_raw_cell_id"]).reset_index(drop=True)
         cells.append(
             CanonicalCell(
                 source_dataset=meta["source_dataset"],
@@ -103,13 +118,16 @@ def _save_adapter_cache(
     frames = []
     cell_metas = []
     for cell in cells:
+        cache_cell_key = f"{cell.source_dataset}::{cell.raw_cell_id}::{cell.file_path}"
         frame = cell.cycles.copy()
         frame["_raw_cell_id"] = cell.raw_cell_id
+        frame["_cache_cell_key"] = cache_cell_key
         frames.append(frame)
         cell_metas.append({
             "source_dataset": cell.source_dataset,
             "raw_cell_id": cell.raw_cell_id,
             "file_path": cell.file_path,
+            "cache_cell_key": cache_cell_key,
             "source_info": cell.source_info,
         })
 

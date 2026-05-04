@@ -59,6 +59,9 @@ def _infer_tju_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object]
 def load_tju_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     root = Path(cfg["root"])
     paths = sorted(root.glob("Dataset_*/*.csv"))
+    exclude_folders = {str(value) for value in cfg.get("exclude_folders", [])}
+    if exclude_folders:
+        paths = [path for path in paths if path.parent.name not in exclude_folders]
     max_cells = cfg.get("max_cells")
     if max_cells:
         paths = paths[: int(max_cells)]
@@ -126,10 +129,10 @@ def load_tju_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
         cells.append(
             CanonicalCell(
                 source_dataset="tju",
-                raw_cell_id=path.stem,
+                raw_cell_id=f"{path.parent.name}/{path.stem}",
                 file_path=str(path),
                 cycles=canonical,
-                source_info={"folder": path.parent.name},
+                source_info={"folder": path.parent.name, "condition_group": path.stem.split("-#")[0]},
             )
         )
     return cells

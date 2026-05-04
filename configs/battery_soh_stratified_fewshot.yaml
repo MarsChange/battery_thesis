@@ -1,5 +1,5 @@
-output_dir: output/case_bank
-model_output_dir: output/forecasting
+output_dir: output/case_bank_stratified_fewshot
+model_output_dir: output/forecasting_stratified_fewshot
 random_seed: 7
 cell_uid_prefix: cell
 adapter_cache: true
@@ -13,6 +13,8 @@ datasets:
   tju:
     enabled: true
     root: datasets/TJU_dataset
+    exclude_folders:
+      - Dataset_3_NCM_NCA_battery
   hust:
     enabled: true
     root: datasets/HUST_dataset
@@ -21,17 +23,33 @@ datasets:
     root: datasets/MIT_dataset
 
 split:
-  strategy: default-main
-  source_datasets: ["xjtu", "hust", "tju"]
-  target_datasets: ["mit"]
-  source_val_frac: 0.2
-  few_shot_k_cells: 1
+  strategy: stratified-fewshot-by-condition
   random_seed: 7
+  exclude_chemistry_families:
+    - Blend
+  exclude_file_path_contains:
+    - Dataset_3_NCM_NCA_battery
+  min_query_cells_per_stratum: 1
+  large_train_cells: 4
+  large_val_cells: 2
+  large_support_cells: 2
+  medium_train_cells: 2
+  medium_val_cells: 1
+  medium_support_cells: 1
+  small_train_cells: 1
+  small_val_cells: 1
+  small_support_cells: 1
+  tiny_train_cells: 1
+  tiny_val_cells: 0
+  tiny_support_cells: 1
+  pair_train_cells: 1
+  pair_val_cells: 0
+  pair_support_cells: 0
 
 memory:
   lookback_length: 32
   prediction_length: 8
-  stride: 1
+  stride: 10
   target_type: delta_soh
   token_normalization: cell_relative
   slope_window: 5
@@ -81,7 +99,7 @@ retrieval:
   retrieval_feature_config_path: configs/retrieval_features.yaml
   db_splits: ["source_train"]
   metric: cosine
-  top_m: 200
+  top_m: 50
   top_k: 8
   same_cell_policy: exclude
   allow_cross_chemistry: true
@@ -92,7 +110,7 @@ retrieval:
   max_neighbors_per_cell: 2
 
 model:
-  hidden_dim: 256
+  hidden_dim: 128
   dropout: 0.1
   meta_embedding_dim: 16
   use_qv_encoder: true
@@ -123,8 +141,8 @@ generate_oof_baseline:
 train_residual_experts:
   enabled: true
   lr: 0.0005
-  epochs: 60
-  patience: 12
+  epochs: 5
+  patience: 3
 
 loss:
   criterion: weighted_mse
@@ -143,21 +161,21 @@ loss:
 train:
   train_splits: ["source_train"]
   val_splits: ["source_val"]
-  batch_size: 64
-  epochs: 100
+  batch_size: 32
+  epochs: 5
   lr: 0.001
   weight_decay: 0.0001
-  patience: 15
+  patience: 5
   grad_clip_norm: 1.0
-  device: auto
+  device: mps
   num_workers: 0
 
 fewshot:
   enabled: true
   support_splits: ["target_support"]
   lr: 0.0003
-  epochs: 50
-  patience: 10
+  epochs: 5
+  patience: 3
 
 experiments:
   feature_validation:

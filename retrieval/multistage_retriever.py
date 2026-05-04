@@ -50,14 +50,29 @@ def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
     csv_path = case_bank_dir / "case_rows.csv"
     if parquet_path.exists():
         try:
-            return pd.read_parquet(parquet_path)
+            return _normalize_case_rows(pd.read_parquet(parquet_path))
         except Exception:
             if csv_path.exists():
-                return pd.read_csv(csv_path)
+                return _normalize_case_rows(pd.read_csv(csv_path))
             raise
     if csv_path.exists():
-        return pd.read_csv(csv_path)
+        return _normalize_case_rows(pd.read_csv(csv_path))
     raise FileNotFoundError(f"Missing case rows at {parquet_path} or {csv_path}")
+
+
+def _normalize_case_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Use plain Python metadata scalars for retrieval loops.
+
+    Retrieval computes distances for many query/reference pairs. Pyarrow-backed
+    parquet string scalars are slow in that loop, so string-like columns are
+    converted once when the case rows are loaded. Numeric columns remain numeric.
+    """
+
+    frame = rows.copy()
+    for column in frame.columns:
+        if not pd.api.types.is_numeric_dtype(frame[column]):
+            frame[column] = frame[column].fillna("unknown").astype(str).astype(object)
+    return frame
 
 
 def _read_json(path: Path, default: object) -> object:
@@ -169,6 +184,13 @@ class MultiStageBatteryRetriever:
 
         self.case_bank_dir = Path(case_bank_dir)
         self.retrieval_config_path = Path(retrieval_config_path)
+        if not self.retrieval_config_path.exists() and self.retrieval_config_path.name == "rag_retrieval_features.yaml":
+            # Backward-compatible path mapping only. The active mainline config
+            # is configs/retrieval_features.yaml and contains no external
+            # sequence embedding distance.
+            fallback_path = Path("configs/retrieval_features.yaml")
+            if fallback_path.exists():
+                self.retrieval_config_path = fallback_path
         self.rag_config = yaml.safe_load(self.retrieval_config_path.read_text())
         self.case_rows = _read_case_rows(self.case_bank_dir).sort_values("case_id").reset_index(drop=True)
         self.case_rows["case_id"] = self.case_rows["case_id"].astype(int)
@@ -229,7 +251,52 @@ class MultiStageBatteryRetriever:
         self.handcrafted_embeddings = self.handcrafted_retrieval_embedding
         self.stage1_embeddings = self._build_stage1_embeddings()
         self.db_stage1_embeddings = self.stage1_embeddings[self.db_indices]
+        self._prepare_fast_retrieval_tables()
         self._build_index()
+
+    def _prepare_fast_retrieval_tables(self) -> None:
+        """Precompute NumPy lookup tables used by bulk cache construction."""
+
+        self._row_case_ids = self.case_rows["case_id"].to_numpy(dtype=np.int64)
+        self._row_cell_uid = self.case_rows["cell_uid"].astype(str).to_numpy(dtype=object)
+        self._row_split = self.case_rows["split"].astype(str).to_numpy(dtype=object)
+        self._row_chemistry = self.case_rows["chemistry_family"].astype(str).to_numpy(dtype=object)
+        self._row_domain = self.case_rows["domain_label"].astype(str).to_numpy(dtype=object)
+        self._row_voltage_window = self.case_rows["voltage_window_bucket"].astype(str).to_numpy(dtype=object)
+        self._row_degradation_stage = self.case_rows["degradation_stage"].astype(str).to_numpy(dtype=object)
+        self._row_window_end = self.case_rows["window_end"].fillna(0).to_numpy(dtype=np.int64)
+        self._row_target_horizon = self.case_rows["target_horizon"].fillna(0).to_numpy(dtype=np.int64)
+        self._future_delta_finite = np.isfinite(np.asarray(self.arrays["future_delta"], dtype=np.float32)).all(axis=1)
+        self._state_matrix = self.case_rows[["anchor_soh", "recent_soh_slope", "recent_soh_curvature"]].fillna(0.0).to_numpy(dtype=np.float32)
+        self._qv_summary_matrix, self._qv_summary_mask = self._build_qv_summary_matrix()
+        self._physics_matrix = np.asarray(self.arrays["anchor_physics_features"], dtype=np.float32)
+        self._physics_mask_matrix = np.asarray(self.arrays["physics_feature_masks"][:, -1, :], dtype=np.float32)
+        self._metadata_summary_matrix = np.asarray(self.handcrafted_retrieval_embedding[:, -12:], dtype=np.float32)
+
+    def _build_qv_summary_matrix(self) -> tuple[np.ndarray, np.ndarray]:
+        cycle_last = np.asarray(self.arrays["cycle_stats"][:, -1, :], dtype=np.float32)
+        values = []
+        masks = []
+        for name, fallback in [
+            ("delta_v_mean", None),
+            ("delta_v_std", None),
+            ("delta_v_q95", "delta_v_max"),
+            ("r_mean", None),
+            ("r_std", None),
+            ("r_q95", None),
+            ("vc_curve_slope_mean", "vc_slope_mean"),
+            ("vd_curve_slope_mean", "vd_slope_mean"),
+        ]:
+            feature_idx = self._cycle_feature_index(name)
+            if feature_idx is None and fallback is not None:
+                feature_idx = self._cycle_feature_index(fallback)
+            if feature_idx is not None and feature_idx < cycle_last.shape[1]:
+                values.append(cycle_last[:, feature_idx])
+                masks.append(np.ones(cycle_last.shape[0], dtype=np.float32))
+            else:
+                values.append(np.zeros(cycle_last.shape[0], dtype=np.float32))
+                masks.append(np.zeros(cycle_last.shape[0], dtype=np.float32))
+        return np.stack(values, axis=1).astype(np.float32), np.stack(masks, axis=1).astype(np.float32)
 
     def _load_case_arrays(self) -> Dict[str, np.ndarray | None]:
         arrays: Dict[str, np.ndarray | None] = {
@@ -448,6 +515,66 @@ class MultiStageBatteryRetriever:
                 values.extend([0.0, 0.0, 0.0])
         return np.asarray(values, dtype=np.float32)
 
+    def _metadata_numeric_matrix(self, chunk_size: int = 1024) -> np.ndarray:
+        """Build Stage-1 numeric metadata summaries for all cases.
+
+        The 12 dimensions are mean/std/last for charge-current sequence,
+        discharge-current sequence, temperature sequence and normalized SOH
+        delta sequence. This is equivalent to `_metadata_numeric_summary`, but
+        uses chunked NumPy operations to avoid slow per-row parquet/pandas access.
+        """
+
+        qv_maps = np.asarray(self.arrays["qv_maps"], dtype=np.float32)
+        qv_masks = np.asarray(self.arrays["qv_masks"], dtype=np.float32)
+        op_seq = np.asarray(self.arrays["operation_seq"], dtype=np.float32)
+        soh_seq = np.asarray(self.arrays["soh_seq"], dtype=np.float32)
+        n_cases = int(soh_seq.shape[0])
+        result = np.zeros((n_cases, 12), dtype=np.float32)
+        op_names = list(self.feature_names.get("operation", []))
+        op_name_to_pos = {name: pos for pos, name in enumerate(op_names[: op_seq.shape[2]])}
+        temp_pos = op_name_to_pos.get("temp_mean")
+
+        def _summarize_sequence(seq: np.ndarray) -> np.ndarray:
+            finite = np.isfinite(seq)
+            count = finite.sum(axis=1).astype(np.float32)
+            safe_seq = np.where(finite, seq, 0.0).astype(np.float32)
+            mean = safe_seq.sum(axis=1) / np.maximum(count, 1.0)
+            centered = np.where(finite, seq - mean[:, None], 0.0)
+            std = np.sqrt((centered * centered).sum(axis=1) / np.maximum(count, 1.0)).astype(np.float32)
+            reversed_seq = np.where(finite, seq, np.nan)[:, ::-1]
+            last = np.zeros(seq.shape[0], dtype=np.float32)
+            has_any = finite.any(axis=1)
+            if np.any(has_any):
+                last_pos = np.argmax(np.isfinite(reversed_seq[has_any]), axis=1)
+                last[has_any] = reversed_seq[has_any, last_pos].astype(np.float32)
+            return np.stack([mean, std, last], axis=1).astype(np.float32)
+
+        for start in range(0, n_cases, int(chunk_size)):
+            end = min(start + int(chunk_size), n_cases)
+            chunk_maps = qv_maps[start:end]
+            chunk_masks = qv_masks[start:end]
+            sequences: list[np.ndarray] = []
+            for channel_idx in [QV_CHANNEL_TO_INDEX["Ic"], QV_CHANNEL_TO_INDEX["Id"]]:
+                values = np.abs(chunk_maps[:, :, channel_idx, :]).astype(np.float32)
+                values = np.where(np.isfinite(values), values, np.nan)
+                seq = np.nanmean(values, axis=2).astype(np.float32)
+                if chunk_masks.ndim == 3 and chunk_masks.shape[2] > channel_idx:
+                    seq = np.where(chunk_masks[:, :, channel_idx] > 0, seq, np.nan).astype(np.float32)
+                sequences.append(seq)
+
+            if temp_pos is not None:
+                sequences.append(op_seq[start:end, :, temp_pos].astype(np.float32))
+            else:
+                sequences.append(np.full((end - start, soh_seq.shape[1]), np.nan, dtype=np.float32))
+
+            capacity_delta = np.zeros_like(soh_seq[start:end], dtype=np.float32)
+            if capacity_delta.shape[1] > 1:
+                capacity_delta[:, 1:] = np.diff(soh_seq[start:end], axis=1)
+                capacity_delta[~np.isfinite(capacity_delta)] = np.nan
+            sequences.append(capacity_delta)
+            result[start:end] = np.concatenate([_summarize_sequence(seq) for seq in sequences], axis=1)
+        return result
+
     def _feature_availability_ratio(self, query_idx: int, ref_idx: int) -> float:
         q_qv = np.asarray(self.arrays["qv_masks"][query_idx, -1], dtype=np.float32)
         r_qv = np.asarray(self.arrays["qv_masks"][ref_idx, -1], dtype=np.float32)
@@ -491,43 +618,39 @@ class MultiStageBatteryRetriever:
         return float(np.clip(raw_score, 0.0, 1.0))
 
     def _build_handcrafted_embeddings(self) -> np.ndarray:
-        rows = []
-        for row_idx in range(len(self.case_rows)):
-            state = self._state_dict(row_idx)
-            qv_summary = self._qv_summary_stats(row_idx)
-            physics = np.asarray(self.arrays["anchor_physics_features"][row_idx], dtype=np.float32)
-            metadata_numeric_vec = self._metadata_numeric_summary(row_idx)
-            qv_vec = np.asarray(
-                [
-                    float(qv_summary.get("delta_v_mean", 0.0)),
-                    float(qv_summary.get("delta_v_std", 0.0)),
-                    float(qv_summary.get("delta_v_q95", 0.0)),
-                    float(qv_summary.get("r_mean", 0.0)),
-                    float(qv_summary.get("r_std", 0.0)),
-                    float(qv_summary.get("r_q95", 0.0)),
-                    float(qv_summary.get("vc_curve_slope_mean", 0.0)),
-                    float(qv_summary.get("vd_curve_slope_mean", 0.0)),
-                ],
-                dtype=np.float32,
-            )
-            rows.append(
-                np.concatenate(
-                    [
-                        np.asarray(
-                            [
-                                float(state["anchor_soh"]),
-                                float(state["recent_soh_slope"]),
-                                float(state["recent_soh_curvature"]),
-                            ],
-                            dtype=np.float32,
-                        ),
-                        qv_vec,
-                        physics.astype(np.float32),
-                        metadata_numeric_vec,
-                    ]
-                )
-            )
-        return np.asarray(rows, dtype=np.float32)
+        cache_path = self.case_bank_dir / "case_handcrafted_retrieval_embedding.npy"
+        expected_dim = 3 + 8 + int(np.asarray(self.arrays["anchor_physics_features"]).shape[1]) + 12
+        if cache_path.exists():
+            cached = np.load(cache_path)
+            if cached.shape == (len(self.case_rows), expected_dim):
+                return np.asarray(cached, dtype=np.float32)
+
+        state = self.case_rows[["anchor_soh", "recent_soh_slope", "recent_soh_curvature"]].fillna(0.0).to_numpy(dtype=np.float32)
+        cycle_last = np.asarray(self.arrays["cycle_stats"][:, -1, :], dtype=np.float32)
+        qv_columns = []
+        for name, fallback in [
+            ("delta_v_mean", None),
+            ("delta_v_std", None),
+            ("delta_v_q95", "delta_v_max"),
+            ("r_mean", None),
+            ("r_std", None),
+            ("r_q95", None),
+            ("vc_curve_slope_mean", "vc_slope_mean"),
+            ("vd_curve_slope_mean", "vd_slope_mean"),
+        ]:
+            feature_idx = self._cycle_feature_index(name)
+            if feature_idx is None and fallback is not None:
+                feature_idx = self._cycle_feature_index(fallback)
+            if feature_idx is not None and feature_idx < cycle_last.shape[1]:
+                qv_columns.append(cycle_last[:, feature_idx])
+            else:
+                qv_columns.append(np.zeros(cycle_last.shape[0], dtype=np.float32))
+        qv_vec = np.stack(qv_columns, axis=1).astype(np.float32)
+        physics = np.asarray(self.arrays["anchor_physics_features"], dtype=np.float32)
+        metadata_numeric = self._metadata_numeric_matrix()
+        embedding = np.concatenate([state, qv_vec, physics, metadata_numeric], axis=1).astype(np.float32)
+        np.save(cache_path, embedding)
+        return embedding
 
     def _build_stage1_embeddings(self) -> np.ndarray:
         return np.asarray(self.handcrafted_embeddings, dtype=np.float32)
@@ -678,6 +801,255 @@ class MultiStageBatteryRetriever:
             domain_counter[str(chosen_row["domain_label"])] = domain_counter.get(str(chosen_row["domain_label"]), 0) + 1
             candidate_order = [pos for pos in candidate_order if int(candidate_case_ids[pos]) != int(best_case)]
         return np.asarray(selected, dtype=np.int64), np.asarray(mmr_scores, dtype=np.float32)
+
+    def _fast_hard_filter_indices(self, query_idx: int, candidate_case_ids: np.ndarray) -> np.ndarray:
+        if candidate_case_ids.size == 0:
+            return np.zeros(0, dtype=np.int64)
+        candidate_indices = np.asarray([self.case_id_to_index[int(case_id)] for case_id in candidate_case_ids.tolist()], dtype=np.int64)
+        mask = (
+            self._row_split[candidate_indices] != "target_query"
+        ) & (self._row_target_horizon[candidate_indices] == self._row_target_horizon[query_idx]) & self._future_delta_finite[candidate_indices]
+        if self.exclude_query_case:
+            mask &= self._row_case_ids[candidate_indices] != self._row_case_ids[query_idx]
+        if self.same_cell_policy == "exclude":
+            mask &= self._row_cell_uid[candidate_indices] != self._row_cell_uid[query_idx]
+        elif self.same_cell_policy == "past_only":
+            same_cell = self._row_cell_uid[candidate_indices] == self._row_cell_uid[query_idx]
+            mask &= (~same_cell) | (self._row_window_end[candidate_indices] <= self._row_window_end[query_idx])
+        if not self.allow_cross_chemistry:
+            mask &= self._row_chemistry[candidate_indices] == self._row_chemistry[query_idx]
+        return candidate_indices[mask][: self.top_m]
+
+    def _fast_component_arrays(self, query_idx: int, ref_indices: np.ndarray) -> Dict[str, np.ndarray]:
+        if ref_indices.size == 0:
+            return {name: np.zeros(0, dtype=np.float32) for name in COMPONENT_NAMES + ["composite_distance"]}
+
+        q_state = self._state_matrix[query_idx]
+        r_state = self._state_matrix[ref_indices]
+        state_scale = np.asarray([0.1, 0.01, 0.005], dtype=np.float32)
+        d_state_numeric = np.sqrt(np.mean(((r_state - q_state[None, :]) / state_scale[None, :]) ** 2, axis=1))
+        d_stage = (self._row_degradation_stage[ref_indices] != self._row_degradation_stage[query_idx]).astype(np.float32)
+        d_soh_state = (0.85 * d_state_numeric + 0.15 * d_stage).astype(np.float32)
+
+        qv_maps = np.asarray(self.arrays["qv_maps"], dtype=np.float32)
+        qv_masks = np.asarray(self.arrays["qv_masks"], dtype=np.float32)
+        q_map = qv_maps[query_idx, -1]
+        r_maps = qv_maps[ref_indices, -1]
+        q_mask = qv_masks[query_idx, -1]
+        r_masks = qv_masks[ref_indices, -1]
+        qv_cfg = dict(self.rag_config.get("qv_shape", {}) or {})
+        qv_weights = dict(qv_cfg.get("channel_weights", {}) or {"Vd": 0.25, "DeltaV": 0.40, "R": 0.35})
+        qv_terms = np.zeros(ref_indices.size, dtype=np.float32)
+        qv_weight_sum = np.zeros(ref_indices.size, dtype=np.float32)
+        for channel_name in ["Vd", "DeltaV", "R"]:
+            channel_idx = QV_CHANNEL_TO_INDEX[channel_name]
+            common = (q_mask[channel_idx] > 0) & (r_masks[:, channel_idx] > 0)
+            if not np.any(common):
+                continue
+            diff = r_maps[:, channel_idx, :] - q_map[channel_idx][None, :]
+            channel_dist = np.sqrt(np.nanmean(diff * diff, axis=1)).astype(np.float32)
+            weight = float(qv_weights.get(channel_name, 1.0))
+            qv_terms[common] += weight * channel_dist[common]
+            qv_weight_sum[common] += weight
+        q_summary = self._qv_summary_matrix[query_idx]
+        r_summary = self._qv_summary_matrix[ref_indices]
+        common_summary = (self._qv_summary_mask[query_idx][None, :] > 0) & (self._qv_summary_mask[ref_indices] > 0)
+        if np.any(common_summary):
+            scale = np.maximum(np.maximum(np.abs(r_summary), np.abs(q_summary[None, :])), 1e-4)
+            summary_diff = ((r_summary - q_summary[None, :]) / scale) ** 2
+            denom = np.maximum(common_summary.sum(axis=1), 1)
+            summary_dist = np.sqrt((summary_diff * common_summary).sum(axis=1) / denom).astype(np.float32)
+            has_summary = common_summary.any(axis=1)
+            qv_terms[has_summary] += summary_dist[has_summary]
+            qv_weight_sum[has_summary] += 1.0
+        d_qv_shape = np.where(qv_weight_sum > 0, qv_terms / np.maximum(qv_weight_sum, 1e-6), 1.0).astype(np.float32)
+
+        q_phys = self._physics_matrix[query_idx]
+        r_phys = self._physics_matrix[ref_indices]
+        q_phys_mask = self._physics_mask_matrix[query_idx]
+        r_phys_mask = self._physics_mask_matrix[ref_indices]
+        common_phys = (q_phys_mask[None, :] > 0) & (r_phys_mask > 0)
+        phys_scale = np.maximum(np.maximum(np.abs(r_phys), np.abs(q_phys[None, :])), 1e-4)
+        phys_diff = ((r_phys - q_phys[None, :]) / phys_scale) ** 2
+        phys_denom = np.maximum(common_phys.sum(axis=1), 1)
+        d_physics = np.where(common_phys.any(axis=1), np.sqrt((phys_diff * common_phys).sum(axis=1) / phys_denom), 1.0).astype(np.float32)
+
+        penalties = dict(self.rag_config.get("metadata_penalties", {}) or {})
+        meta_pairs = [
+            (self._row_chemistry, "chemistry_family_mismatch", 1.0),
+            (self._row_domain, "domain_label_mismatch", 0.5),
+            (self._row_voltage_window, "voltage_window_mismatch", 0.5),
+        ]
+        categorical_score = np.zeros(ref_indices.size, dtype=np.float32)
+        categorical_weight = 0.0
+        for values, penalty_name, default_penalty in meta_pairs:
+            penalty = float(penalties.get(penalty_name, default_penalty))
+            categorical_score += penalty * (values[ref_indices] != values[query_idx]).astype(np.float32)
+            categorical_weight += penalty
+        categorical_distance = categorical_score / max(categorical_weight, 1e-6)
+        q_meta = self._metadata_summary_matrix[query_idx]
+        r_meta = self._metadata_summary_matrix[ref_indices]
+        meta_scale = np.maximum(np.maximum(np.abs(r_meta), np.abs(q_meta[None, :])), 1e-4)
+        numeric_distance = np.sqrt(np.mean(((r_meta - q_meta[None, :]) / meta_scale) ** 2, axis=1)).astype(np.float32)
+        mix = dict(self.rag_config.get("metadata_distance_weights", {}) or {})
+        categorical_mix = float(mix.get("categorical", 0.4))
+        numeric_mix = float(mix.get("raw_numeric", 0.6))
+        d_metadata = ((categorical_mix * categorical_distance + numeric_mix * numeric_distance) / max(categorical_mix + numeric_mix, 1e-6)).astype(np.float32)
+
+        d_operation = np.full(ref_indices.size, np.nan, dtype=np.float32)
+        components = {
+            "d_soh_state": d_soh_state,
+            "d_qv_shape": d_qv_shape,
+            "d_physics": d_physics,
+            "d_operation": d_operation,
+            "d_metadata": d_metadata,
+        }
+        weights = []
+        names = []
+        for name in CORE_COMPONENTS:
+            cfg = self.rag_config
+            if "distance_components" in cfg:
+                enabled = bool(dict(cfg.get("distance_components", {}).get(name, {}) or {}).get("enabled", False))
+                weight = float(dict(cfg.get("distance_components", {}).get(name, {}) or {}).get("weight", 0.0))
+            else:
+                enabled = bool(cfg.get(name, False))
+                weight = float(dict(cfg.get("weights", {}) or {}).get(name, 0.0))
+            if enabled and weight > 0 and np.isfinite(components[name]).any():
+                weights.append(weight)
+                names.append(name)
+        composite = np.zeros(ref_indices.size, dtype=np.float32)
+        weight_sum = float(sum(weights))
+        if weight_sum > 0:
+            for name, weight in zip(names, weights):
+                values = components[name]
+                composite += (weight / weight_sum) * np.where(np.isfinite(values), values, 0.0).astype(np.float32)
+        components["composite_distance"] = composite.astype(np.float32)
+        return components
+
+    def _empty_result(self, query_case_id: int) -> RetrievalResult:
+        horizon = int(self.arrays["future_delta"].shape[1])
+        zeros = np.zeros(self.top_k, dtype=np.float32)
+        return RetrievalResult(
+            query_case_id=int(query_case_id),
+            neighbor_case_ids=np.full(self.top_k, -1, dtype=np.int64),
+            retrieval_mask=zeros.copy(),
+            d_soh_state=zeros.copy(),
+            d_qv_shape=zeros.copy(),
+            d_physics=zeros.copy(),
+            d_operation=np.full(self.top_k, np.nan, dtype=np.float32),
+            d_metadata=zeros.copy(),
+            composite_distance=np.full(self.top_k, np.inf, dtype=np.float32),
+            retrieval_confidence=0.0,
+            retrieval_alpha=zeros.copy(),
+            neighbor_future_delta_soh=np.zeros((self.top_k, horizon), dtype=np.float32),
+            neighbor_metadata=[{} for _ in range(self.top_k)],
+            explain_json={"warning": "No valid neighbors after hard filtering."},
+            stage_distance=zeros.copy(),
+            missing_penalty=zeros.copy(),
+            reference_compatibility_score=zeros.copy(),
+            mmr_diversity_score=zeros.copy(),
+        )
+
+    def _retrieve_fast(self, query_case_id: int) -> RetrievalResult:
+        query_idx = self.case_id_to_index[int(query_case_id)]
+        ref_indices = self._fast_hard_filter_indices(query_idx, self._coarse_candidates(query_idx))
+        if ref_indices.size == 0:
+            return self._empty_result(query_case_id)
+        distances = self._fast_component_arrays(query_idx, ref_indices)
+        order = np.argsort(distances["composite_distance"])[: max(self.top_m, self.top_k)]
+        ref_indices = ref_indices[order]
+        distances = {name: values[order] for name, values in distances.items()}
+
+        selected_positions: list[int] = []
+        cell_counter: Dict[str, int] = {}
+        domain_counter: Dict[str, int] = {}
+        for pos, ref_idx in enumerate(ref_indices.tolist()):
+            cell_uid = str(self._row_cell_uid[ref_idx])
+            domain_label = str(self._row_domain[ref_idx])
+            if self.use_mmr and cell_counter.get(cell_uid, 0) >= self.max_neighbors_per_cell:
+                continue
+            if self.use_mmr and self.max_neighbors_per_domain is not None and domain_counter.get(domain_label, 0) >= int(self.max_neighbors_per_domain):
+                continue
+            selected_positions.append(pos)
+            cell_counter[cell_uid] = cell_counter.get(cell_uid, 0) + 1
+            domain_counter[domain_label] = domain_counter.get(domain_label, 0) + 1
+            if len(selected_positions) >= self.top_k:
+                break
+        if not selected_positions:
+            selected_positions = list(range(min(self.top_k, ref_indices.size)))
+
+        selected_ref_indices = ref_indices[np.asarray(selected_positions, dtype=np.int64)]
+        k = int(min(selected_ref_indices.size, self.top_k))
+        horizon = int(self.arrays["future_delta"].shape[1])
+        neighbor_case_ids = np.full(self.top_k, -1, dtype=np.int64)
+        retrieval_mask = np.zeros(self.top_k, dtype=np.float32)
+        composite_distance = np.full(self.top_k, np.inf, dtype=np.float32)
+        d_soh_state = np.zeros(self.top_k, dtype=np.float32)
+        d_qv_shape = np.zeros(self.top_k, dtype=np.float32)
+        d_physics = np.zeros(self.top_k, dtype=np.float32)
+        d_operation = np.full(self.top_k, np.nan, dtype=np.float32)
+        d_metadata = np.zeros(self.top_k, dtype=np.float32)
+        stage_distance = np.zeros(self.top_k, dtype=np.float32)
+        missing_penalty = np.zeros(self.top_k, dtype=np.float32)
+        reference_compatibility_score = np.zeros(self.top_k, dtype=np.float32)
+        mmr_diversity_score = np.ones(self.top_k, dtype=np.float32)
+        neighbor_future_delta_soh = np.zeros((self.top_k, horizon), dtype=np.float32)
+        retrieval_alpha = np.zeros(self.top_k, dtype=np.float32)
+        neighbor_metadata = [{} for _ in range(self.top_k)]
+
+        if k > 0:
+            pos_arr = np.asarray(selected_positions[:k], dtype=np.int64)
+            neighbor_case_ids[:k] = self._row_case_ids[selected_ref_indices[:k]]
+            retrieval_mask[:k] = 1.0
+            d_soh_state[:k] = distances["d_soh_state"][pos_arr]
+            d_qv_shape[:k] = distances["d_qv_shape"][pos_arr]
+            d_physics[:k] = distances["d_physics"][pos_arr]
+            d_operation[:k] = distances["d_operation"][pos_arr]
+            d_metadata[:k] = distances["d_metadata"][pos_arr]
+            composite_distance[:k] = distances["composite_distance"][pos_arr]
+            stage_distance[:k] = (self._row_degradation_stage[selected_ref_indices[:k]] != self._row_degradation_stage[query_idx]).astype(np.float32)
+            reference_compatibility_score[:k] = np.clip(1.0 - composite_distance[:k], 0.0, 1.0)
+            retrieval_alpha[:k] = _softmax_masked(composite_distance[:k], retrieval_mask[:k], self.retrieval_temperature)
+            neighbor_future_delta_soh[:k] = np.asarray(self.arrays["future_delta"][selected_ref_indices[:k]], dtype=np.float32)
+            for pos, ref_idx in enumerate(selected_ref_indices[:k].tolist()):
+                neighbor_metadata[pos] = {
+                    "case_id": int(self._row_case_ids[ref_idx]),
+                    "cell_uid": str(self._row_cell_uid[ref_idx]),
+                    "chemistry_family": str(self._row_chemistry[ref_idx]),
+                    "domain_label": str(self._row_domain[ref_idx]),
+                    "source_dataset": str(self.case_rows.iloc[ref_idx].get("source_dataset", "unknown")),
+                    "degradation_stage": str(self._row_degradation_stage[ref_idx]),
+                    "anchor_soh": float(self._state_matrix[ref_idx, 0]),
+                    "recent_soh_slope": float(self._state_matrix[ref_idx, 1]),
+                    "voltage_window_bucket": str(self._row_voltage_window[ref_idx]),
+                }
+        confidence_payload = {
+            "composite_distance": composite_distance[:k],
+            "feature_availability_ratio": 1.0,
+            "chemistry_match_rate": float(np.mean(self._row_chemistry[selected_ref_indices[:k]] == self._row_chemistry[query_idx])) if k else 0.0,
+            "domain_match_rate": float(np.mean(self._row_domain[selected_ref_indices[:k]] == self._row_domain[query_idx])) if k else 0.0,
+        }
+        retrieval_confidence = compute_retrieval_confidence(confidence_payload, self.rag_config) if k else 0.0
+        return RetrievalResult(
+            query_case_id=int(query_case_id),
+            neighbor_case_ids=neighbor_case_ids,
+            retrieval_mask=retrieval_mask,
+            d_soh_state=d_soh_state,
+            d_qv_shape=d_qv_shape,
+            d_physics=d_physics,
+            d_operation=d_operation,
+            d_metadata=d_metadata,
+            composite_distance=composite_distance,
+            retrieval_confidence=float(retrieval_confidence),
+            retrieval_alpha=retrieval_alpha,
+            neighbor_future_delta_soh=neighbor_future_delta_soh,
+            neighbor_metadata=neighbor_metadata,
+            explain_json={"fast_cache_path": True, "enabled_distance_components": self.enabled_component_names},
+            stage_distance=stage_distance,
+            missing_penalty=missing_penalty,
+            reference_compatibility_score=reference_compatibility_score,
+            mmr_diversity_score=mmr_diversity_score,
+        )
 
     def retrieve(self, query_case_id: int) -> RetrievalResult:
         query_idx = self.case_id_to_index[int(query_case_id)]
@@ -830,7 +1202,12 @@ class MultiStageBatteryRetriever:
     def build_cache(self, query_case_ids: Iterable[int], output_path: str | Path) -> Path:
         output_path = Path(output_path)
         query_case_ids = [int(case_id) for case_id in query_case_ids]
-        results = [self.retrieve(case_id) for case_id in query_case_ids]
+        results = []
+        total = len(query_case_ids)
+        for pos, case_id in enumerate(query_case_ids, start=1):
+            results.append(self._retrieve_fast(case_id))
+            if pos == 1 or pos % 500 == 0 or pos == total:
+                print(f"[retrieval-cache] {output_path.name}: {pos}/{total}", flush=True)
         np.savez_compressed(
             output_path,
             query_case_ids=np.asarray(query_case_ids, dtype=np.int64),

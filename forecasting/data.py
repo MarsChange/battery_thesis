@@ -24,20 +24,48 @@ DEFAULT_META_FIELDS = [
     "source_dataset",
 ]
 
+CHEMISTRY_TO_ID = {"LFP": 0, "NCM": 1, "NCA": 2}
+
+
+def chemistry_family_to_id(value: object) -> int:
+    text = str(value or "unknown").upper()
+    if "LFP" in text:
+        return CHEMISTRY_TO_ID["LFP"]
+    if "NCM" in text:
+        return CHEMISTRY_TO_ID["NCM"]
+    if "NCA" in text:
+        return CHEMISTRY_TO_ID["NCA"]
+    return CHEMISTRY_TO_ID["LFP"]
+
 
 def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
     parquet_path = case_bank_dir / "case_rows.parquet"
     csv_path = case_bank_dir / "case_rows.csv"
     if parquet_path.exists():
         try:
-            return pd.read_parquet(parquet_path)
+            return _normalize_case_rows(pd.read_parquet(parquet_path))
         except Exception:
             if csv_path.exists():
-                return pd.read_csv(csv_path)
+                return _normalize_case_rows(pd.read_csv(csv_path))
             raise
     if csv_path.exists():
-        return pd.read_csv(csv_path)
+        return _normalize_case_rows(pd.read_csv(csv_path))
     raise FileNotFoundError(f"Missing case rows at {parquet_path} or {csv_path}")
+
+
+def _normalize_case_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Convert metadata columns to plain Python objects for fast row access.
+
+    Pandas can preserve parquet string columns as pyarrow-backed scalars. That
+    is memory efficient, but very slow for the row-wise indexing used by case
+    bank retrieval/evaluation. Numeric columns are kept numeric.
+    """
+
+    frame = rows.copy()
+    for column in frame.columns:
+        if not pd.api.types.is_numeric_dtype(frame[column]):
+            frame[column] = frame[column].fillna("unknown").astype(str).astype(object)
+    return frame
 
 
 class BatterySOHForecastDataset(Dataset):
@@ -99,22 +127,20 @@ class BatterySOHForecastDataset(Dataset):
     def _build_meta_vocab(rows: pd.DataFrame, meta_fields: List[str]) -> Dict[str, Dict[str, int]]:
         vocab = {}
         for field in meta_fields:
-            values = sorted({str(value) for value in rows[field].fillna("unknown").astype(str).tolist()})
+            values = sorted({str(value) for value in rows[field].fillna("unknown").astype(str).to_numpy(dtype=object).tolist()})
             vocab[field] = {value: idx + 1 for idx, value in enumerate(values)}
             vocab[field]["<unk>"] = 0
         return vocab
 
     @staticmethod
     def _encode_meta_ids(rows: pd.DataFrame, meta_fields: List[str], meta_vocab: Dict[str, Dict[str, int]]) -> np.ndarray:
-        encoded = []
-        for _, row in rows.iterrows():
-            encoded.append(
-                [
-                    int(meta_vocab[field].get(str(row.get(field, "unknown")), meta_vocab[field]["<unk>"]))
-                    for field in meta_fields
-                ]
-            )
-        return np.asarray(encoded, dtype=np.int64)
+        encoded = np.zeros((len(rows), len(meta_fields)), dtype=np.int64)
+        for field_pos, field in enumerate(meta_fields):
+            values = rows[field].fillna("unknown").astype(str).to_numpy(dtype=object)
+            vocab = meta_vocab[field]
+            unknown_id = int(vocab["<unk>"])
+            encoded[:, field_pos] = np.asarray([int(vocab.get(str(value), unknown_id)) for value in values], dtype=np.int64)
+        return encoded
 
     def _retrieval_cache_path(self, retriever: MultiStageBatteryRetriever) -> Path:
         split_tag = "-".join(sorted(self.case_rows.loc[self.indices, "split"].astype(str).unique().tolist()))
@@ -172,6 +198,7 @@ class BatterySOHForecastDataset(Dataset):
             "ref_cycle_stats": np.zeros((top_k,) + self.arrays["cycle_stats"].shape[1:], dtype=np.float32),
             "ref_soh_seq": np.zeros((top_k, self.arrays["soh_seq"].shape[1], 1), dtype=np.float32),
             "ref_anchor_soh": np.zeros(top_k, dtype=np.float32),
+            "ref_chemistry_id": np.zeros(top_k, dtype=np.int64),
             "ref_qv_maps": np.zeros((top_k,) + self.arrays["qv_maps"].shape[1:], dtype=np.float32),
             "ref_partial_charge": np.zeros((top_k,) + self.arrays["partial_charge"].shape[1:], dtype=np.float32),
             "ref_physics_features": np.zeros((top_k,) + self.arrays["physics_features"].shape[1:], dtype=np.float32),
@@ -191,6 +218,7 @@ class BatterySOHForecastDataset(Dataset):
             "cell_uid": str(row["cell_uid"]),
             "split": str(row["split"]),
             "anchor_soh": np.asarray(float(row["anchor_soh"]), dtype=np.float32),
+            "chemistry_id": np.asarray(chemistry_family_to_id(row.get("chemistry_family", "unknown")), dtype=np.int64),
             "target_delta_soh": np.asarray(self.arrays["future_delta_soh"][row_idx], dtype=np.float32),
             "target_soh": np.asarray(self.arrays["future_soh"][row_idx], dtype=np.float32),
             "cycle_stats": np.asarray(self.arrays["cycle_stats"][row_idx], dtype=np.float32),
@@ -261,6 +289,10 @@ class BatterySOHForecastDataset(Dataset):
                 "ref_cycle_stats": np.asarray(self.arrays["cycle_stats"][ref_row_indices], dtype=np.float32),
                 "ref_soh_seq": np.asarray(self.arrays["soh_seq"][ref_row_indices][:, :, None], dtype=np.float32),
                 "ref_anchor_soh": np.asarray(self.case_rows.iloc[ref_row_indices]["anchor_soh"].to_numpy(dtype=np.float32), dtype=np.float32),
+                "ref_chemistry_id": np.asarray(
+                    [chemistry_family_to_id(value) for value in self.case_rows.iloc[ref_row_indices]["chemistry_family"].tolist()],
+                    dtype=np.int64,
+                ),
                 "ref_qv_maps": np.asarray(self.arrays["qv_maps"][ref_row_indices], dtype=np.float32),
                 "ref_partial_charge": np.asarray(self.arrays["partial_charge"][ref_row_indices], dtype=np.float32),
                 "ref_physics_features": np.asarray(self.arrays["physics_features"][ref_row_indices], dtype=np.float32),

@@ -21,8 +21,8 @@ pred_soh = anchor_soh + pred_delta_soh
 
 - `case_bank`: 将电池循环数据切成窗口级监督样本，提取 SOH、Q-V、DeltaV/R、partial-charge、工况和 metadata 特征。
 - `RAG retrieval`: 使用可解释数值距离从历史 case memory 中检索 top-k 相似窗口。
-- `router`: 使用命名清楚的物理和工况特征输出专家权重。
-- `LSTM experts`: 每个专家接收窗口级数值特征序列，输出未来 K 步 SOH delta 的专家预测或残差修正。
+- `semantic hierarchical router`: 第一层使用已知 `chemistry_family` 做 hard routing，第二层用语义概念先验和小校准器输出 4 个模式专家权重。
+- `residual LSTM experts`: 每个 chemistry branch 下有 4 个 LSTM residual experts，只输出 `moe_residual`，最终 `pred_delta = base_delta + moe_residual`。
 
 主方法检索和专家输入均不依赖外部序列 embedding。公开数据集中无法稳定提取的充电后静置电压恢复曲线不进入主线特征。
 
@@ -45,30 +45,40 @@ Stage-1 粗检索默认使用 `handcrafted_retrieval_embedding`，由 `anchor_so
 
 ## Router 输入
 
-Router 的目标是用自然语言语义可解释的特征选择专家。默认输入分组：
+Router 的目标是用语义可解释的数值特征选择专家。它分两层：
+
+- 第一层：使用 metadata 中已知的 `chemistry_family` 直接 hard route 到 `LFP`、`NCM` 或 `NCA` branch，不训练 chemistry classifier。
+- 第二层：在对应 chemistry branch 内，对 4 个 residual expert mode 做 soft routing。
+
+第二层 `SemanticHierarchicalRouter` 默认输入分组：
 
 - `soh_state`: `anchor_soh`、`recent_soh_slope`、`recent_soh_curvature`。
 - `qv_polarization`: `delta_v_mean`、`delta_v_std`、`delta_v_q95`、`r_mean`、`r_std`、`r_q95`、Q-V 曲线斜率和平台形态统计。
-- `operation`: 充电倍率、放电倍率、温度统计、`protocol_change_rate`。
-- `chemistry`: 电池化学体系和 domain metadata。
-- `retrieval`: `retrieval_confidence`、top-k 综合距离均值和离散度。
-- `neighbor_vote`: top-k 历史邻居的物理模式投票结果。
+- `partial_charge_shape`: `q_total`、`q_mean`、`q_std`、`dq_dv_peak_value`。
+- `operation_stress`: 电流、温度、CC/CV 时长、throughput/energy 变化和 `protocol_change_rate`。
+- `retrieval`: `retrieval_confidence`、top-k 综合距离均值/标准差、top-1 距离、特征可用率和 chemistry match ratio。
+- `neighbor_vote`: top-k 历史邻居的 semantic mode vote。
 
-Router 输出 `expert_weights`，每个权重对应一个 LSTM 专家。`expert_router_contributions` 会记录每个输入分组对专家 logits 的贡献，便于解释模型决策。
+Router 先构造 `concept_slow_linear`、`concept_accelerating`、`concept_high_polarization`、`concept_curve_polarization`、`concept_high_operation_stress`、`concept_low_retrieval_reliability`，再形成 semantic prior，最后用小校准器做有限修正。`expert_router_contributions` 和 `semantic_explanation_json` 会记录每个输入分组和语义概念对专家选择的影响。
 
 ## Expert Library
 
-默认专家列表定义在 [configs/battery_soh.yaml](/Users/marc/DeepScientist/battery_ts_rag/configs/battery_soh.yaml)：
+默认层次专家库定义在 [configs/battery_soh.yaml](/Users/marc/DeepScientist/battery_ts_rag/configs/battery_soh.yaml)：
+
+第一层 chemistry branches：
 
 - `LFP`
 - `NCM`
 - `NCA`
+
+每个 chemistry branch 下都有 4 个 residual LSTM experts：
+
 - `slow_linear`
 - `accelerating`
 - `high_polarization`
 - `curve_polarization_expert`
 
-不再保留 `shared` 专家。`curve_polarization_expert` 用 Q-V 曲线、`DeltaV(Q)` 和 `R(Q)` 表示极化强度，不依赖充电后静置曲线。
+总计 12 个 experts。所有 experts 都是 residual experts，不输出完整 SOH 预测。不再保留 `shared` 专家。`curve_polarization_expert` 用 Q-V 曲线、`DeltaV(Q)` 和 `R(Q)` 表示极化强度，不依赖充电后静置曲线。
 
 更详细说明见 [EXPERTS.md](/Users/marc/DeepScientist/battery_ts_rag/EXPERTS.md)。
 
@@ -104,16 +114,28 @@ python -m experiments.validate_preprocessing_features --config configs/battery_s
 python -m experiments.validate_retrieval_quality --config configs/battery_soh.yaml --num_queries 100
 ```
 
-训练预测模型：
+Stage A 训练基础模型：
 
 ```bash
 python -m forecasting.train --config configs/battery_soh.yaml
 ```
 
+Stage B 生成按 cell_uid 划分的 OOF baseline：
+
+```bash
+python -m forecasting.generate_baseline_oof --config configs/battery_soh.yaml
+```
+
+Stage C 训练 semantic router 和 residual experts：
+
+```bash
+python -m forecasting.train_residual_experts --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/base_model_best.pt
+```
+
 few-shot 适配：
 
 ```bash
-python -m forecasting.fewshot_adapt --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/best.pt
+python -m forecasting.fewshot_adapt --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/residual_experts_best.pt
 ```
 
 评估：

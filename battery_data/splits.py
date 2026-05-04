@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Iterable, List, Set
 
 import numpy as np
@@ -27,6 +28,8 @@ def build_cell_catalog(
             "voltage_window_bucket": representative.get("voltage_window_bucket"),
             "missing_mask": parse_json_list(representative.get("missing_mask")),
         }
+        chemistry = representative.get("chemistry_family")
+        condition_label = _infer_condition_label(cell, representative)
         rows.append(
             {
                 "cell_uid": representative["cell_uid"],
@@ -34,10 +37,40 @@ def build_cell_catalog(
                 "raw_cell_id": cell.raw_cell_id,
                 "file_path": cell.file_path,
                 "n_cycles": int(len(cell.cycles)),
+                "chemistry_family": chemistry,
+                "condition_label": condition_label,
+                "split_stratum": f"{cell.source_dataset}|{chemistry}|{condition_label}",
                 "domain_label": build_cell_level_domain_label(rep_meta, domain_rules),
             }
         )
     return pd.DataFrame(rows).sort_values(["source_dataset", "raw_cell_id"]).reset_index(drop=True)
+
+
+def _infer_condition_label(cell: CanonicalCell, representative: pd.Series) -> str:
+    """Return a cell-level condition group for stratified few-shot splitting."""
+
+    raw_cell_id = str(cell.raw_cell_id)
+    file_path = Path(str(cell.file_path))
+    if cell.source_dataset == "tju":
+        folder = str(cell.source_info.get("folder") or file_path.parent.name)
+        condition = str(cell.source_info.get("condition_group") or file_path.stem.split("-#")[0])
+        return f"{folder}:{condition}"
+    if cell.source_dataset == "xjtu":
+        condition = raw_cell_id.split("_battery-")[0]
+        batch = str(cell.source_info.get("batch") or file_path.parent.name)
+        return f"{batch}:{condition}"
+    if cell.source_dataset == "hust":
+        return f"hust_group_{raw_cell_id.split('-')[0]}"
+    if cell.source_dataset == "mit":
+        # MIT has many near-singleton exact protocols. Use a coarse condition
+        # bucket for splitting; raw operation traces remain available to RAG.
+        temp = representative.get("temperature_bucket") or "unknown_temp"
+        rate = representative.get("charge_rate_bucket") or "unknown_rate"
+        return f"mit_fastcharge:{temp}:{rate}"
+    policy = representative.get("discharge_policy_family") or "unknown_policy"
+    temp = representative.get("temperature_bucket") or "unknown_temp"
+    rate = representative.get("charge_rate_bucket") or "unknown_rate"
+    return f"{policy}:{temp}:{rate}"
 
 
 def _sample_ids(ids: List[str], count: int, rng: np.random.RandomState) -> Set[str]:
@@ -78,10 +111,71 @@ def build_split_manifest(
     if catalog.empty:
         raise ValueError("No cells were loaded; cannot build split manifest.")
 
+    exclude_chemistry = {str(value) for value in split_cfg.get("exclude_chemistry_families", [])}
+    exclude_path_contains = [str(value) for value in split_cfg.get("exclude_file_path_contains", [])]
+    if exclude_chemistry:
+        catalog = catalog[~catalog["chemistry_family"].astype(str).isin(exclude_chemistry)].copy()
+    for pattern in exclude_path_contains:
+        catalog = catalog[~catalog["file_path"].astype(str).str.contains(pattern, regex=False)].copy()
+    catalog = catalog.reset_index(drop=True)
+    if catalog.empty:
+        raise ValueError("Split filters removed all cells.")
+
     strategy = split_cfg.get("strategy", "dataset-held-out")
     rng = np.random.RandomState(int(split_cfg.get("random_seed", 7)))
     source_val_frac = float(split_cfg.get("source_val_frac", 0.2))
     few_shot_k_cells = int(split_cfg.get("few_shot_k_cells", 0))
+
+    if strategy == "stratified-fewshot-by-condition":
+        manifest = catalog.copy()
+        manifest["split"] = "target_query"
+        assignments: Dict[str, str] = {}
+        min_query = int(split_cfg.get("min_query_cells_per_stratum", 1))
+        for _, group in manifest.groupby("split_stratum", sort=True):
+            ids = group["cell_uid"].tolist()
+            rng.shuffle(ids)
+            n = len(ids)
+            if n >= 20:
+                n_train = int(split_cfg.get("large_train_cells", 4))
+                n_val = int(split_cfg.get("large_val_cells", 2))
+                n_support = int(split_cfg.get("large_support_cells", 2))
+            elif n >= 8:
+                n_train = int(split_cfg.get("medium_train_cells", 2))
+                n_val = int(split_cfg.get("medium_val_cells", 1))
+                n_support = int(split_cfg.get("medium_support_cells", 1))
+            elif n >= 4:
+                n_train = int(split_cfg.get("small_train_cells", 1))
+                n_val = int(split_cfg.get("small_val_cells", 1))
+                n_support = int(split_cfg.get("small_support_cells", 1))
+            elif n == 3:
+                n_train = int(split_cfg.get("tiny_train_cells", 1))
+                n_val = int(split_cfg.get("tiny_val_cells", 0))
+                n_support = int(split_cfg.get("tiny_support_cells", 1))
+            elif n == 2:
+                n_train = int(split_cfg.get("pair_train_cells", 1))
+                n_val = int(split_cfg.get("pair_val_cells", 0))
+                n_support = int(split_cfg.get("pair_support_cells", 0))
+            else:
+                n_train = 0
+                n_val = 0
+                n_support = 0
+            budget = max(0, n - min_query)
+            n_train = min(n_train, budget)
+            budget -= n_train
+            n_val = min(n_val, budget)
+            budget -= n_val
+            n_support = min(n_support, budget)
+            train_ids = ids[:n_train]
+            val_ids = ids[n_train : n_train + n_val]
+            support_ids = ids[n_train + n_val : n_train + n_val + n_support]
+            for cell_uid in train_ids:
+                assignments[cell_uid] = "source_train"
+            for cell_uid in val_ids:
+                assignments[cell_uid] = "source_val"
+            for cell_uid in support_ids:
+                assignments[cell_uid] = "target_support"
+        manifest["split"] = manifest["cell_uid"].map(assignments).fillna("target_query")
+        return manifest.sort_values(["split", "source_dataset", "condition_label", "raw_cell_id"]).reset_index(drop=True)
 
     if strategy == "default-main":
         source_datasets = set(split_cfg.get("source_datasets", ["xjtu", "hust", "tju"]))
