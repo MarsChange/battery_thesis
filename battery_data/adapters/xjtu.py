@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Dict, List
 
@@ -11,6 +12,30 @@ from battery_data.features import bucket_temperature
 from battery_data.schema import CanonicalCell
 
 XJTU_CHEMISTRY_FAMILY = "NCM"
+
+
+def _should_exclude_xjtu_file(path: Path, cfg: Dict[str, object]) -> bool:
+    """Return whether an XJTU cell should be skipped by user-configured rules.
+
+    The XJTU dataset contains several protocol families.  Some downstream SOH
+    forecasting experiments intentionally exclude protocol families whose
+    per-cycle summary capacity is not directly comparable to ordinary full
+    cycling samples.  The rule is explicit in config so the excluded cells are
+    auditable instead of silently disappearing.
+    """
+
+    raw_cell_id = path.stem.replace("_summary", "")
+    path_text = str(path)
+    for token in cfg.get("exclude_file_path_contains", []) or []:
+        if str(token) and str(token) in path_text:
+            return True
+    for prefix in cfg.get("exclude_raw_cell_id_prefixes", []) or []:
+        if raw_cell_id.startswith(str(prefix)):
+            return True
+    for pattern in cfg.get("exclude_raw_cell_id_patterns", []) or []:
+        if fnmatch(raw_cell_id, str(pattern)):
+            return True
+    return False
 
 
 def _infer_xjtu_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object]:
@@ -64,6 +89,7 @@ def _load_xjtu_temperature_frame(summary_path: Path) -> pd.DataFrame | None:
 def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     root = Path(cfg["root"])
     paths = sorted(root.glob("Batch-*/*_summary.csv"))
+    paths = [path for path in paths if not _should_exclude_xjtu_file(path, cfg)]
     max_cells = cfg.get("max_cells")
     if max_cells:
         paths = paths[: int(max_cells)]
@@ -72,11 +98,27 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     for path in paths:
         df = pd.read_csv(path)
         temp_frame = _load_xjtu_temperature_frame(path)
+        charge_capacity = df["charge_capacity_Ah"].astype(float)
+        discharge_capacity = df["discharge_capacity_Ah"].astype(float)
+        finite_initial = discharge_capacity.replace([np.inf, -np.inf], np.nan).dropna()
+        initial_capacity = float(finite_initial.iloc[0]) if not finite_initial.empty else float("nan")
+        if not np.isfinite(initial_capacity) or initial_capacity <= 0:
+            initial_capacity = float("nan")
+        # XJTU's first cycle is an initial-capacity measurement. In the summary
+        # files, the first-cycle charge capacity can be a short pre-test charge
+        # segment, while the first-cycle discharge capacity is the measured
+        # initial capacity. For subsequent full-charge cycles, use charge
+        # capacity as the SOH numerator as requested by the dataset protocol.
+        soh_capacity = charge_capacity.copy()
+        if np.isfinite(initial_capacity) and initial_capacity > 0 and len(soh_capacity) > 0:
+            soh_capacity.iloc[0] = initial_capacity
+        soh = soh_capacity / initial_capacity if np.isfinite(initial_capacity) and initial_capacity > 0 else np.nan
         base = pd.DataFrame(
             {
                 "cycle_idx": df["cycle_index"].astype(int),
                 "timestamp": None,
-                "capacity": df["discharge_capacity_Ah"].astype(float),
+                "capacity": soh_capacity,
+                "soh": soh,
                 "voltage_mean": df[["charge_mean_voltage", "discharge_mean_voltage"]].mean(axis=1),
                 "voltage_max": np.nan,
                 "voltage_min": np.nan,
@@ -103,6 +145,13 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                     base = base.drop(columns=[merged_col])
 
         metadata = _infer_xjtu_metadata(path, cfg)
+        if np.isfinite(initial_capacity) and initial_capacity > 0:
+            # XJTU documentation states that the first cycle measures the
+            # initial capacity.  Use it as the SOH denominator instead of the
+            # generic first-N stable-window median, which is invalid for
+            # partial/satellite protocols.
+            metadata["nominal_capacity_hint"] = initial_capacity
+            metadata["prefer_nominal_capacity_hint"] = True
         if metadata.get("temperature_bucket") is None and base["temp_mean"].notna().any():
             metadata["temperature_bucket"] = bucket_temperature(base["temp_mean"].median())
 

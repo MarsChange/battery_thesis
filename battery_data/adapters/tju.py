@@ -18,6 +18,61 @@ CHEMISTRY_BY_FOLDER = {
 }
 
 
+def _repair_isolated_capacity_outliers(base: pd.DataFrame, cfg: Dict[str, object]) -> pd.DataFrame:
+    """Interpolate isolated gross capacity dropouts in TJU cycle summaries.
+
+    Some TJU raw cycles contain an almost-zero recorded discharge capacity while
+    the adjacent cycles remain near the normal degradation trajectory. Those
+    points are measurement/segmentation dropouts, not physical SOH changes. If
+    left untreated, they become target SOH spikes and are copied by RAG
+    references. This repair only targets gross local outliers and leaves smooth
+    degradation trends unchanged.
+    """
+
+    enabled = bool(cfg.get("tju_repair_soh_outliers", cfg.get("repair_soh_outliers", True)))
+    if not enabled or base.empty or "capacity" not in base.columns:
+        return base
+
+    repaired = base.copy()
+    capacity = pd.to_numeric(repaired["capacity"], errors="coerce").astype(float)
+    if capacity.notna().sum() < 5:
+        return repaired
+
+    window = int(cfg.get("soh_outlier_local_window", cfg.get("capacity_outlier_local_window", 7)))
+    if window < 3:
+        window = 3
+    if window % 2 == 0:
+        window += 1
+    relative_floor = float(cfg.get("soh_outlier_relative_floor", cfg.get("capacity_outlier_relative_floor", 0.60)))
+    min_capacity = float(cfg.get("soh_outlier_min_capacity_ah", cfg.get("capacity_outlier_min_capacity_ah", 1e-4)))
+
+    local_median = capacity.rolling(window=window, center=True, min_periods=max(3, window // 2)).median()
+    global_median = float(capacity[capacity > min_capacity].median()) if (capacity > min_capacity).any() else float("nan")
+    if np.isfinite(global_median):
+        local_median = local_median.fillna(global_median)
+
+    gross_dropout = capacity.le(min_capacity)
+    local_dropout = capacity.lt(local_median * relative_floor) & local_median.gt(min_capacity)
+    outlier_mask = (gross_dropout | local_dropout) & capacity.notna()
+    if not bool(outlier_mask.any()):
+        return repaired
+
+    repaired_capacity = capacity.mask(outlier_mask, np.nan)
+    repaired_capacity = repaired_capacity.interpolate(method="linear", limit_direction="both")
+    repaired["capacity"] = repaired_capacity.astype(float)
+
+    # Keep per-cycle discharge throughput consistent before the adapter turns it
+    # into cumulative throughput below.
+    if "discharge_throughput" in repaired.columns:
+        repaired["discharge_throughput"] = repaired_capacity.astype(float)
+    if "energy_discharge" in repaired.columns:
+        old_capacity = capacity.replace(0.0, np.nan)
+        voltage_proxy = pd.to_numeric(repaired["energy_discharge"], errors="coerce") / old_capacity
+        repaired["energy_discharge"] = repaired_capacity * voltage_proxy.interpolate(method="linear", limit_direction="both")
+
+    return repaired
+
+
 def _parse_rate_token(token: str) -> float | None:
     mapping = {
         "025": 0.25,
@@ -122,6 +177,7 @@ def load_tju_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 }
             )
         base = pd.DataFrame(rows).sort_values("cycle_idx").reset_index(drop=True)
+        base = _repair_isolated_capacity_outliers(base, cfg)
         base["charge_throughput"] = base["charge_throughput"].fillna(0).cumsum()
         base["discharge_throughput"] = base["discharge_throughput"].fillna(0).cumsum()
         metadata.pop("temperature_c", None)

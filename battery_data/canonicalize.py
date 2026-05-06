@@ -34,6 +34,12 @@ from .schema import CANONICAL_COLUMNS, CANONICAL_NUMERIC_COLUMNS, CanonicalCell
 # ---------------------------------------------------------------------------
 
 _CACHE_DIR_NAME = ".canonical_cache"
+_ADAPTER_CACHE_SCHEMA_VERSION = 2
+
+
+def _adapter_cache_config_signature(cfg: Dict[str, object] | None) -> str:
+    payload = json.dumps(cfg or {}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _cache_fingerprint(root: Path, glob_pattern: str) -> str:
@@ -49,6 +55,7 @@ def _cache_fingerprint(root: Path, glob_pattern: str) -> str:
 def _try_load_adapter_cache(
     root: Path,
     dataset_name: str,
+    cfg: Dict[str, object] | None = None,
 ) -> Optional[List[CanonicalCell]]:
     """Return cached CanonicalCells if a valid cache exists, else None."""
     cache_dir = root / _CACHE_DIR_NAME
@@ -68,6 +75,12 @@ def _try_load_adapter_cache(
         with open(meta_path) as f:
             cell_metas = json.load(f)
     except Exception:
+        return None
+
+    expected_signature = _adapter_cache_config_signature(cfg)
+    if any(int(meta.get("adapter_cache_schema_version", -1)) != _ADAPTER_CACHE_SCHEMA_VERSION for meta in cell_metas):
+        return None
+    if any(str(meta.get("adapter_cache_config_signature", "")) != expected_signature for meta in cell_metas):
         return None
 
     cache_keys = [meta.get("cache_cell_key") for meta in cell_metas]
@@ -106,6 +119,7 @@ def _save_adapter_cache(
     root: Path,
     dataset_name: str,
     cells: List[CanonicalCell],
+    cfg: Dict[str, object] | None = None,
 ) -> None:
     """Persist adapter output so next run can skip raw CSV parsing."""
     cache_dir = root / _CACHE_DIR_NAME
@@ -117,6 +131,7 @@ def _save_adapter_cache(
 
     frames = []
     cell_metas = []
+    config_signature = _adapter_cache_config_signature(cfg)
     for cell in cells:
         cache_cell_key = f"{cell.source_dataset}::{cell.raw_cell_id}::{cell.file_path}"
         frame = cell.cycles.copy()
@@ -124,6 +139,8 @@ def _save_adapter_cache(
         frame["_cache_cell_key"] = cache_cell_key
         frames.append(frame)
         cell_metas.append({
+            "adapter_cache_schema_version": _ADAPTER_CACHE_SCHEMA_VERSION,
+            "adapter_cache_config_signature": config_signature,
             "source_dataset": cell.source_dataset,
             "raw_cell_id": cell.raw_cell_id,
             "file_path": cell.file_path,
@@ -171,8 +188,17 @@ def finalize_canonical_cell_frame(
         stable_window=int(cfg.get("nominal_capacity_window", 5)),
     )
     nominal_hint = static_metadata.get("nominal_capacity_hint")
-    if not np.isfinite(nominal_capacity) and nominal_hint is not None:
-        nominal_capacity = float(nominal_hint)
+    prefer_nominal_hint = bool(
+        static_metadata.get("prefer_nominal_capacity_hint", False)
+        or cfg.get("prefer_nominal_capacity_hint", False)
+    )
+    if nominal_hint is not None:
+        try:
+            nominal_hint_value = float(nominal_hint)
+        except (TypeError, ValueError):
+            nominal_hint_value = float("nan")
+        if np.isfinite(nominal_hint_value) and nominal_hint_value > 0 and (prefer_nominal_hint or not np.isfinite(nominal_capacity)):
+            nominal_capacity = nominal_hint_value
 
     if "soh" not in df.columns or df["soh"].isna().all():
         if np.isfinite(nominal_capacity) and nominal_capacity > 0:
@@ -237,7 +263,7 @@ def load_enabled_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
 
         # Try loading from parquet cache first
         if use_cache and root.is_dir():
-            cached = _try_load_adapter_cache(root, dataset_name)
+            cached = _try_load_adapter_cache(root, dataset_name, dataset_cfg)
             if cached is not None:
                 print(f"  [{dataset_name}] Loaded {len(cached)} cells from cache (skipped raw CSV parsing)", flush=True)
                 all_cells.extend(cached)
@@ -251,7 +277,7 @@ def load_enabled_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
 
         # Save cache for next time
         if use_cache and root.is_dir() and cells:
-            _save_adapter_cache(root, dataset_name, cells)
+            _save_adapter_cache(root, dataset_name, cells, dataset_cfg)
             print(f"  [{dataset_name}] Saved adapter cache to {root / _CACHE_DIR_NAME}/", flush=True)
 
         all_cells.extend(cells)

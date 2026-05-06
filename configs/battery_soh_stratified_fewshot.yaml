@@ -5,14 +5,24 @@ cell_uid_prefix: cell
 adapter_cache: true
 nominal_capacity_window: 5
 soh_skip_initial_cycles: 0
+tju_repair_soh_outliers: true
+soh_outlier_local_window: 7
+soh_outlier_relative_floor: 0.60
+soh_outlier_min_capacity_ah: 0.0001
 
 datasets:
   xjtu:
     enabled: true
     root: datasets/xjtu_dataset
+    exclude_raw_cell_id_patterns:
+      - "Sim_satellite_*"
   tju:
     enabled: true
     root: datasets/TJU_dataset
+    tju_repair_soh_outliers: true
+    soh_outlier_local_window: 7
+    soh_outlier_relative_floor: 0.60
+    soh_outlier_min_capacity_ah: 0.0001
     exclude_folders:
       - Dataset_3_NCM_NCA_battery
   hust:
@@ -130,6 +140,14 @@ model:
   top_k_experts: 2
   router_type: semantic_hierarchical
   fusion_router_type: grouped_additive
+  residual_decoder_type: smooth_basis
+  residual_basis_points: 8
+  residual_max_abs: 0.004
+  residual_confidence_floor: 0.35
+  base_trend_blend: 0.60
+  residual_stage_floor: 0.10
+  residual_stage_mid_soh: 0.975
+  residual_stage_sharpness: 70.0
 
 train_base:
   enabled: true
@@ -141,8 +159,8 @@ generate_oof_baseline:
 train_residual_experts:
   enabled: true
   lr: 0.0005
-  epochs: 5
-  patience: 3
+  epochs: 20
+  patience: 6
 
 loss:
   criterion: weighted_mse
@@ -152,7 +170,10 @@ loss:
   residual: 1.0
   route_kl: 0.01
   monotonic: 0.05
-  smoothness: 0.01
+  smoothness: 0.05
+  residual_smoothness: 0.10
+  residual_total_variation: 0.02
+  residual_magnitude: 0.05
   expert_balance: 0.01
   retrieval_consistency: 0.02
   fusion_regularization: 0.0
@@ -162,10 +183,10 @@ train:
   train_splits: ["source_train"]
   val_splits: ["source_val"]
   batch_size: 32
-  epochs: 5
+  epochs: 25
   lr: 0.001
   weight_decay: 0.0001
-  patience: 5
+  patience: 8
   grad_clip_norm: 1.0
   device: mps
   num_workers: 0
@@ -174,8 +195,8 @@ fewshot:
   enabled: true
   support_splits: ["target_support"]
   lr: 0.0003
-  epochs: 5
-  patience: 3
+  epochs: 15
+  patience: 5
 
 experiments:
   feature_validation:

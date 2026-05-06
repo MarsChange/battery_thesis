@@ -21,6 +21,32 @@ from forecasting.model import BatterySOHForecaster
 from forecasting.train import infer_model_init_from_dataset, load_config, move_batch_to_device, resolve_device
 
 
+def _load_compatible_state_dict(model: BatterySOHForecaster, state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
+    """Load matching checkpoint tensors and skip shape-changed residual heads.
+
+    Stage C may intentionally change the residual expert decoder type from a
+    direct horizon-wide head to a smooth basis head. In that case the base
+    encoders, pairwise branch and fusion router should be reused, while the
+    residual expert decoder tensors are freshly initialized.
+    """
+
+    current = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in current and current[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    return {
+        "loaded_tensors": len(compatible),
+        "skipped_tensors": skipped,
+        "missing_tensors": list(missing),
+        "unexpected_tensors": list(unexpected),
+    }
+
+
 def _freeze_for_residual_training(model: BatterySOHForecaster) -> None:
     for param in model.parameters():
         param.requires_grad = False
@@ -41,12 +67,13 @@ def train_residual_experts(cfg: Dict[str, object], checkpoint_path: str | Path |
 
     if checkpoint_path is not None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        model = BatterySOHForecaster(**checkpoint["model_init"])
-        model.load_state_dict(checkpoint["model_state"])
-        model_init = checkpoint["model_init"]
+        model_init = infer_model_init_from_dataset(dataset, cfg)
+        model = BatterySOHForecaster(**model_init)
+        load_report = _load_compatible_state_dict(model, checkpoint["model_state"])
     else:
         model_init = infer_model_init_from_dataset(dataset, cfg)
         model = BatterySOHForecaster(**model_init)
+        load_report = {"loaded_tensors": 0, "skipped_tensors": [], "missing_tensors": [], "unexpected_tensors": []}
 
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))
     model.to(device)
@@ -85,6 +112,7 @@ def train_residual_experts(cfg: Dict[str, object], checkpoint_path: str | Path |
             "config": cfg,
             "epoch": epoch,
             "loss": mean_loss,
+            "base_checkpoint_load_report": load_report,
         }
         torch.save(payload, checkpoint_dir / "residual_experts_last.pt")
         if mean_loss < best_loss:
@@ -101,6 +129,7 @@ def train_residual_experts(cfg: Dict[str, object], checkpoint_path: str | Path |
         "best_checkpoint": str(checkpoint_dir / "residual_experts_best.pt"),
         "last_checkpoint": str(checkpoint_dir / "residual_experts_last.pt"),
         "best_loss": best_loss,
+        "base_checkpoint_load_report": load_report,
     }
 
 

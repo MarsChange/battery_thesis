@@ -64,7 +64,44 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "expert_names": list(model_cfg.get("expert_names", [])),
         "chemistry_families": list(model_cfg.get("chemistry_families", ["LFP", "NCM", "NCA"])),
         "top_k_experts": int(model_cfg.get("top_k_experts", 2)),
+        "residual_decoder_type": str(model_cfg.get("residual_decoder_type", "direct")),
+        "residual_basis_points": int(model_cfg.get("residual_basis_points", 8)),
+        "residual_max_abs": float(model_cfg.get("residual_max_abs", 0.006)),
+        "residual_confidence_floor": float(model_cfg.get("residual_confidence_floor", 0.35)),
+        "base_trend_blend": float(model_cfg.get("base_trend_blend", 0.60)),
+        "residual_stage_floor": float(model_cfg.get("residual_stage_floor", 0.25)),
+        "residual_stage_mid_soh": float(model_cfg.get("residual_stage_mid_soh", 0.98)),
+        "residual_stage_sharpness": float(model_cfg.get("residual_stage_sharpness", 60.0)),
     }
+
+
+MODEL_INIT_CONFIG_OVERRIDE_KEYS = [
+    "residual_decoder_type",
+    "residual_basis_points",
+    "residual_max_abs",
+    "residual_confidence_floor",
+    "base_trend_blend",
+    "residual_stage_floor",
+    "residual_stage_mid_soh",
+    "residual_stage_sharpness",
+]
+
+
+def apply_model_init_config_overrides(model_init: Dict[str, object], cfg: Dict[str, object]) -> Dict[str, object]:
+    """Apply scalar safety/configuration overrides that do not affect tensor shapes.
+
+    Older checkpoints may have been trained before conservative long-horizon
+    residual gates were tightened. These fields are constructor-time scalars,
+    so current config should be allowed to override them at evaluation/adapt
+    time without changing checkpoint tensor compatibility.
+    """
+
+    resolved = dict(model_init)
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    for key in MODEL_INIT_CONFIG_OVERRIDE_KEYS:
+        if key in model_cfg:
+            resolved[key] = model_cfg[key]
+    return resolved
 
 
 def freeze_for_base_training(model: BatterySOHForecaster) -> None:

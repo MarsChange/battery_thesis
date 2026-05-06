@@ -144,12 +144,21 @@ python -m forecasting.fewshot_adapt --config configs/battery_soh.yaml --checkpoi
 python -m forecasting.eval --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/best_adapted.pt --split target_query
 ```
 
+随机片段 SOH 预测实验：
+
+```bash
+python -m experiments.random_segment_soh_prediction --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/best_adapted.pt --source-dataset mit --chemistry LFP --split target_query --history-length 32 --future-length 64
+```
+
+该实验从 MIT/LFP 的目标电池中随机抽取 early、middle、late 三个退化阶段片段。每个片段给定 `N` 个历史 SOH 作为可观测上下文，预测后续 `K` 个 SOH，其中默认 `K >= 2N`。论文叙事应表述为“随机片段的多步 SOH 预测”，而不是完整生命周期预测。
+
 ## 输出路径
 
 - Case-bank artifacts: `output/case_bank/`
 - Feature validation: `output/experiments/feature_validation/<run_id>/`
 - Retrieval validation: `output/experiments/retrieval_validation/<run_id>/`
 - Forecasting checkpoints and evaluation: `output/forecasting/`
+- Random segment prediction: `output/forecasting/figures/random_segments/`
 
 ## 数据泄漏约束
 

@@ -62,6 +62,14 @@ def smoothness_loss(pred_soh: torch.Tensor) -> torch.Tensor:
     return second_diff.abs().mean()
 
 
+def total_variation_loss(sequence: torch.Tensor) -> torch.Tensor:
+    """Mean absolute first difference used to suppress residual sawtooth noise."""
+
+    if sequence.size(1) < 2:
+        return sequence.new_tensor(0.0)
+    return (sequence[:, 1:] - sequence[:, :-1]).abs().mean()
+
+
 def expert_load_balance_loss(expert_weights: torch.Tensor) -> torch.Tensor:
     if expert_weights.numel() == 0:
         return expert_weights.new_tensor(0.0)
@@ -94,6 +102,12 @@ def residual_supervision_loss(
     horizon_end_weight: float = 1.2,
 ) -> torch.Tensor:
     return forecast_loss(moe_residual, residual_target, criterion=criterion, horizon_end_weight=horizon_end_weight)
+
+
+def residual_magnitude_loss(moe_residual: torch.Tensor) -> torch.Tensor:
+    """Keep residual experts as small corrections around the base prediction."""
+
+    return moe_residual.abs().mean()
 
 
 def compute_base_model_loss(
@@ -167,6 +181,9 @@ def compute_residual_expert_loss(
     )
     mono = monotonic_loss(pred_soh, epsilon=float(loss_cfg.get("monotonic_epsilon", 5e-4)))
     smooth = smoothness_loss(pred_soh)
+    residual_smooth = smoothness_loss(outputs["moe_residual"])
+    residual_tv = total_variation_loss(outputs["moe_residual"])
+    residual_mag = residual_magnitude_loss(outputs["moe_residual"])
     expert_balance = expert_load_balance_loss(outputs["expert_weights"])
     route_kl = route_kl_loss(outputs["final_router_prior"], outputs["expert_weights"])
     total = (
@@ -175,6 +192,9 @@ def compute_residual_expert_loss(
         + float(loss_cfg.get("route_kl", loss_cfg.get("route", 0.01))) * route_kl
         + float(loss_cfg.get("monotonic", 0.05)) * mono
         + float(loss_cfg.get("smoothness", 0.01)) * smooth
+        + float(loss_cfg.get("residual_smoothness", 0.0)) * residual_smooth
+        + float(loss_cfg.get("residual_total_variation", 0.0)) * residual_tv
+        + float(loss_cfg.get("residual_magnitude", 0.0)) * residual_mag
         + float(loss_cfg.get("expert_balance", 0.01)) * expert_balance
     )
     return {
@@ -183,6 +203,9 @@ def compute_residual_expert_loss(
         "final_forecast_loss": final_forecast,
         "monotonic_loss": mono,
         "smoothness_loss": smooth,
+        "residual_smoothness_loss": residual_smooth,
+        "residual_total_variation_loss": residual_tv,
+        "residual_magnitude_loss": residual_mag,
         "expert_load_balance_loss": expert_balance,
         "route_kl_loss": route_kl,
     }

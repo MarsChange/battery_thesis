@@ -151,15 +151,40 @@ class ResidualLSTMExpert(nn.Module):
     - residual correction，最终 `pred_delta = base_delta + moe_residual`。
     """
 
-    def __init__(self, expert_seq_dim: int, expert_context_dim: int, horizon: int, future_operation_dim: int, hidden_dim: int, dropout: float):
+    def __init__(
+        self,
+        expert_seq_dim: int,
+        expert_context_dim: int,
+        horizon: int,
+        future_operation_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        residual_decoder_type: str = "direct",
+        residual_basis_points: int = 8,
+    ):
         super().__init__()
         self.horizon = int(horizon)
         self.future_operation_dim = int(future_operation_dim)
+        self.residual_decoder_type = str(residual_decoder_type)
+        self.residual_basis_points = max(2, min(int(residual_basis_points), self.horizon))
         self.input_proj = nn.Linear(expert_seq_dim, hidden_dim)
         self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=1, batch_first=True)
         self.context_proj = nn.Sequential(nn.Linear(expert_context_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout))
         self.future_gru = nn.GRU(future_operation_dim, hidden_dim, batch_first=True) if future_operation_dim > 0 else None
-        self.decoder = MLPHead(hidden_dim * 3 + self.horizon, self.horizon, hidden_dim, dropout)
+        decoder_output_dim = self.residual_basis_points if self.residual_decoder_type == "smooth_basis" else self.horizon
+        self.decoder = MLPHead(hidden_dim * 3 + self.horizon, decoder_output_dim, hidden_dim, dropout)
+
+    def _decode_residual(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        raw = self.decoder(decoder_input)
+        if self.residual_decoder_type != "smooth_basis":
+            return raw
+        if raw.shape[-1] == self.horizon:
+            return raw
+        # Long-horizon residuals should be smooth corrections, not independent
+        # high-frequency point estimates. The expert predicts a small number of
+        # semantic trend control points and linearly interpolates them to the
+        # forecast horizon.
+        return F.interpolate(raw.unsqueeze(1), size=self.horizon, mode="linear", align_corners=True).squeeze(1)
 
     def forward(
         self,
@@ -179,7 +204,7 @@ class ResidualLSTMExpert(nn.Module):
         else:
             future_summary = torch.zeros_like(seq_summary)
         decoder_input = torch.cat([seq_summary, context_summary, future_summary, baseline_delta_detached], dim=-1)
-        return self.decoder(decoder_input)
+        return self._decode_residual(decoder_input)
 
 
 class BatterySOHForecaster(nn.Module):
@@ -202,6 +227,14 @@ class BatterySOHForecaster(nn.Module):
         expert_names: List[str] | None = None,
         chemistry_families: List[str] | None = None,
         top_k_experts: int = 2,
+        residual_decoder_type: str = "direct",
+        residual_basis_points: int = 8,
+        residual_max_abs: float = 0.006,
+        residual_confidence_floor: float = 0.35,
+        base_trend_blend: float = 0.60,
+        residual_stage_floor: float = 0.25,
+        residual_stage_mid_soh: float = 0.98,
+        residual_stage_sharpness: float = 60.0,
     ):
         super().__init__()
         del qv_width
@@ -212,6 +245,14 @@ class BatterySOHForecaster(nn.Module):
         self.future_operation_dim = int(future_operation_dim)
         self.meta_dim = int(meta_dim)
         self.expert_seq_dim = int(expert_seq_dim)
+        self.residual_decoder_type = str(residual_decoder_type)
+        self.residual_basis_points = int(residual_basis_points)
+        self.residual_max_abs = float(residual_max_abs)
+        self.residual_confidence_floor = float(residual_confidence_floor)
+        self.base_trend_blend = float(base_trend_blend)
+        self.residual_stage_floor = float(residual_stage_floor)
+        self.residual_stage_mid_soh = float(residual_stage_mid_soh)
+        self.residual_stage_sharpness = float(residual_stage_sharpness)
         requested_experts = list(expert_names or DEFAULT_EXPERT_NAMES)
         self.expert_names = [name for name in requested_experts if name in SEMANTIC_EXPERT_MODES]
         if not self.expert_names:
@@ -245,6 +286,8 @@ class BatterySOHForecaster(nn.Module):
                             future_operation_dim=self.future_operation_dim,
                             hidden_dim=hidden_dim,
                             dropout=dropout,
+                            residual_decoder_type=self.residual_decoder_type,
+                            residual_basis_points=self.residual_basis_points,
                         )
                         for mode_name in self.expert_names
                     }
@@ -287,6 +330,26 @@ class BatterySOHForecaster(nn.Module):
         slope = seq[:, -1] - seq[:, -2] if seq.size(1) >= 2 else torch.zeros_like(anchor_soh)
         curvature = seq[:, -1] - 2 * seq[:, -2] + seq[:, -3] if seq.size(1) >= 3 else torch.zeros_like(anchor_soh)
         return torch.stack([anchor_soh, slope, curvature], dim=-1)
+
+    def _linear_trend_delta(self, soh_seq: torch.Tensor, horizon: int) -> torch.Tensor:
+        """Deterministic local SOH trend prior from the observed history.
+
+        This is not a separate expert. It is a conservative anchor for the base
+        prediction when retrieved references are weak. The slope is estimated
+        by least squares over the most recent history window to avoid using only
+        one noisy last-cycle difference.
+        """
+
+        seq = soh_seq.squeeze(-1).to(torch.float32)
+        window = min(int(seq.shape[1]), 16)
+        y = seq[:, -window:]
+        x = torch.arange(window, device=seq.device, dtype=seq.dtype)
+        x = x - x.mean()
+        y_centered = y - y.mean(dim=1, keepdim=True)
+        denom = (x.pow(2).sum()).clamp_min(1e-6)
+        slope = (y_centered * x.unsqueeze(0)).sum(dim=1) / denom
+        steps = torch.arange(1, int(horizon) + 1, device=seq.device, dtype=seq.dtype)
+        return slope.unsqueeze(-1) * steps.unsqueeze(0)
 
     def _feature_availability(self, qv_masks: torch.Tensor, physics_mask: torch.Tensor, future_ops_mask: torch.Tensor) -> torch.Tensor:
         return torch.stack(
@@ -482,7 +545,11 @@ class BatterySOHForecaster(nn.Module):
         }
         fusion_out = self.base_fusion_router(base_fusion_inputs)
         base_stack = torch.stack([fm_delta, rag_delta, pair_delta], dim=1)
-        base_delta = torch.sum(base_stack * fusion_out["weights"].unsqueeze(-1), dim=1)
+        base_delta_raw = torch.sum(base_stack * fusion_out["weights"].unsqueeze(-1), dim=1)
+        trend_delta = self._linear_trend_delta(query["soh_seq"].to(torch.float32), self.horizon)
+        trend_blend = float(self.base_trend_blend) * (1.0 - retrieval["retrieval_confidence"].to(torch.float32).clamp(0.0, 1.0))
+        trend_blend = trend_blend.unsqueeze(-1).clamp(0.0, 1.0)
+        base_delta = base_delta_raw * (1.0 - trend_blend) + trend_delta * trend_blend
 
         retrieval_features = torch.stack(
             [
@@ -575,7 +642,22 @@ class BatterySOHForecaster(nn.Module):
         all_expert_outputs = torch.stack(chemistry_outputs, dim=1)
         chemistry_one_hot = F.one_hot(chemistry_ids, num_classes=len(self.chemistry_families)).to(all_expert_outputs.dtype)
         expert_outputs = torch.sum(all_expert_outputs * chemistry_one_hot[:, :, None, None], dim=1)
-        moe_residual = torch.sum(expert_outputs * router_out["weights"].unsqueeze(-1), dim=1)
+        raw_moe_residual = torch.sum(expert_outputs * router_out["weights"].unsqueeze(-1), dim=1)
+        retrieval_residual_gate = retrieval["retrieval_confidence"].to(torch.float32).clamp(0.0, 1.0)
+        retrieval_residual_gate = float(self.residual_confidence_floor) + (1.0 - float(self.residual_confidence_floor)) * retrieval_residual_gate
+        stage_progress_gate = torch.sigmoid((float(self.residual_stage_mid_soh) - anchor_soh.to(torch.float32)) * float(self.residual_stage_sharpness))
+        stage_progress_gate = float(self.residual_stage_floor) + (1.0 - float(self.residual_stage_floor)) * stage_progress_gate
+        residual_gate = (retrieval_residual_gate * stage_progress_gate).clamp(0.0, 1.0)
+        if self.residual_max_abs > 0:
+            # Residual experts are corrective specialists, not a second full
+            # forecaster. Bound their amplitude and shrink it when RAG
+            # confidence is modest so they cannot override the smooth base
+            # trajectory with a large unsupported correction.
+            residual_bound = float(self.residual_max_abs) * residual_gate.unsqueeze(-1)
+            moe_residual = residual_bound * torch.tanh(raw_moe_residual / residual_bound.clamp_min(1e-6))
+        else:
+            residual_bound = torch.full_like(raw_moe_residual, float("inf"))
+            moe_residual = raw_moe_residual
         pred_delta = base_delta + moe_residual
         pred_soh = anchor_soh.unsqueeze(-1) + pred_delta
 
@@ -587,7 +669,15 @@ class BatterySOHForecaster(nn.Module):
             "rag_delta": rag_delta,
             "pair_delta": pair_delta,
             "base_delta": base_delta,
+            "base_delta_raw": base_delta_raw,
+            "trend_delta": trend_delta,
+            "trend_blend": trend_blend.squeeze(-1),
             "moe_residual": moe_residual,
+            "raw_moe_residual": raw_moe_residual,
+            "residual_gate": residual_gate,
+            "residual_retrieval_gate": retrieval_residual_gate,
+            "residual_stage_gate": stage_progress_gate,
+            "residual_bound": residual_bound,
             "pair_residual": pair_residual,
             "retrieval_alpha": retrieval_alpha,
             "retrieval_confidence": retrieval["retrieval_confidence"].to(torch.float32),

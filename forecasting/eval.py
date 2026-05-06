@@ -18,7 +18,7 @@ from forecasting.data import BatterySOHForecastDataset
 from forecasting.metrics import horizon_metrics, regression_metrics
 from forecasting.model import BatterySOHForecaster
 from forecasting.routers import CHEMISTRY_FAMILIES, SEMANTIC_CONCEPT_NAMES
-from forecasting.train import load_config, move_batch_to_device, resolve_device
+from forecasting.train import apply_model_init_config_overrides, load_config, move_batch_to_device, resolve_device
 from forecasting.visualization import plot_group_bar, plot_horizon_error, plot_weight_heatmap
 from retrieval.multistage_retriever import component_matrix_to_named_list
 
@@ -92,7 +92,8 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
     )
     loader = DataLoader(dataset, batch_size=int(cfg.get("train", {}).get("batch_size", 64)), shuffle=False)
 
-    model = BatterySOHForecaster(**checkpoint["model_init"])
+    model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
+    model = BatterySOHForecaster(**model_init)
     model.load_state_dict(checkpoint["model_state"])
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))
     model.to(device)

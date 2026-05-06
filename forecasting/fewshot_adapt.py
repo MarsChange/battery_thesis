@@ -14,9 +14,16 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from forecasting.data import BatterySOHForecastDataset
-from forecasting.losses import expert_load_balance_loss, forecast_loss, monotonic_loss, smoothness_loss
+from forecasting.losses import (
+    expert_load_balance_loss,
+    forecast_loss,
+    monotonic_loss,
+    residual_magnitude_loss,
+    smoothness_loss,
+    total_variation_loss,
+)
 from forecasting.model import BatterySOHForecaster
-from forecasting.train import load_config, move_batch_to_device, resolve_device
+from forecasting.train import apply_model_init_config_overrides, load_config, move_batch_to_device, resolve_device
 
 
 def _freeze_modules(model: BatterySOHForecaster, cfg: Dict[str, object]) -> None:
@@ -29,7 +36,8 @@ def _freeze_modules(model: BatterySOHForecaster, cfg: Dict[str, object]) -> None
 
 def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[str, object]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    model = BatterySOHForecaster(**checkpoint["model_init"])
+    model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
+    model = BatterySOHForecaster(**model_init)
     model.load_state_dict(checkpoint["model_state"])
 
     support_splits = list(cfg.get("fewshot", {}).get("support_splits", ["target_support"]))
@@ -70,6 +78,9 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
                 forecast_loss(outputs["pred_delta"], target_delta, criterion=str(cfg.get("loss", {}).get("criterion", "huber")))
                 + float(cfg.get("loss", {}).get("monotonic", 0.05)) * monotonic_loss(pred_soh, epsilon=float(cfg.get("loss", {}).get("monotonic_epsilon", 5e-4)))
                 + float(cfg.get("loss", {}).get("smoothness", 0.01)) * smoothness_loss(pred_soh)
+                + float(cfg.get("loss", {}).get("residual_smoothness", 0.0)) * smoothness_loss(outputs["moe_residual"])
+                + float(cfg.get("loss", {}).get("residual_total_variation", 0.0)) * total_variation_loss(outputs["moe_residual"])
+                + float(cfg.get("loss", {}).get("residual_magnitude", 0.0)) * residual_magnitude_loss(outputs["moe_residual"])
                 + float(cfg.get("loss", {}).get("expert_balance", 0.01)) * expert_load_balance_loss(outputs["expert_weights"])
             )
             optimizer.zero_grad()
@@ -80,7 +91,7 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
         logs.append({"epoch": epoch, "support_loss": mean_loss})
         checkpoint_payload = {
             "model_state": model.state_dict(),
-            "model_init": checkpoint["model_init"],
+            "model_init": model_init,
             "config": cfg,
             "meta_vocab": checkpoint.get("meta_vocab", dataset.meta_vocab),
             "meta_fields": checkpoint.get("meta_fields", dataset.meta_fields),
