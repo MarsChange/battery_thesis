@@ -235,6 +235,9 @@ class BatterySOHForecaster(nn.Module):
         residual_stage_floor: float = 0.25,
         residual_stage_mid_soh: float = 0.98,
         residual_stage_sharpness: float = 60.0,
+        residual_smoothing_window: int = 7,
+        residual_max_step_abs: float = 3e-4,
+        residual_opposition_scale: float = 0.25,
     ):
         super().__init__()
         del qv_width
@@ -253,6 +256,9 @@ class BatterySOHForecaster(nn.Module):
         self.residual_stage_floor = float(residual_stage_floor)
         self.residual_stage_mid_soh = float(residual_stage_mid_soh)
         self.residual_stage_sharpness = float(residual_stage_sharpness)
+        self.residual_smoothing_window = max(1, int(residual_smoothing_window))
+        self.residual_max_step_abs = float(residual_max_step_abs)
+        self.residual_opposition_scale = float(residual_opposition_scale)
         requested_experts = list(expert_names or DEFAULT_EXPERT_NAMES)
         self.expert_names = [name for name in requested_experts if name in SEMANTIC_EXPERT_MODES]
         if not self.expert_names:
@@ -391,6 +397,54 @@ class BatterySOHForecaster(nn.Module):
             pad = torch.zeros(seq.shape[0], seq.shape[1], self.expert_seq_dim - seq.shape[-1], device=seq.device, dtype=seq.dtype)
             seq = torch.cat([seq, pad], dim=-1)
         return seq[..., : self.expert_seq_dim]
+
+    def _smooth_horizon_sequence(self, values: torch.Tensor, window: int) -> torch.Tensor:
+        """MPS-safe moving average over the forecast horizon.
+
+        Residual experts are low-frequency correction specialists. Smoothing
+        here prevents a residual control point from becoming a visual SOH spike
+        inside the 64-step forecast.
+        """
+
+        if int(window) <= 1 or values.shape[-1] <= 2:
+            return values
+        radius = max(1, int(window) // 2)
+        smoothed = []
+        horizon = int(values.shape[-1])
+        for step_idx in range(horizon):
+            start = max(0, step_idx - radius)
+            end = min(horizon, step_idx + radius + 1)
+            smoothed.append(values[:, start:end].mean(dim=-1))
+        return torch.stack(smoothed, dim=-1)
+
+    def _limit_horizon_step_change(self, values: torch.Tensor, max_step_abs: float) -> torch.Tensor:
+        """Limit residual first differences so residual corrections stay smooth."""
+
+        if float(max_step_abs) <= 0 or values.shape[-1] <= 1:
+            return values
+        first_value = values[:, :1]
+        diffs = (values[:, 1:] - values[:, :-1]).clamp(-float(max_step_abs), float(max_step_abs))
+        return torch.cat([first_value, first_value + torch.cumsum(diffs, dim=-1)], dim=-1)
+
+    def _trend_consistency_gate(
+        self,
+        residual: torch.Tensor,
+        base_delta: torch.Tensor,
+        trend_delta: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shrink residuals that push the forecast away from the local trend.
+
+        The local trend is not a prediction target; it is only a conservative
+        guard. If a residual moves `base_delta` in the opposite direction from
+        `trend_delta - base_delta`, it is treated as weakly supported and
+        damped. This addresses systematic red-vs-blue offsets without using
+        target future SOH.
+        """
+
+        toward_local_trend = trend_delta - base_delta
+        agrees_with_trend = residual * toward_local_trend >= 0
+        damped = residual * float(self.residual_opposition_scale)
+        return torch.where(agrees_with_trend, residual, damped)
 
     def _encode_modalities(
         self,
@@ -658,6 +712,11 @@ class BatterySOHForecaster(nn.Module):
         else:
             residual_bound = torch.full_like(raw_moe_residual, float("inf"))
             moe_residual = raw_moe_residual
+        moe_residual = self._trend_consistency_gate(moe_residual, base_delta, trend_delta)
+        moe_residual = self._smooth_horizon_sequence(moe_residual, self.residual_smoothing_window)
+        moe_residual = self._limit_horizon_step_change(moe_residual, self.residual_max_step_abs)
+        if self.residual_max_abs > 0:
+            moe_residual = moe_residual.clamp(-residual_bound, residual_bound)
         pred_delta = base_delta + moe_residual
         pred_soh = anchor_soh.unsqueeze(-1) + pred_delta
 

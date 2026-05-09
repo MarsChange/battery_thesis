@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import compute_base_model_loss
@@ -72,6 +73,9 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "residual_stage_floor": float(model_cfg.get("residual_stage_floor", 0.25)),
         "residual_stage_mid_soh": float(model_cfg.get("residual_stage_mid_soh", 0.98)),
         "residual_stage_sharpness": float(model_cfg.get("residual_stage_sharpness", 60.0)),
+        "residual_smoothing_window": int(model_cfg.get("residual_smoothing_window", 7)),
+        "residual_max_step_abs": float(model_cfg.get("residual_max_step_abs", 3e-4)),
+        "residual_opposition_scale": float(model_cfg.get("residual_opposition_scale", 0.25)),
     }
 
 
@@ -84,6 +88,9 @@ MODEL_INIT_CONFIG_OVERRIDE_KEYS = [
     "residual_stage_floor",
     "residual_stage_mid_soh",
     "residual_stage_sharpness",
+    "residual_smoothing_window",
+    "residual_max_step_abs",
+    "residual_opposition_scale",
 ]
 
 
@@ -121,6 +128,10 @@ def run_epoch(
     optimizer: AdamW | None,
     loss_cfg: Dict[str, object],
     grad_clip_norm: float = 0.0,
+    epoch: int | None = None,
+    total_epochs: int | None = None,
+    stage: str = "",
+    show_progress: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], List[Dict[str, object]]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -132,8 +143,19 @@ def run_epoch(
     fusion_weights = []
     retrieval_confidence = []
 
+    if epoch is not None and total_epochs is not None:
+        desc = f"Epoch {epoch:03d}/{total_epochs:03d}"
+    elif epoch is not None:
+        desc = f"Epoch {epoch:03d}"
+    else:
+        desc = "Epoch"
+    if stage:
+        desc = f"{desc} {stage}"
+    running_loss = 0.0
+
     with torch.set_grad_enabled(is_train):
-        for batch in loader:
+        progress = tqdm(loader, desc=desc, unit="batch", dynamic_ncols=True, leave=False, disable=not show_progress)
+        for step, batch in enumerate(progress, start=1):
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
             loss_dict = compute_base_model_loss(outputs, batch, loss_cfg)
@@ -144,6 +166,8 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
             loss_accumulator.append({key: float(value.detach().cpu().item()) for key, value in loss_dict.items()})
+            running_loss += loss_accumulator[-1].get("loss", 0.0)
+            progress.set_postfix(loss=f"{running_loss / step:.6f}")
             all_pred.append(outputs["base_delta"].detach().cpu().numpy())
             all_target.append(batch["query"]["target_delta_soh"].detach().cpu().numpy())
             expert_weights.append(outputs["expert_weights"].detach().cpu().numpy())
@@ -224,11 +248,33 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
 
     epochs = int(train_cfg.get("epochs", 100))
+    show_progress = bool(train_cfg.get("show_progress", True))
     for epoch in range(1, epochs + 1):
         model.train(True)
-        train_metrics, _, _ = run_epoch(model, train_loader, device, optimizer, cfg.get("loss", {}), grad_clip_norm=grad_clip_norm)
+        train_metrics, _, _ = run_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer,
+            cfg.get("loss", {}),
+            grad_clip_norm=grad_clip_norm,
+            epoch=epoch,
+            total_epochs=epochs,
+            stage="train",
+            show_progress=show_progress,
+        )
         model.train(False)
-        val_metrics, h_metrics, extras = run_epoch(model, val_loader, device, None, cfg.get("loss", {}))
+        val_metrics, h_metrics, extras = run_epoch(
+            model,
+            val_loader,
+            device,
+            None,
+            cfg.get("loss", {}),
+            epoch=epoch,
+            total_epochs=epochs,
+            stage="val",
+            show_progress=show_progress,
+        )
         if not np.isfinite(val_metrics.get("loss", np.nan)):
             val_metrics = dict(train_metrics)
         extra = extras[0]
@@ -248,6 +294,15 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
             "retrieval_confidence_std": extra["retrieval_confidence_std"],
         }
         history_rows.append(row)
+        if show_progress:
+            tqdm.write(
+                "Epoch "
+                f"{epoch:03d}/{epochs:03d} "
+                f"train_loss={train_metrics['loss']:.6f} "
+                f"val_loss={val_metrics['loss']:.6f} "
+                f"val_mae={val_metrics['mae']:.6f} "
+                f"val_rmse={val_metrics['rmse']:.6f}"
+            )
 
         checkpoint = {
             "model_state": model.state_dict(),

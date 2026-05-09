@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import (
@@ -65,11 +66,22 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
     patience = int(cfg.get("fewshot", {}).get("patience", 10))
     best_epoch = -1
     logs = []
+    epochs = int(cfg.get("fewshot", {}).get("epochs", 50))
+    show_progress = bool(cfg.get("train", {}).get("show_progress", True))
 
-    for epoch in range(1, int(cfg.get("fewshot", {}).get("epochs", 50)) + 1):
+    for epoch in range(1, epochs + 1):
         model.train(True)
         epoch_losses = []
-        for batch in loader:
+        progress = tqdm(
+            loader,
+            desc=f"Few-shot epoch {epoch:03d}/{epochs:03d}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not show_progress,
+        )
+        running_loss = 0.0
+        for step, batch in enumerate(progress, start=1):
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
             target_delta = batch["query"]["target_delta_soh"]
@@ -87,8 +99,12 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
             loss.backward()
             optimizer.step()
             epoch_losses.append(float(loss.detach().cpu().item()))
+            running_loss += epoch_losses[-1]
+            progress.set_postfix(loss=f"{running_loss / step:.6f}")
         mean_loss = float(sum(epoch_losses) / max(len(epoch_losses), 1))
         logs.append({"epoch": epoch, "support_loss": mean_loss})
+        if show_progress:
+            tqdm.write(f"Few-shot epoch {epoch:03d}/{epochs:03d} support_loss={mean_loss:.6f}")
         checkpoint_payload = {
             "model_state": model.state_dict(),
             "model_init": model_init,

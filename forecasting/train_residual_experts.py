@@ -14,6 +14,7 @@ import pandas as pd
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import compute_residual_expert_loss
@@ -92,11 +93,21 @@ def train_residual_experts(cfg: Dict[str, object], checkpoint_path: str | Path |
     logs = []
     patience = int(cfg.get("train_residual_experts", {}).get("patience", 12))
     epochs = int(cfg.get("train_residual_experts", {}).get("epochs", 60))
+    show_progress = bool(cfg.get("train", {}).get("show_progress", True))
 
     for epoch in range(1, epochs + 1):
         model.train(True)
         epoch_losses = []
-        for batch in loader:
+        progress = tqdm(
+            loader,
+            desc=f"Residual experts epoch {epoch:03d}/{epochs:03d}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not show_progress,
+        )
+        running_loss = 0.0
+        for step, batch in enumerate(progress, start=1):
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
             loss_dict = compute_residual_expert_loss(outputs, batch, cfg.get("loss", {}))
@@ -104,8 +115,12 @@ def train_residual_experts(cfg: Dict[str, object], checkpoint_path: str | Path |
             loss_dict["loss"].backward()
             optimizer.step()
             epoch_losses.append(float(loss_dict["loss"].detach().cpu().item()))
+            running_loss += epoch_losses[-1]
+            progress.set_postfix(loss=f"{running_loss / step:.6f}")
         mean_loss = float(sum(epoch_losses) / max(len(epoch_losses), 1))
         logs.append({"epoch": epoch, "loss": mean_loss})
+        if show_progress:
+            tqdm.write(f"Residual experts epoch {epoch:03d}/{epochs:03d} loss={mean_loss:.6f}")
         payload = {
             "model_state": model.state_dict(),
             "model_init": model_init,

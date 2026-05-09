@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import compute_base_model_loss
@@ -33,21 +34,46 @@ def make_cell_uid_folds(case_rows, indices: Iterable[int], num_folds: int) -> Li
     return folds
 
 
-def _train_fold_model(train_subset: Subset, model_init: Dict[str, object], cfg: Dict[str, object], device: str) -> BatterySOHForecaster:
+def _train_fold_model(
+    train_subset: Subset,
+    model_init: Dict[str, object],
+    cfg: Dict[str, object],
+    device: str,
+    *,
+    fold_id: int,
+    num_folds: int,
+) -> BatterySOHForecaster:
     model = BatterySOHForecaster(**model_init).to(device)
     optimizer = AdamW(model.parameters(), lr=float(cfg.get("generate_oof_baseline", {}).get("lr", 5e-4)))
     epochs = int(cfg.get("generate_oof_baseline", {}).get("epochs", 5))
     batch_size = min(int(cfg.get("train", {}).get("batch_size", 64)), max(len(train_subset), 1))
     loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=0)
-    for _ in range(epochs):
+    show_progress = bool(cfg.get("train", {}).get("show_progress", True))
+    for epoch in range(1, epochs + 1):
         model.train(True)
-        for batch in loader:
+        progress = tqdm(
+            loader,
+            desc=f"OOF fold {fold_id + 1:02d}/{num_folds:02d} epoch {epoch:03d}/{epochs:03d}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not show_progress,
+        )
+        running_loss = 0.0
+        for step, batch in enumerate(progress, start=1):
             batch = move_batch_to_device(batch, device)
             outputs = model(batch)
             loss_dict = compute_base_model_loss(outputs, batch, cfg.get("loss", {}))
             optimizer.zero_grad()
             loss_dict["loss"].backward()
             optimizer.step()
+            running_loss += float(loss_dict["loss"].detach().cpu().item())
+            progress.set_postfix(loss=f"{running_loss / step:.6f}")
+        if show_progress:
+            tqdm.write(
+                f"OOF fold {fold_id + 1:02d}/{num_folds:02d} "
+                f"epoch {epoch:03d}/{epochs:03d} loss={running_loss / max(len(loader), 1):.6f}"
+            )
     return model
 
 
@@ -66,7 +92,8 @@ def generate_oof_baseline(cfg: Dict[str, object]) -> Dict[str, object]:
     folds = make_cell_uid_folds(full_rows, dataset.indices.tolist(), int(cfg.get("generate_oof_baseline", {}).get("num_folds", 5)))
     source_train_index_set = set(dataset.indices.tolist())
 
-    for fold_id, heldout_indices in enumerate(folds):
+    show_progress = bool(cfg.get("train", {}).get("show_progress", True))
+    for fold_id, heldout_indices in enumerate(tqdm(folds, desc="OOF folds", unit="fold", disable=not show_progress)):
         heldout_indices = [idx for idx in heldout_indices if idx in source_train_index_set]
         if not heldout_indices:
             continue
@@ -79,6 +106,8 @@ def generate_oof_baseline(cfg: Dict[str, object]) -> Dict[str, object]:
             model_init=model_init,
             cfg=cfg,
             device=device,
+            fold_id=fold_id,
+            num_folds=len(folds),
         )
         model.eval()
         heldout_subset = Subset(dataset, [dataset.query_case_id_to_local[int(dataset.case_rows.iloc[idx]["case_id"])] for idx in heldout_indices])

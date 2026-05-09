@@ -142,12 +142,15 @@ model:
   fusion_router_type: grouped_additive
   residual_decoder_type: smooth_basis
   residual_basis_points: 8
-  residual_max_abs: 0.004
-  residual_confidence_floor: 0.35
+  residual_max_abs: 0.002
+  residual_confidence_floor: 0.20
   base_trend_blend: 0.60
-  residual_stage_floor: 0.10
+  residual_stage_floor: 0.05
   residual_stage_mid_soh: 0.975
   residual_stage_sharpness: 70.0
+  residual_smoothing_window: 9
+  residual_max_step_abs: 0.00025
+  residual_opposition_scale: 0.20
 
 train_base:
   enabled: true
@@ -173,9 +176,9 @@ loss:
   route_kl: 0.01
   monotonic: 0.05
   smoothness: 0.05
-  residual_smoothness: 0.10
-  residual_total_variation: 0.02
-  residual_magnitude: 0.05
+  residual_smoothness: 0.50
+  residual_total_variation: 0.25
+  residual_magnitude: 0.20
   expert_balance: 0.01
   retrieval_consistency: 0.02
   fusion_regularization: 0.0
