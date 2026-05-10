@@ -43,6 +43,7 @@ except Exception:  # pragma: no cover - fallback path is enough for tests withou
 CORE_COMPONENTS = list(CORE_COMPONENT_NAMES)
 COMPONENT_NAMES = list(ALL_COMPONENT_NAMES)
 OPTIONAL_COMPONENTS = list(OPTIONAL_COMPONENT_NAMES)
+RETRIEVAL_CACHE_SCHEMA_VERSION = "retrieval_confidence_reference_quality_v1"
 
 
 def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
@@ -326,6 +327,7 @@ class MultiStageBatteryRetriever:
 
     def retrieval_config_hash(self) -> str:
         payload = {
+            "cache_schema_version": RETRIEVAL_CACHE_SCHEMA_VERSION,
             "retrieval_config_path": str(self.retrieval_config_path),
             "rag_config": self.rag_config,
             "db_splits": self.db_splits,
@@ -345,6 +347,49 @@ class MultiStageBatteryRetriever:
         }
         text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
         return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _reference_quality_payload(
+        neighbor_future_delta_soh: np.ndarray,
+        retrieval_alpha: np.ndarray,
+        retrieval_mask: np.ndarray,
+        neighbor_cell_uids: Sequence[str] | None = None,
+    ) -> Dict[str, float]:
+        """Summarize whether selected top-k reference futures agree.
+
+        Only historical reference labels are used here; the query future target
+        is never accessed. The resulting diagnostics make confidence lower when
+        the top-k references have similar composite distances but disagree about
+        the future delta-SOH trajectory.
+        """
+
+        mask = np.asarray(retrieval_mask, dtype=np.float32) > 0
+        if not np.any(mask):
+            return {"future_delta_dispersion": 0.0, "alpha_entropy": 1.0, "unique_cell_ratio": 0.0}
+        futures = np.asarray(neighbor_future_delta_soh, dtype=np.float32)[mask]
+        alpha = np.asarray(retrieval_alpha, dtype=np.float32)[mask]
+        alpha_sum = float(np.sum(alpha))
+        if alpha_sum <= 0:
+            alpha = np.full(futures.shape[0], 1.0 / max(futures.shape[0], 1), dtype=np.float32)
+        else:
+            alpha = alpha / alpha_sum
+        weighted_mean = np.sum(futures * alpha[:, None], axis=0)
+        weighted_var = np.sum(((futures - weighted_mean[None, :]) ** 2) * alpha[:, None], axis=0)
+        future_delta_dispersion = float(np.sqrt(np.maximum(weighted_var, 0.0)).mean())
+        if alpha.size <= 1:
+            alpha_entropy = 0.0
+        else:
+            alpha_entropy = float(-np.sum(alpha * np.log(np.clip(alpha, 1e-8, 1.0))) / np.log(alpha.size))
+        if neighbor_cell_uids:
+            valid_cells = [str(cell) for idx, cell in enumerate(neighbor_cell_uids) if idx < len(mask) and bool(mask[idx])]
+            unique_cell_ratio = float(len(set(valid_cells)) / max(len(valid_cells), 1))
+        else:
+            unique_cell_ratio = 1.0
+        return {
+            "future_delta_dispersion": future_delta_dispersion,
+            "alpha_entropy": alpha_entropy,
+            "unique_cell_ratio": unique_cell_ratio,
+        }
 
     def _cycle_feature_index(self, name: str) -> int | None:
         names = list(self.feature_names.get("cycle_stats", []))
@@ -1029,6 +1074,14 @@ class MultiStageBatteryRetriever:
             "chemistry_match_rate": float(np.mean(self._row_chemistry[selected_ref_indices[:k]] == self._row_chemistry[query_idx])) if k else 0.0,
             "domain_match_rate": float(np.mean(self._row_domain[selected_ref_indices[:k]] == self._row_domain[query_idx])) if k else 0.0,
         }
+        confidence_payload.update(
+            self._reference_quality_payload(
+                neighbor_future_delta_soh[:k],
+                retrieval_alpha[:k],
+                retrieval_mask[:k],
+                [str(value) for value in self._row_cell_uid[selected_ref_indices[:k]].tolist()],
+            )
+        )
         retrieval_confidence = compute_retrieval_confidence(confidence_payload, self.rag_config) if k else 0.0
         return RetrievalResult(
             query_case_id=int(query_case_id),
@@ -1155,6 +1208,14 @@ class MultiStageBatteryRetriever:
             "chemistry_match_rate": float(selected_frame["chemistry_match"].mean()) if k > 0 else 0.0,
             "domain_match_rate": float(selected_frame["domain_match"].mean()) if k > 0 else 0.0,
         }
+        confidence_payload.update(
+            self._reference_quality_payload(
+                neighbor_future_delta_soh[:k],
+                retrieval_alpha[:k],
+                retrieval_mask[:k],
+                [str(item.get("cell_uid", "")) for item in neighbor_metadata[:k]],
+            )
+        )
         retrieval_confidence = compute_retrieval_confidence(confidence_payload, self.rag_config) if k > 0 else 0.0
 
         explain_json = {
@@ -1162,6 +1223,15 @@ class MultiStageBatteryRetriever:
             "optional_component_names": OPTIONAL_COMPONENTS,
             "enabled_distance_components": self.enabled_component_names,
             "candidate_count_after_filter": int(len(candidate_case_ids)),
+            "reference_quality": {
+                key: float(value)
+                for key, value in self._reference_quality_payload(
+                    neighbor_future_delta_soh[:k],
+                    retrieval_alpha[:k],
+                    retrieval_mask[:k],
+                    [str(item.get("cell_uid", "")) for item in neighbor_metadata[:k]],
+                ).items()
+            },
             "selected_neighbors": [
                 {
                     "case_id": int(neighbor_case_ids[pos]),

@@ -37,7 +37,7 @@ stage1_retrieval:
   top_m: 200
 
 final_topk:
-  top_k: 8
+  top_k: 5
   use_mmr: true
   mmr_lambda: 0.75
   max_neighbors_per_cell: 2

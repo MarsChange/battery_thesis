@@ -73,6 +73,16 @@ concat(last_hidden, context_embedding, future_embedding, baseline_delta_detached
   -> residual_pred
 ```
 
+当前长 horizon 配置中，专家 residual 不是直接逐点覆盖 `base_delta`。为了避免红色预测曲线出现突刺，同时让专家可以修正预测末端的系统性漂移，模型支持 `residual_output_mode: hybrid_rate`：
+
+| component | 含义 | 约束 |
+| --- | --- | --- |
+| `direct_residual_component` | 小幅逐点 residual，用于修正起点附近的局部偏差。 | 由 `residual_max_abs` 和 retrieval/stage gate 限幅，并做 horizon smoothing。 |
+| `terminal_rate_residual_component` | 平滑终端轨迹 residual，用专家预测的末端修正方向构造跨 horizon 的累计修正。 | 由 `residual_terminal_max_abs` 限幅，并按单调 profile 分布到未来 step。 |
+| `moe_residual` | 两个 component 相加后的专家库总修正。 | 最终仍满足 `pred_delta = base_delta + moe_residual`。 |
+
+这样做的动机是：专家库应学习“未来退化轨迹是否比 base 更快/更慢”，而不是为 64 个未来点分别输出互相独立的 SOH residual。`terminal_rate_residual_component` 给专家更大的末端纠偏空间，但通过平滑 profile 和 step-change limit 避免突然上升或锯齿状振荡。
+
 ## expert_seq 特征
 
 `expert_seq` 由 case bank 预处理阶段生成：
@@ -159,6 +169,15 @@ Router 先得到 `semantic_prior`，再结合 top-k 邻居的 `rag_semantic_prio
 | Stage A | general sequence branch、RAG prior branch、pairwise branch、base fusion router | semantic router 和 expert bank | `base_model_best.pt` |
 | Stage B | 按 `cell_uid` 做 OOF baseline 生成 | 不训练模型 | `case_baseline_delta_oof.npy`, `case_residual_target_oof.npy` |
 | Stage C | semantic router 和 chemistry-specific residual LSTM experts | base model 和 retrieval pipeline | `residual_experts_best.pt` |
+
+Stage C 的损失函数除 residual supervision 和 final forecast loss 外，还可以启用：
+
+| loss term | 含义 |
+| --- | --- |
+| `late_forecast` | 加强后段 horizon 的预测误差约束，用于缓解末端漂移。 |
+| `terminal_forecast` | 单独约束最后一个 horizon step。 |
+| `late_residual` | 让专家 residual 在预测后段更接近 OOF residual target。 |
+| `under_degradation` | 小权重惩罚预测 SOH 高于真实 SOH 的情况，避免过度低估退化。 |
 
 评估 CSV 中专家相关字段：
 

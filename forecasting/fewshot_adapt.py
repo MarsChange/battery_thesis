@@ -18,10 +18,13 @@ from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import (
     expert_load_balance_loss,
     forecast_loss,
+    late_horizon_mse_loss,
     monotonic_loss,
     residual_magnitude_loss,
     smoothness_loss,
+    terminal_mse_loss,
     total_variation_loss,
+    under_degradation_loss,
 )
 from forecasting.model import BatterySOHForecaster
 from forecasting.train import apply_model_init_config_overrides, load_config, move_batch_to_device, resolve_device
@@ -86,14 +89,19 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
             outputs = model(batch)
             target_delta = batch["query"]["target_delta_soh"]
             pred_soh = batch["query"]["anchor_soh"].unsqueeze(-1) + outputs["pred_delta"]
+            loss_cfg = cfg.get("loss", {})
+            late_fraction = float(loss_cfg.get("late_horizon_fraction", 0.35))
             loss = (
-                forecast_loss(outputs["pred_delta"], target_delta, criterion=str(cfg.get("loss", {}).get("criterion", "huber")))
-                + float(cfg.get("loss", {}).get("monotonic", 0.05)) * monotonic_loss(pred_soh, epsilon=float(cfg.get("loss", {}).get("monotonic_epsilon", 5e-4)))
-                + float(cfg.get("loss", {}).get("smoothness", 0.01)) * smoothness_loss(pred_soh)
-                + float(cfg.get("loss", {}).get("residual_smoothness", 0.0)) * smoothness_loss(outputs["moe_residual"])
-                + float(cfg.get("loss", {}).get("residual_total_variation", 0.0)) * total_variation_loss(outputs["moe_residual"])
-                + float(cfg.get("loss", {}).get("residual_magnitude", 0.0)) * residual_magnitude_loss(outputs["moe_residual"])
-                + float(cfg.get("loss", {}).get("expert_balance", 0.01)) * expert_load_balance_loss(outputs["expert_weights"])
+                forecast_loss(outputs["pred_delta"], target_delta, criterion=str(loss_cfg.get("criterion", "huber")))
+                + float(loss_cfg.get("late_forecast", 0.0)) * late_horizon_mse_loss(outputs["pred_delta"], target_delta, fraction=late_fraction)
+                + float(loss_cfg.get("terminal_forecast", 0.0)) * terminal_mse_loss(outputs["pred_delta"], target_delta)
+                + float(loss_cfg.get("under_degradation", 0.0)) * under_degradation_loss(outputs["pred_delta"], target_delta, fraction=late_fraction)
+                + float(loss_cfg.get("monotonic", 0.05)) * monotonic_loss(pred_soh, epsilon=float(loss_cfg.get("monotonic_epsilon", 5e-4)))
+                + float(loss_cfg.get("smoothness", 0.01)) * smoothness_loss(pred_soh)
+                + float(loss_cfg.get("residual_smoothness", 0.0)) * smoothness_loss(outputs["moe_residual"])
+                + float(loss_cfg.get("residual_total_variation", 0.0)) * total_variation_loss(outputs["moe_residual"])
+                + float(loss_cfg.get("residual_magnitude", 0.0)) * residual_magnitude_loss(outputs["moe_residual"])
+                + float(loss_cfg.get("expert_balance", 0.01)) * expert_load_balance_loss(outputs["expert_weights"])
             )
             optimizer.zero_grad()
             loss.backward()

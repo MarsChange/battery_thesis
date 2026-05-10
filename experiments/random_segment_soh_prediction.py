@@ -4,8 +4,10 @@ This experiment supports the paper narrative of random-fragment multi-step SOH
 forecasting rather than complete lifecycle prediction. A single MIT/LFP target
 cell is selected, and one segment is sampled from each degradation stage
 (`early`, `middle`, `late`). For each segment, the observed context is `N`
-historical SOH values and the task is to forecast the next `K` SOH values,
-where `K >= 2N` by default.
+historical SOH values and the task is to forecast the next `K` SOH values.
+Earlier long-horizon experiments required `K >= 2N`; that constraint is now an
+explicit command-line option so equal-length settings such as 64->64 can be
+used for controlled comparisons.
 
 The trained forecasting model still consumes the numerical case-bank features
 available in the initial window, including Q-V, partial-charge, physics,
@@ -264,6 +266,18 @@ def _predict_segment(
             pred_delta = _to_numpy(outputs["pred_delta"][0]).reshape(-1)
             base_delta = _to_numpy(outputs["base_delta"][0]).reshape(-1)
             residual = _to_numpy(outputs["moe_residual"][0]).reshape(-1)
+            residual_gate = _to_numpy(outputs.get("residual_gate", torch.ones_like(outputs["retrieval_confidence"]))[0]).reshape(-1)
+            residual_retrieval_gate = _to_numpy(outputs.get("residual_retrieval_gate", torch.ones_like(outputs["retrieval_confidence"]))[0]).reshape(-1)
+            residual_reference_agreement_gate = _to_numpy(
+                outputs.get("residual_reference_agreement_gate", torch.ones_like(outputs["retrieval_confidence"]))[0]
+            ).reshape(-1)
+            reference_future_delta_dispersion = _to_numpy(
+                outputs.get("reference_future_delta_dispersion", torch.zeros_like(outputs["retrieval_confidence"]))[0]
+            ).reshape(-1)
+            residual_stage_gate = _to_numpy(outputs.get("residual_stage_gate", torch.ones_like(outputs["retrieval_confidence"]))[0]).reshape(-1)
+            residual_trend_anchor_cap = _to_numpy(
+                outputs.get("residual_trend_anchor_cap", torch.full_like(outputs["moe_residual"], float("nan")))[0]
+            ).reshape(-1)
             anchor_value = float(current_anchor_soh.detach().cpu().item())
             base_soh = anchor_value + base_delta
             expert_weights = _to_numpy(outputs["expert_weights"][0]).reshape(-1)
@@ -284,6 +298,12 @@ def _predict_segment(
                 "retrieval_confidence": retrieval_confidence,
                 "topk_mean_composite_distance": float(np.mean(valid_dist)) if valid_dist.size else float("nan"),
                 "topk_std_composite_distance": float(np.std(valid_dist)) if valid_dist.size else float("nan"),
+                "residual_gate": float(residual_gate[0]) if residual_gate.size else float("nan"),
+                "residual_retrieval_gate": float(residual_retrieval_gate[0]) if residual_retrieval_gate.size else float("nan"),
+                "residual_reference_agreement_gate": float(residual_reference_agreement_gate[0]) if residual_reference_agreement_gate.size else float("nan"),
+                "reference_future_delta_dispersion": float(reference_future_delta_dispersion[0]) if reference_future_delta_dispersion.size else float("nan"),
+                "residual_stage_gate": float(residual_stage_gate[0]) if residual_stage_gate.size else float("nan"),
+                "residual_trend_anchor_cap_mean": float(np.nanmean(residual_trend_anchor_cap[:step_count])),
                 "base_delta_mean": float(np.mean(base_delta[:step_count])),
                 "residual_mean": float(np.mean(residual[:step_count])),
                 "residual_abs_mean": float(np.mean(np.abs(residual[:step_count]))),
@@ -418,15 +438,237 @@ def _plot_expert_weights(blocks: pd.DataFrame, output_path: Path, expert_names: 
     plt.close(figure)
 
 
+def _collect_retrieval_topk_segments(
+    *,
+    base_batch: Dict[str, Dict[str, torch.Tensor]],
+    initial_case: pd.Series,
+    rows: pd.DataFrame,
+    history_length: int,
+    future_length: int,
+) -> pd.DataFrame:
+    """Collect query and top-k retrieved 32->64 segments in aligned coordinates.
+
+    The y-axis uses delta SOH relative to each segment anchor, so query and
+    retrieved references can be compared in one coordinate system without
+    leaking absolute target-cell identity.
+    """
+
+    query = base_batch["query"]
+    retrieval = base_batch["retrieval"]
+    case_id_to_meta = rows.set_index("case_id", drop=False)
+    records: List[Dict[str, object]] = []
+
+    stage = str(initial_case["sampled_stage"])
+    query_case_id = int(initial_case["case_id"])
+    query_anchor_soh = float(_to_numpy(query["anchor_soh"]).reshape(-1)[0])
+    query_history = _to_numpy(query["soh_seq"][0]).reshape(-1)[-history_length:]
+    query_future_soh = _to_numpy(query["target_soh"][0]).reshape(-1)[:future_length]
+    query_label = f"Query | {initial_case['cell_uid']} | {initial_case['source_dataset']}/{initial_case['chemistry_family']}"
+
+    for pos, soh in enumerate(query_history):
+        rel_step = int(pos - len(query_history) + 1)
+        records.append(
+            {
+                "stage": stage,
+                "query_case_id": query_case_id,
+                "series_role": "query_history",
+                "series_label": query_label,
+                "neighbor_rank": -1,
+                "neighbor_case_id": -1,
+                "relative_step": rel_step,
+                "delta_soh_from_anchor": float(soh - query_anchor_soh),
+                "absolute_soh": float(soh),
+                "anchor_soh": query_anchor_soh,
+                "retrieval_alpha": np.nan,
+                "composite_distance": np.nan,
+                "d_soh_state": np.nan,
+                "d_qv_shape": np.nan,
+                "d_physics": np.nan,
+                "d_metadata": np.nan,
+                "source_dataset": str(initial_case["source_dataset"]),
+                "chemistry_family": str(initial_case["chemistry_family"]),
+                "cell_uid": str(initial_case["cell_uid"]),
+            }
+        )
+    for horizon_idx, soh in enumerate(query_future_soh):
+        records.append(
+            {
+                "stage": stage,
+                "query_case_id": query_case_id,
+                "series_role": "query_future_true",
+                "series_label": query_label,
+                "neighbor_rank": -1,
+                "neighbor_case_id": -1,
+                "relative_step": int(horizon_idx + 1),
+                "delta_soh_from_anchor": float(soh - query_anchor_soh),
+                "absolute_soh": float(soh),
+                "anchor_soh": query_anchor_soh,
+                "retrieval_alpha": np.nan,
+                "composite_distance": np.nan,
+                "d_soh_state": np.nan,
+                "d_qv_shape": np.nan,
+                "d_physics": np.nan,
+                "d_metadata": np.nan,
+                "source_dataset": str(initial_case["source_dataset"]),
+                "chemistry_family": str(initial_case["chemistry_family"]),
+                "cell_uid": str(initial_case["cell_uid"]),
+            }
+        )
+
+    neighbor_case_ids = _to_numpy(retrieval["neighbor_case_ids"][0]).reshape(-1).astype(int)
+    retrieval_mask = _to_numpy(retrieval["retrieval_mask"][0]).reshape(-1)
+    retrieval_alpha = _to_numpy(retrieval["retrieval_alpha"][0]).reshape(-1)
+    composite_distance = _to_numpy(retrieval["composite_distance"][0]).reshape(-1)
+    distance_columns = {
+        "d_soh_state": _to_numpy(retrieval.get("d_soh_state", torch.full_like(retrieval["composite_distance"], np.nan))[0]).reshape(-1),
+        "d_qv_shape": _to_numpy(retrieval.get("d_qv_shape", torch.full_like(retrieval["composite_distance"], np.nan))[0]).reshape(-1),
+        "d_physics": _to_numpy(retrieval.get("d_physics", torch.full_like(retrieval["composite_distance"], np.nan))[0]).reshape(-1),
+        "d_metadata": _to_numpy(retrieval.get("d_metadata", torch.full_like(retrieval["composite_distance"], np.nan))[0]).reshape(-1),
+    }
+    ref_anchor_soh = _to_numpy(retrieval["ref_anchor_soh"][0]).reshape(-1)
+    ref_history = _to_numpy(retrieval["ref_soh_seq"][0]).reshape(len(neighbor_case_ids), -1)
+    ref_future_delta = _to_numpy(retrieval["ref_future_delta_soh"][0]).reshape(len(neighbor_case_ids), -1)
+
+    for rank, neighbor_case_id in enumerate(neighbor_case_ids):
+        if neighbor_case_id < 0 or rank >= len(retrieval_mask) or retrieval_mask[rank] <= 0:
+            continue
+        if neighbor_case_id in case_id_to_meta.index:
+            meta = case_id_to_meta.loc[neighbor_case_id]
+            neighbor_cell = str(meta.get("cell_uid", "unknown"))
+            neighbor_dataset = str(meta.get("source_dataset", "unknown"))
+            neighbor_chemistry = str(meta.get("chemistry_family", "unknown"))
+        else:
+            neighbor_cell = "unknown"
+            neighbor_dataset = "unknown"
+            neighbor_chemistry = "unknown"
+        ref_anchor = float(ref_anchor_soh[rank])
+        ref_label = (
+            f"Top-{rank + 1} | {neighbor_cell} | {neighbor_dataset}/{neighbor_chemistry} "
+            f"| d={float(composite_distance[rank]):.3f} | alpha={float(retrieval_alpha[rank]):.2f}"
+        )
+        history = ref_history[rank, -history_length:]
+        future_delta = ref_future_delta[rank, :future_length]
+        for pos, soh in enumerate(history):
+            records.append(
+                {
+                    "stage": stage,
+                    "query_case_id": query_case_id,
+                    "series_role": "reference_history",
+                    "series_label": ref_label,
+                    "neighbor_rank": int(rank + 1),
+                    "neighbor_case_id": int(neighbor_case_id),
+                    "relative_step": int(pos - len(history) + 1),
+                    "delta_soh_from_anchor": float(soh - ref_anchor),
+                    "absolute_soh": float(soh),
+                    "anchor_soh": ref_anchor,
+                    "retrieval_alpha": float(retrieval_alpha[rank]),
+                    "composite_distance": float(composite_distance[rank]),
+                    **{name: float(values[rank]) for name, values in distance_columns.items()},
+                    "source_dataset": neighbor_dataset,
+                    "chemistry_family": neighbor_chemistry,
+                    "cell_uid": neighbor_cell,
+                }
+            )
+        for horizon_idx, delta in enumerate(future_delta):
+            records.append(
+                {
+                    "stage": stage,
+                    "query_case_id": query_case_id,
+                    "series_role": "reference_future_delta",
+                    "series_label": ref_label,
+                    "neighbor_rank": int(rank + 1),
+                    "neighbor_case_id": int(neighbor_case_id),
+                    "relative_step": int(horizon_idx + 1),
+                    "delta_soh_from_anchor": float(delta),
+                    "absolute_soh": float(ref_anchor + delta),
+                    "anchor_soh": ref_anchor,
+                    "retrieval_alpha": float(retrieval_alpha[rank]),
+                    "composite_distance": float(composite_distance[rank]),
+                    **{name: float(values[rank]) for name, values in distance_columns.items()},
+                    "source_dataset": neighbor_dataset,
+                    "chemistry_family": neighbor_chemistry,
+                    "cell_uid": neighbor_cell,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _plot_retrieval_topk_segments(
+    retrieval_frame: pd.DataFrame,
+    output_path: Path,
+    *,
+    cell_uid: str,
+    source_dataset: str,
+    chemistry: str,
+    history_length: int,
+    future_length: int,
+) -> None:
+    if retrieval_frame.empty:
+        return
+    stages = [stage for stage in ["early", "middle", "late"] if stage in set(retrieval_frame["stage"].astype(str))]
+    if not stages:
+        stages = sorted(retrieval_frame["stage"].astype(str).unique().tolist())
+    figure, axes = plt.subplots(len(stages), 1, figsize=(12.5, 4.2 * len(stages)), dpi=180, sharex=True)
+    if len(stages) == 1:
+        axes = [axes]
+    colors = ["#2563eb", "#16a34a", "#9333ea", "#f59e0b", "#0891b2", "#be123c", "#64748b", "#84cc16"]
+    for axis, stage in zip(axes, stages):
+        sub = retrieval_frame[retrieval_frame["stage"].astype(str) == stage].copy()
+        query_hist = sub[sub["series_role"] == "query_history"].sort_values("relative_step")
+        query_future = sub[sub["series_role"] == "query_future_true"].sort_values("relative_step")
+        axis.plot(
+            query_hist["relative_step"],
+            query_hist["delta_soh_from_anchor"],
+            color="#111827",
+            linewidth=2.6,
+            label=f"Query history (N={history_length})",
+        )
+        axis.plot(
+            query_future["relative_step"],
+            query_future["delta_soh_from_anchor"],
+            color="#111827",
+            linewidth=2.2,
+            alpha=0.75,
+            label=f"Query true future (K={future_length})",
+        )
+        ref_labels = (
+            sub[sub["neighbor_rank"] > 0][["neighbor_rank", "series_label"]]
+            .drop_duplicates()
+            .sort_values("neighbor_rank")
+            .to_records(index=False)
+        )
+        for idx, (rank, label) in enumerate(ref_labels):
+            ref = sub[sub["neighbor_rank"] == int(rank)].sort_values("relative_step")
+            hist = ref[ref["series_role"] == "reference_history"]
+            fut = ref[ref["series_role"] == "reference_future_delta"]
+            color = colors[idx % len(colors)]
+            alpha = max(0.25, 0.82 - 0.06 * idx)
+            axis.plot(hist["relative_step"], hist["delta_soh_from_anchor"], color=color, linestyle="--", linewidth=1.2, alpha=alpha)
+            axis.plot(fut["relative_step"], fut["delta_soh_from_anchor"], color=color, linewidth=1.6, alpha=alpha, label=str(label))
+        axis.axvline(0, color="#475569", linestyle="--", linewidth=1.0, alpha=0.65)
+        axis.axhline(0, color="#94a3b8", linestyle=":", linewidth=0.9, alpha=0.7)
+        axis.set_title(f"{stage} query vs retrieved top-k segments")
+        axis.set_ylabel("Delta SOH from anchor")
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best", fontsize=7)
+    axes[-1].set_xlabel("Relative step: history <= 0, future > 0")
+    figure.suptitle(f"Retrieved reference segments | {cell_uid} | {source_dataset}/{chemistry}", y=1.01)
+    figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+
+
 def _write_summary_md(path: Path, metrics: Mapping[str, object], blocks: pd.DataFrame) -> None:
     lines = [
         "# Random Segment SOH Prediction Summary",
         "",
         "## Task Definition",
         f"- Input: `N={metrics['history_length']}` observed historical SOH values from one random segment.",
-        f"- Output: next `K={metrics['future_length']}` SOH values, with `K >= 2N`.",
+        f"- Output: next `K={metrics['future_length']}` SOH values.",
         "- Target remains `target_delta_soh = future_soh - anchor_soh`; absolute SOH is reconstructed as `pred_soh = anchor_soh + pred_delta_soh`.",
         "- This is a random segment prediction experiment, not complete lifecycle prediction.",
+        "- Retrieval top-k segment figures align query/reference histories and futures by anchor SOH, so the plot compares trajectory shape rather than absolute cell identity.",
         "",
         "## Selected Cell",
         f"- cell_uid: `{metrics['cell_uid']}`",
@@ -487,6 +729,7 @@ def run_experiment(
     sampling_mode: str = "stage",
     num_segments: int = 3,
     seed: int = 7,
+    require_future_at_least_twice_history: bool = False,
 ) -> Dict[str, object]:
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     cfg = load_config(str(config_path))
@@ -501,7 +744,7 @@ def run_experiment(
     case_lookback = int(np.load(case_bank_dir / "case_soh_seq.npy", mmap_mode="r").shape[1])
     selected_history_length = int(history_length or case_lookback)
     selected_future_length = int(future_length or max(2 * selected_history_length, int(np.load(case_bank_dir / "case_future_soh.npy", mmap_mode="r").shape[1])))
-    if selected_future_length < 2 * selected_history_length:
+    if require_future_at_least_twice_history and selected_future_length < 2 * selected_history_length:
         raise ValueError(f"future_length must satisfy K >= 2N; got K={selected_future_length}, N={selected_history_length}.")
     if selected_history_length != case_lookback:
         raise ValueError(f"This trained case bank uses lookback N={case_lookback}; requested history_length={selected_history_length}.")
@@ -553,6 +796,7 @@ def run_experiment(
 
     segment_frames = []
     block_records: List[Dict[str, object]] = []
+    retrieval_segment_frames: List[pd.DataFrame] = []
     for stage, case_row in selected_cases.items():
         case_row = case_row.copy()
         case_row["sampled_stage"] = stage
@@ -560,6 +804,15 @@ def run_experiment(
         if case_id not in dataset.query_case_id_to_local:
             raise ValueError(f"case_id={case_id} is missing from the dataset view for split={split!r}.")
         base_batch = move_batch_to_device(_batchify(dataset[dataset.query_case_id_to_local[case_id]]), device)
+        retrieval_segment_frames.append(
+            _collect_retrieval_topk_segments(
+                base_batch=base_batch,
+                initial_case=case_row,
+                rows=rows,
+                history_length=selected_history_length,
+                future_length=selected_future_length,
+            )
+        )
         observed, predicted, blocks = _predict_segment(
             model=model,
             base_batch=base_batch,
@@ -574,6 +827,11 @@ def run_experiment(
 
     segment_frame = pd.concat(segment_frames, ignore_index=True).sort_values(["stage", "cycle_idx"])
     blocks = pd.DataFrame(block_records)
+    retrieval_segments = (
+        pd.concat(retrieval_segment_frames, ignore_index=True)
+        if retrieval_segment_frames
+        else pd.DataFrame()
+    )
     future = segment_frame[segment_frame["segment_part"] == "future"].copy()
     valid = future[np.isfinite(future["true_soh"].to_numpy(dtype=float))].copy()
     overall = regression_metrics(valid["pred_soh"].to_numpy(dtype=np.float32), valid["true_soh"].to_numpy(dtype=np.float32))
@@ -607,10 +865,12 @@ def run_experiment(
     prefix = f"{safe_cell}_{actual_source_dataset.lower()}_{chemistry.lower()}_{sampling_mode.lower()}_N{selected_history_length}_K{selected_future_length}"
     predictions_csv = output_root / f"{prefix}_segment_predictions.csv"
     blocks_csv = output_root / f"{prefix}_expert_blocks.csv"
+    retrieval_segments_csv = output_root / f"{prefix}_retrieval_topk_segments.csv"
     metrics_json = output_root / f"{prefix}_metrics.json"
     summary_md = output_root / f"{prefix}_summary.md"
     segment_figure = output_root / f"{prefix}_segments.png"
     expert_figure = output_root / f"{prefix}_expert_weights.png"
+    retrieval_figure = output_root / f"{prefix}_retrieval_topk_segments.png"
 
     metadata = {
         "cell_uid": str(selected_cell),
@@ -637,6 +897,7 @@ def run_experiment(
 
     segment_frame.to_csv(predictions_csv, index=False)
     blocks.to_csv(blocks_csv, index=False)
+    retrieval_segments.to_csv(retrieval_segments_csv, index=False)
     metrics_json.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     _plot_segments(
         segment_frame,
@@ -648,15 +909,26 @@ def run_experiment(
         future_length=selected_future_length,
     )
     _plot_expert_weights(blocks, expert_figure, list(model.expert_names))
+    _plot_retrieval_topk_segments(
+        retrieval_segments,
+        retrieval_figure,
+        cell_uid=str(selected_cell),
+        source_dataset=str(actual_source_dataset),
+        chemistry=str(chemistry),
+        history_length=selected_history_length,
+        future_length=selected_future_length,
+    )
     _write_summary_md(summary_md, metadata, blocks)
     return {
         "metrics": metadata,
         "predictions_csv": str(predictions_csv),
         "expert_blocks_csv": str(blocks_csv),
+        "retrieval_topk_segments_csv": str(retrieval_segments_csv),
         "metrics_json": str(metrics_json),
         "summary_md": str(summary_md),
         "segment_figure": str(segment_figure),
         "expert_figure": str(expert_figure),
+        "retrieval_topk_figure": str(retrieval_figure),
     }
 
 
@@ -673,6 +945,11 @@ def main() -> None:
     parser.add_argument("--sampling-mode", choices=["stage", "random"], default="stage")
     parser.add_argument("--num-segments", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--require-future-at-least-twice-history",
+        action="store_true",
+        help="Enforce the earlier long-horizon narrative constraint K >= 2N.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -691,6 +968,7 @@ def main() -> None:
         sampling_mode=args.sampling_mode,
         num_segments=args.num_segments,
         seed=args.seed,
+        require_future_at_least_twice_history=args.require_future_at_least_twice_history,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 

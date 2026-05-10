@@ -110,7 +110,7 @@ retrieval:
   db_splits: ["source_train"]
   metric: cosine
   top_m: 50
-  top_k: 8
+  top_k: 5
   same_cell_policy: exclude
   allow_cross_chemistry: true
   retrieval_temperature: 0.1
@@ -142,8 +142,15 @@ model:
   fusion_router_type: grouped_additive
   residual_decoder_type: smooth_basis
   residual_basis_points: 8
+  residual_output_mode: hybrid_rate
+  residual_direct_fraction: 0.35
+  residual_terminal_max_abs: 0.045
+  residual_terminal_profile_power: 1.35
+  residual_terminal_step_max_abs: 0.001
   residual_max_abs: 0.002
   residual_confidence_floor: 0.20
+  residual_reference_dispersion_scale: 0.004
+  residual_reference_agreement_floor: 0.05
   base_trend_blend: 0.60
   residual_stage_floor: 0.05
   residual_stage_mid_soh: 0.975
@@ -178,7 +185,12 @@ loss:
   smoothness: 0.05
   residual_smoothness: 0.50
   residual_total_variation: 0.25
-  residual_magnitude: 0.20
+  residual_magnitude: 0.05
+  late_horizon_fraction: 0.35
+  late_forecast: 0.40
+  terminal_forecast: 0.30
+  late_residual: 0.25
+  under_degradation: 0.03
   expert_balance: 0.01
   retrieval_consistency: 0.02
   fusion_regularization: 0.0

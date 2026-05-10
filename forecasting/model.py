@@ -229,8 +229,15 @@ class BatterySOHForecaster(nn.Module):
         top_k_experts: int = 2,
         residual_decoder_type: str = "direct",
         residual_basis_points: int = 8,
+        residual_output_mode: str = "direct",
+        residual_direct_fraction: float = 1.0,
+        residual_terminal_max_abs: float = 0.0,
+        residual_terminal_profile_power: float = 1.25,
+        residual_terminal_step_max_abs: float = 0.0,
         residual_max_abs: float = 0.006,
         residual_confidence_floor: float = 0.35,
+        residual_reference_dispersion_scale: float = 0.004,
+        residual_reference_agreement_floor: float = 0.05,
         base_trend_blend: float = 0.60,
         residual_stage_floor: float = 0.25,
         residual_stage_mid_soh: float = 0.98,
@@ -238,6 +245,9 @@ class BatterySOHForecaster(nn.Module):
         residual_smoothing_window: int = 7,
         residual_max_step_abs: float = 3e-4,
         residual_opposition_scale: float = 0.25,
+        residual_trend_cap_fraction: float = 0.0,
+        residual_trend_cap_floor: float = 0.0,
+        residual_deployment_max_abs: float = 0.0,
     ):
         super().__init__()
         del qv_width
@@ -250,8 +260,15 @@ class BatterySOHForecaster(nn.Module):
         self.expert_seq_dim = int(expert_seq_dim)
         self.residual_decoder_type = str(residual_decoder_type)
         self.residual_basis_points = int(residual_basis_points)
+        self.residual_output_mode = str(residual_output_mode)
+        self.residual_direct_fraction = float(residual_direct_fraction)
+        self.residual_terminal_max_abs = float(residual_terminal_max_abs)
+        self.residual_terminal_profile_power = float(residual_terminal_profile_power)
+        self.residual_terminal_step_max_abs = float(residual_terminal_step_max_abs)
         self.residual_max_abs = float(residual_max_abs)
         self.residual_confidence_floor = float(residual_confidence_floor)
+        self.residual_reference_dispersion_scale = float(residual_reference_dispersion_scale)
+        self.residual_reference_agreement_floor = float(residual_reference_agreement_floor)
         self.base_trend_blend = float(base_trend_blend)
         self.residual_stage_floor = float(residual_stage_floor)
         self.residual_stage_mid_soh = float(residual_stage_mid_soh)
@@ -259,6 +276,9 @@ class BatterySOHForecaster(nn.Module):
         self.residual_smoothing_window = max(1, int(residual_smoothing_window))
         self.residual_max_step_abs = float(residual_max_step_abs)
         self.residual_opposition_scale = float(residual_opposition_scale)
+        self.residual_trend_cap_fraction = float(residual_trend_cap_fraction)
+        self.residual_trend_cap_floor = float(residual_trend_cap_floor)
+        self.residual_deployment_max_abs = float(residual_deployment_max_abs)
         requested_experts = list(expert_names or DEFAULT_EXPERT_NAMES)
         self.expert_names = [name for name in requested_experts if name in SEMANTIC_EXPERT_MODES]
         if not self.expert_names:
@@ -426,6 +446,48 @@ class BatterySOHForecaster(nn.Module):
         diffs = (values[:, 1:] - values[:, :-1]).clamp(-float(max_step_abs), float(max_step_abs))
         return torch.cat([first_value, first_value + torch.cumsum(diffs, dim=-1)], dim=-1)
 
+    def _residual_components(
+        self,
+        raw_residual: torch.Tensor,
+        residual_gate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convert expert outputs into safe residual correction components.
+
+        The default direct residual is a small signed correction. For long
+        horizons, the optional hybrid-rate mode adds a smooth terminal
+        trajectory correction: the expert predicts the terminal residual
+        direction, then the correction is distributed monotonically across the
+        horizon. This corrects degradation trajectory shape instead of letting
+        experts emit independent SOH points.
+        """
+
+        if self.residual_max_abs > 0:
+            direct_bound = float(self.residual_max_abs) * residual_gate.unsqueeze(-1)
+            direct_residual = direct_bound * torch.tanh(raw_residual / direct_bound.clamp_min(1e-6))
+        else:
+            direct_bound = torch.full_like(raw_residual, float("inf"))
+            direct_residual = raw_residual
+        mode = self.residual_output_mode.lower()
+        if mode in {"direct", "bounded_direct"} or self.residual_terminal_max_abs <= 0:
+            return direct_residual, torch.zeros_like(direct_residual), direct_bound
+
+        terminal_bound = float(self.residual_terminal_max_abs) * residual_gate
+        terminal_raw = raw_residual[:, -1]
+        terminal_residual = terminal_bound * torch.tanh(terminal_raw / terminal_bound.clamp_min(1e-6))
+        steps = torch.linspace(0.0, 1.0, self.horizon, device=raw_residual.device, dtype=raw_residual.dtype)
+        profile = steps.clamp_min(0.0).pow(max(float(self.residual_terminal_profile_power), 0.1))
+        terminal_component = terminal_residual.unsqueeze(-1) * profile.unsqueeze(0)
+        terminal_component = self._smooth_horizon_sequence(terminal_component, self.residual_smoothing_window)
+        terminal_component = self._limit_horizon_step_change(terminal_component, self.residual_terminal_step_max_abs)
+
+        direct_fraction = max(0.0, min(float(self.residual_direct_fraction), 1.0))
+        if mode in {"terminal_rate", "terminal", "rate"}:
+            direct_residual = torch.zeros_like(direct_residual)
+        else:
+            direct_residual = direct_residual * direct_fraction
+        total_bound = direct_bound * max(direct_fraction, 0.0) + terminal_bound.unsqueeze(-1).abs()
+        return direct_residual, terminal_component, total_bound
+
     def _trend_consistency_gate(
         self,
         residual: torch.Tensor,
@@ -445,6 +507,61 @@ class BatterySOHForecaster(nn.Module):
         agrees_with_trend = residual * toward_local_trend >= 0
         damped = residual * float(self.residual_opposition_scale)
         return torch.where(agrees_with_trend, residual, damped)
+
+    def _trend_anchor_residual_cap(
+        self,
+        residual: torch.Tensor,
+        base_delta: torch.Tensor,
+        trend_delta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cap residuals when the base forecast already matches local SOH trend.
+
+        This is an inference-time safety guard for long-horizon random segment
+        evaluation. It uses only observed-history-derived linear trend and the
+        model's own base prediction. If `base_delta` is already close to the
+        local trend, the residual expert is allowed only a very small correction;
+        if base and local trend disagree, a larger residual correction remains
+        possible. No target future SOH is used.
+        """
+
+        fraction = max(float(self.residual_trend_cap_fraction), 0.0)
+        floor = max(float(self.residual_trend_cap_floor), 0.0)
+        max_abs = max(float(self.residual_deployment_max_abs), 0.0)
+        if fraction <= 0.0 and floor <= 0.0 and max_abs <= 0.0:
+            return residual, torch.full_like(residual, float("inf"))
+
+        trend_gap = (base_delta - trend_delta).abs()
+        cap = floor + fraction * trend_gap
+        if max_abs > 0.0:
+            cap = torch.minimum(cap, torch.full_like(cap, max_abs))
+        cap = cap.clamp_min(0.0)
+        return residual.clamp(-cap, cap), cap
+
+    def _reference_future_agreement_gate(
+        self,
+        ref_future_delta: torch.Tensor,
+        retrieval_alpha: torch.Tensor,
+        retrieval_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gate residual correction by top-k reference trajectory agreement.
+
+        The gate uses only historical reference futures from the numerical case
+        memory. It does not access the query target. If top-k references have
+        similar composite distances but disagree on their future delta-SOH
+        trajectories, the residual expert correction is treated as weakly
+        supported and is damped.
+        """
+
+        mask = retrieval_mask.to(ref_future_delta.dtype).clamp(0.0, 1.0)
+        alpha = retrieval_alpha.to(ref_future_delta.dtype) * mask
+        alpha = alpha / alpha.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        rag_delta = torch.sum(ref_future_delta * alpha.unsqueeze(-1), dim=1)
+        weighted_var = torch.sum((ref_future_delta - rag_delta.unsqueeze(1)).pow(2) * alpha.unsqueeze(-1), dim=1)
+        dispersion = torch.sqrt(weighted_var.clamp_min(0.0)).mean(dim=-1)
+        scale = max(float(self.residual_reference_dispersion_scale), 1e-6)
+        floor = min(max(float(self.residual_reference_agreement_floor), 0.0), 1.0)
+        agreement_gate = floor + (1.0 - floor) * torch.exp(-dispersion / scale)
+        return agreement_gate.clamp(0.0, 1.0), dispersion
 
     def _encode_modalities(
         self,
@@ -699,22 +816,23 @@ class BatterySOHForecaster(nn.Module):
         raw_moe_residual = torch.sum(expert_outputs * router_out["weights"].unsqueeze(-1), dim=1)
         retrieval_residual_gate = retrieval["retrieval_confidence"].to(torch.float32).clamp(0.0, 1.0)
         retrieval_residual_gate = float(self.residual_confidence_floor) + (1.0 - float(self.residual_confidence_floor)) * retrieval_residual_gate
+        reference_agreement_gate, reference_future_dispersion = self._reference_future_agreement_gate(
+            ref_future_delta,
+            retrieval_alpha,
+            retrieval_mask,
+        )
         stage_progress_gate = torch.sigmoid((float(self.residual_stage_mid_soh) - anchor_soh.to(torch.float32)) * float(self.residual_stage_sharpness))
         stage_progress_gate = float(self.residual_stage_floor) + (1.0 - float(self.residual_stage_floor)) * stage_progress_gate
-        residual_gate = (retrieval_residual_gate * stage_progress_gate).clamp(0.0, 1.0)
-        if self.residual_max_abs > 0:
-            # Residual experts are corrective specialists, not a second full
-            # forecaster. Bound their amplitude and shrink it when RAG
-            # confidence is modest so they cannot override the smooth base
-            # trajectory with a large unsupported correction.
-            residual_bound = float(self.residual_max_abs) * residual_gate.unsqueeze(-1)
-            moe_residual = residual_bound * torch.tanh(raw_moe_residual / residual_bound.clamp_min(1e-6))
-        else:
-            residual_bound = torch.full_like(raw_moe_residual, float("inf"))
-            moe_residual = raw_moe_residual
+        residual_gate = (retrieval_residual_gate * reference_agreement_gate * stage_progress_gate).clamp(0.0, 1.0)
+        direct_residual_component, terminal_rate_residual_component, residual_bound = self._residual_components(
+            raw_moe_residual,
+            residual_gate,
+        )
+        moe_residual = direct_residual_component + terminal_rate_residual_component
         moe_residual = self._trend_consistency_gate(moe_residual, base_delta, trend_delta)
         moe_residual = self._smooth_horizon_sequence(moe_residual, self.residual_smoothing_window)
         moe_residual = self._limit_horizon_step_change(moe_residual, self.residual_max_step_abs)
+        moe_residual, residual_trend_anchor_cap = self._trend_anchor_residual_cap(moe_residual, base_delta, trend_delta)
         if self.residual_max_abs > 0:
             moe_residual = moe_residual.clamp(-residual_bound, residual_bound)
         pred_delta = base_delta + moe_residual
@@ -733,10 +851,15 @@ class BatterySOHForecaster(nn.Module):
             "trend_blend": trend_blend.squeeze(-1),
             "moe_residual": moe_residual,
             "raw_moe_residual": raw_moe_residual,
+            "direct_residual_component": direct_residual_component,
+            "terminal_rate_residual_component": terminal_rate_residual_component,
             "residual_gate": residual_gate,
             "residual_retrieval_gate": retrieval_residual_gate,
+            "residual_reference_agreement_gate": reference_agreement_gate,
+            "reference_future_delta_dispersion": reference_future_dispersion,
             "residual_stage_gate": stage_progress_gate,
             "residual_bound": residual_bound,
+            "residual_trend_anchor_cap": residual_trend_anchor_cap,
             "pair_residual": pair_residual,
             "retrieval_alpha": retrieval_alpha,
             "retrieval_confidence": retrieval["retrieval_confidence"].to(torch.float32),

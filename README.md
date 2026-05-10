@@ -24,6 +24,8 @@ pred_soh = anchor_soh + pred_delta_soh
 - `semantic hierarchical router`: 第一层使用已知 `chemistry_family` 做 hard routing，第二层用语义概念先验和小校准器输出 4 个模式专家权重。
 - `residual LSTM experts`: 每个 chemistry branch 下有 4 个 LSTM residual experts，只输出 `moe_residual`，最终 `pred_delta = base_delta + moe_residual`。
 
+长 horizon 配置支持 `residual_output_mode: hybrid_rate`。该模式把专家输出拆成小幅逐点 residual 和平滑终端退化轨迹 residual：前者修正局部偏差，后者用于修正预测末端漂移，并通过平滑 profile、step-change limit 和 residual gate 抑制突然上升或锯齿振荡。
+
 主方法检索和专家输入均不依赖外部序列 embedding。公开数据集中无法稳定提取的充电后静置电压恢复曲线不进入主线特征。
 
 ## RAG 检索特征配置
@@ -151,6 +153,8 @@ python -m experiments.random_segment_soh_prediction --config configs/battery_soh
 ```
 
 该实验从 MIT/LFP 的目标电池中随机抽取 early、middle、late 三个退化阶段片段。每个片段给定 `N` 个历史 SOH 作为可观测上下文，预测后续 `K` 个 SOH，其中默认 `K >= 2N`。论文叙事应表述为“随机片段的多步 SOH 预测”，而不是完整生命周期预测。
+
+随机片段实验还会额外输出 `*_retrieval_topk_segments.png` 和 `*_retrieval_topk_segments.csv`。该图把 query 片段和 RAG top-k reference cases 的历史 32 步、未来 64 步按 anchor SOH 对齐后画在同一坐标系中，用于判断检索参考案例是否在退化轨迹形状上可比。
 
 ## 输出路径
 

@@ -67,8 +67,15 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "top_k_experts": int(model_cfg.get("top_k_experts", 2)),
         "residual_decoder_type": str(model_cfg.get("residual_decoder_type", "direct")),
         "residual_basis_points": int(model_cfg.get("residual_basis_points", 8)),
+        "residual_output_mode": str(model_cfg.get("residual_output_mode", "direct")),
+        "residual_direct_fraction": float(model_cfg.get("residual_direct_fraction", 1.0)),
+        "residual_terminal_max_abs": float(model_cfg.get("residual_terminal_max_abs", 0.0)),
+        "residual_terminal_profile_power": float(model_cfg.get("residual_terminal_profile_power", 1.25)),
+        "residual_terminal_step_max_abs": float(model_cfg.get("residual_terminal_step_max_abs", 0.0)),
         "residual_max_abs": float(model_cfg.get("residual_max_abs", 0.006)),
         "residual_confidence_floor": float(model_cfg.get("residual_confidence_floor", 0.35)),
+        "residual_reference_dispersion_scale": float(model_cfg.get("residual_reference_dispersion_scale", 0.004)),
+        "residual_reference_agreement_floor": float(model_cfg.get("residual_reference_agreement_floor", 0.05)),
         "base_trend_blend": float(model_cfg.get("base_trend_blend", 0.60)),
         "residual_stage_floor": float(model_cfg.get("residual_stage_floor", 0.25)),
         "residual_stage_mid_soh": float(model_cfg.get("residual_stage_mid_soh", 0.98)),
@@ -76,14 +83,24 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "residual_smoothing_window": int(model_cfg.get("residual_smoothing_window", 7)),
         "residual_max_step_abs": float(model_cfg.get("residual_max_step_abs", 3e-4)),
         "residual_opposition_scale": float(model_cfg.get("residual_opposition_scale", 0.25)),
+        "residual_trend_cap_fraction": float(model_cfg.get("residual_trend_cap_fraction", 0.0)),
+        "residual_trend_cap_floor": float(model_cfg.get("residual_trend_cap_floor", 0.0)),
+        "residual_deployment_max_abs": float(model_cfg.get("residual_deployment_max_abs", 0.0)),
     }
 
 
 MODEL_INIT_CONFIG_OVERRIDE_KEYS = [
     "residual_decoder_type",
     "residual_basis_points",
+    "residual_output_mode",
+    "residual_direct_fraction",
+    "residual_terminal_max_abs",
+    "residual_terminal_profile_power",
+    "residual_terminal_step_max_abs",
     "residual_max_abs",
     "residual_confidence_floor",
+    "residual_reference_dispersion_scale",
+    "residual_reference_agreement_floor",
     "base_trend_blend",
     "residual_stage_floor",
     "residual_stage_mid_soh",
@@ -91,6 +108,9 @@ MODEL_INIT_CONFIG_OVERRIDE_KEYS = [
     "residual_smoothing_window",
     "residual_max_step_abs",
     "residual_opposition_scale",
+    "residual_trend_cap_fraction",
+    "residual_trend_cap_floor",
+    "residual_deployment_max_abs",
 ]
 
 

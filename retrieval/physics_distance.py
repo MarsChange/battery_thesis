@@ -345,6 +345,10 @@ def compute_retrieval_confidence(topk_component_distances: Mapping[str, object] 
     composite = composite[np.isfinite(composite)]
     if composite.size == 0:
         return 0.0
+    future_delta_dispersion = _safe_float(payload.get("future_delta_dispersion", np.nan), np.nan)
+    dispersion_scale = _safe_float(payload.get("future_delta_dispersion_scale", 0.015), 0.015)
+    alpha_entropy = _safe_float(payload.get("alpha_entropy", np.nan), np.nan)
+    unique_cell_ratio = _safe_float(payload.get("unique_cell_ratio", np.nan), np.nan)
     scores = [
         float(np.exp(-float(np.mean(composite)))),
         float(np.exp(-float(np.std(composite)))),
@@ -352,6 +356,16 @@ def compute_retrieval_confidence(topk_component_distances: Mapping[str, object] 
         float(np.clip(_safe_float(payload.get("feature_availability_ratio", 1.0), 1.0), 0.0, 1.0)),
         float(np.clip(_safe_float(payload.get("chemistry_match_rate", 0.0), 0.0), 0.0, 1.0)),
     ]
+    if np.isfinite(future_delta_dispersion):
+        scores.append(float(np.exp(-max(future_delta_dispersion, 0.0) / max(dispersion_scale, 1e-6))))
+    if np.isfinite(alpha_entropy):
+        # Normalized entropy close to 1 means all neighbors have similar alpha,
+        # usually indicating no clearly dominant reference case. Keep this as a
+        # soft reliability term rather than a hard penalty because equal alpha is
+        # acceptable when the reference trajectories themselves agree.
+        scores.append(float(np.clip(1.0 - 0.7 * alpha_entropy, 0.0, 1.0)))
+    if np.isfinite(unique_cell_ratio):
+        scores.append(float(np.clip(unique_cell_ratio, 0.0, 1.0)))
     return float(np.clip(float(np.mean(scores)), 0.0, 1.0))
 
 
