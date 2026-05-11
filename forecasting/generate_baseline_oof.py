@@ -16,6 +16,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
+tqdm.monitor_interval = 0
+
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import compute_base_model_loss
 from forecasting.model import BatterySOHForecaster
@@ -44,7 +46,13 @@ def _train_fold_model(
     num_folds: int,
 ) -> BatterySOHForecaster:
     model = BatterySOHForecaster(**model_init).to(device)
-    optimizer = AdamW(model.parameters(), lr=float(cfg.get("generate_oof_baseline", {}).get("lr", 5e-4)))
+    oof_cfg = cfg.get("generate_oof_baseline", {})
+    train_cfg = cfg.get("train", {})
+    optimizer = AdamW(
+        model.parameters(),
+        lr=float(oof_cfg.get("lr", train_cfg.get("lr", 1e-3))),
+        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
+    )
     epochs = int(cfg.get("generate_oof_baseline", {}).get("epochs", 5))
     batch_size = min(int(cfg.get("train", {}).get("batch_size", 64)), max(len(train_subset), 1))
     loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -66,6 +74,9 @@ def _train_fold_model(
             loss_dict = compute_base_model_loss(outputs, batch, cfg.get("loss", {}))
             optimizer.zero_grad()
             loss_dict["loss"].backward()
+            grad_clip_norm = float(train_cfg.get("grad_clip_norm", 0.0) or 0.0)
+            if grad_clip_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
             running_loss += float(loss_dict["loss"].detach().cpu().item())
             progress.set_postfix(loss=f"{running_loss / step:.6f}")
@@ -79,7 +90,11 @@ def _train_fold_model(
 
 def generate_oof_baseline(cfg: Dict[str, object]) -> Dict[str, object]:
     case_bank_dir = Path(cfg.get("output_dir", "output/case_bank"))
-    dataset = BatterySOHForecastDataset(case_bank_dir=case_bank_dir, splits=["source_train"], retrieval_cfg={})
+    dataset = BatterySOHForecastDataset(
+        case_bank_dir=case_bank_dir,
+        splits=["source_train"],
+        retrieval_cfg=dict(cfg.get("retrieval", {})),
+    )
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))
     model_init = infer_model_init_from_dataset(dataset, cfg)
 

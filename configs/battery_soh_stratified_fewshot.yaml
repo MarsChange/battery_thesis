@@ -14,6 +14,10 @@ datasets:
   xjtu:
     enabled: true
     root: datasets/xjtu_dataset
+    exclude_file_path_contains:
+      - Batch-4
+      - Batch-5
+      - Batch-6
     exclude_raw_cell_id_patterns:
       - "Sim_satellite_*"
   tju:
@@ -39,6 +43,9 @@ split:
     - Blend
   exclude_file_path_contains:
     - Dataset_3_NCM_NCA_battery
+    - Batch-4
+    - Batch-5
+    - Batch-6
   min_query_cells_per_stratum: 1
   large_train_cells: 4
   large_val_cells: 2
@@ -133,10 +140,10 @@ model:
     - NCM
     - NCA
   expert_names:
-    - slow_linear
-    - accelerating
-    - high_polarization
-    - curve_polarization_expert
+    - high_temperature_expert
+    - high_current_expert
+    - high_cycle_expert
+    - high_power_expert
   top_k_experts: 2
   router_type: semantic_hierarchical
   fusion_router_type: grouped_additive

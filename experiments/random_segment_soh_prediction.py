@@ -192,16 +192,14 @@ def _sample_stage_cases(
 
 def _semantic_text(concepts: Mapping[str, float]) -> Dict[str, str]:
     text = {}
-    if concepts.get("concept_slow_linear", 0.0) >= 0.55:
-        text["slow_linear"] = "历史 SOH 斜率和曲率较稳定，支持缓慢线性退化模式。"
-    if concepts.get("concept_accelerating", 0.0) >= 0.55:
-        text["accelerating"] = "近期 SOH 趋势存在加速退化证据。"
-    if concepts.get("concept_high_polarization", 0.0) >= 0.55:
-        text["high_polarization"] = "R(Q) proxy 或运行压力较高，支持高极化模式。"
-    if concepts.get("concept_curve_polarization", 0.0) >= 0.55:
-        text["curve_polarization_expert"] = "DeltaV(Q)、曲线斜率或 dq/dv 峰值支持曲线极化模式。"
-    if concepts.get("concept_high_operation_stress", 0.0) >= 0.55:
-        text["operation_stress"] = "电流、温度或协议变化特征显示运行压力较高。"
+    if concepts.get("concept_high_temperature", 0.0) >= 0.55:
+        text["high_temperature_expert"] = "温度均值或最高温度偏高，支持高温因素专家。"
+    if concepts.get("concept_high_current", 0.0) >= 0.55:
+        text["high_current_expert"] = "绝对电流均值或峰值偏高，支持高电流因素专家。"
+    if concepts.get("concept_high_cycle_aging", 0.0) >= 0.55:
+        text["high_cycle_expert"] = "SOH 已进入更深退化区间或循环老化指数较高，支持高循环老化专家。"
+    if concepts.get("concept_high_power", 0.0) >= 0.55:
+        text["high_power_expert"] = "功率/能量吞吐 proxy 偏高，支持高功率因素专家。"
     if concepts.get("concept_low_retrieval_reliability", 0.0) >= 0.55:
         text["retrieval"] = "RAG 检索置信度偏低，top-k 参考案例应谨慎使用。"
     else:
@@ -280,12 +278,17 @@ def _predict_segment(
             ).reshape(-1)
             anchor_value = float(current_anchor_soh.detach().cpu().item())
             base_soh = anchor_value + base_delta
-            expert_weights = _to_numpy(outputs["expert_weights"][0]).reshape(-1)
+            step_count = min(horizon, remaining)
+            expert_weights_by_horizon = _to_numpy(
+                outputs.get("expert_weights_by_horizon", outputs["expert_weights"].unsqueeze(1))[0]
+            )
+            if expert_weights_by_horizon.ndim == 1:
+                expert_weights_by_horizon = np.repeat(expert_weights_by_horizon.reshape(1, -1), horizon, axis=0)
+            expert_weights = expert_weights_by_horizon[:step_count].mean(axis=0)
             concepts = _to_numpy(outputs["semantic_concepts"][0]).reshape(-1)
             retrieval_confidence = float(_to_numpy(outputs["retrieval_confidence"][0]).reshape(-1)[0])
             composite_distance = _to_numpy(batch["retrieval"]["composite_distance"][0]).reshape(-1)
             valid_dist = composite_distance[np.isfinite(composite_distance)]
-            step_count = min(horizon, remaining)
 
             block_record: Dict[str, object] = {
                 "stage": str(initial_case["sampled_stage"]),
@@ -313,6 +316,9 @@ def _predict_segment(
             }
             for pos, name in enumerate(expert_names):
                 block_record[f"expert_weight_{name}"] = float(expert_weights[pos]) if pos < expert_weights.size else float("nan")
+                if pos < expert_weights_by_horizon.shape[-1]:
+                    block_record[f"expert_weight_{name}_first"] = float(expert_weights_by_horizon[0, pos])
+                    block_record[f"expert_weight_{name}_last"] = float(expert_weights_by_horizon[step_count - 1, pos])
             concept_map = {}
             for pos, name in enumerate(SEMANTIC_CONCEPT_NAMES):
                 value = float(concepts[pos]) if pos < concepts.size else float("nan")
@@ -327,8 +333,7 @@ def _predict_segment(
                 prediction = float(pred_soh[horizon_idx])
                 persistence = initial_anchor_soh
                 linear = initial_anchor_soh + initial_slope * float(cycle_idx - initial_anchor_cycle)
-                prediction_records.append(
-                    {
+                step_record = {
                         "cycle_idx": int(cycle_idx),
                         "stage": str(initial_case["sampled_stage"]),
                         "segment_part": "future",
@@ -346,7 +351,10 @@ def _predict_segment(
                         "linear_slope_absolute_error": abs(linear - true_soh) if np.isfinite(true_soh) else np.nan,
                         "horizon_from_segment_start": int(horizon_idx + 1 + block_index * horizon),
                     }
-                )
+                for pos, name in enumerate(expert_names):
+                    if pos < expert_weights_by_horizon.shape[-1]:
+                        step_record[f"expert_weight_{name}"] = float(expert_weights_by_horizon[horizon_idx, pos])
+                prediction_records.append(step_record)
 
             appended = torch.as_tensor(pred_soh[:step_count], dtype=torch.float32, device=device).view(-1, 1)
             current_soh_seq = torch.cat([current_soh_seq, appended], dim=0)[-history_length:]
@@ -399,24 +407,44 @@ def _plot_segments(
     plt.close(figure)
 
 
-def _plot_expert_weights(blocks: pd.DataFrame, output_path: Path, expert_names: List[str]) -> None:
+def _plot_expert_weights(
+    blocks: pd.DataFrame,
+    output_path: Path,
+    expert_names: List[str],
+    segment_frame: pd.DataFrame | None = None,
+) -> None:
     stages = [stage for stage in ["early", "middle", "late"] if stage in set(blocks["stage"].astype(str))]
     if not stages:
         stages = sorted(blocks["stage"].astype(str).unique().tolist())
     colors = {
-        "slow_linear": "#2563eb",
-        "accelerating": "#dc2626",
-        "high_polarization": "#f59e0b",
-        "curve_polarization_expert": "#16a34a",
+        "high_temperature_expert": "#dc2626",
+        "high_current_expert": "#2563eb",
+        "high_cycle_expert": "#16a34a",
+        "high_power_expert": "#f59e0b",
     }
     figure, axes = plt.subplots(len(stages), 1, figsize=(12, 3.6 * len(stages)), dpi=180, sharex=False)
     if len(stages) == 1:
         axes = [axes]
     for axis, stage in zip(axes, stages):
+        if segment_frame is not None and not segment_frame.empty:
+            sub_steps = segment_frame[
+                (segment_frame["stage"].astype(str) == stage)
+                & (segment_frame["segment_part"].astype(str) == "future")
+            ].sort_values("cycle_idx")
+        else:
+            sub_steps = pd.DataFrame()
         sub = blocks[blocks["stage"].astype(str) == stage].sort_values("anchor_cycle_idx")
         for name in expert_names:
             col = f"expert_weight_{name}"
-            if col in sub.columns:
+            if col in sub_steps.columns:
+                axis.plot(
+                    sub_steps["cycle_idx"],
+                    sub_steps[col],
+                    color=colors.get(name),
+                    linewidth=1.7,
+                    label=name,
+                )
+            elif col in sub.columns:
                 axis.plot(
                     sub["anchor_cycle_idx"],
                     sub[col],
@@ -426,8 +454,8 @@ def _plot_expert_weights(blocks: pd.DataFrame, output_path: Path, expert_names: 
                     markersize=4.5,
                     label=name,
                 )
-        axis.set_title(f"{stage} segment expert weights")
-        axis.set_xlabel("Segment forecast anchor cycle")
+        axis.set_title(f"{stage} segment step-wise expert weights")
+        axis.set_xlabel("Forecast cycle index")
         axis.set_ylabel("Expert weight")
         axis.set_ylim(-0.02, 1.02)
         axis.grid(True, alpha=0.25)
@@ -462,6 +490,7 @@ def _collect_retrieval_topk_segments(
     query_case_id = int(initial_case["case_id"])
     query_anchor_soh = float(_to_numpy(query["anchor_soh"]).reshape(-1)[0])
     query_history = _to_numpy(query["soh_seq"][0]).reshape(-1)[-history_length:]
+    query_history_delta = query_history - query_anchor_soh
     query_future_soh = _to_numpy(query["target_soh"][0]).reshape(-1)[:future_length]
     query_label = f"Query | {initial_case['cell_uid']} | {initial_case['source_dataset']}/{initial_case['chemistry_family']}"
 
@@ -485,6 +514,7 @@ def _collect_retrieval_topk_segments(
                 "d_qv_shape": np.nan,
                 "d_physics": np.nan,
                 "d_metadata": np.nan,
+                "history_shape_rmse": np.nan,
                 "source_dataset": str(initial_case["source_dataset"]),
                 "chemistry_family": str(initial_case["chemistry_family"]),
                 "cell_uid": str(initial_case["cell_uid"]),
@@ -509,6 +539,7 @@ def _collect_retrieval_topk_segments(
                 "d_qv_shape": np.nan,
                 "d_physics": np.nan,
                 "d_metadata": np.nan,
+                "history_shape_rmse": np.nan,
                 "source_dataset": str(initial_case["source_dataset"]),
                 "chemistry_family": str(initial_case["chemistry_family"]),
                 "cell_uid": str(initial_case["cell_uid"]),
@@ -542,11 +573,17 @@ def _collect_retrieval_topk_segments(
             neighbor_dataset = "unknown"
             neighbor_chemistry = "unknown"
         ref_anchor = float(ref_anchor_soh[rank])
+        history = ref_history[rank, -history_length:]
+        history_delta = history - ref_anchor
+        if history_delta.shape == query_history_delta.shape:
+            history_shape_rmse = float(np.sqrt(np.mean((history_delta - query_history_delta) ** 2)))
+        else:
+            history_shape_rmse = float("nan")
         ref_label = (
             f"Top-{rank + 1} | {neighbor_cell} | {neighbor_dataset}/{neighbor_chemistry} "
-            f"| d={float(composite_distance[rank]):.3f} | alpha={float(retrieval_alpha[rank]):.2f}"
+            f"| d={float(composite_distance[rank]):.3f} | hRMSE={history_shape_rmse:.4f} "
+            f"| alpha={float(retrieval_alpha[rank]):.2f}"
         )
-        history = ref_history[rank, -history_length:]
         future_delta = ref_future_delta[rank, :future_length]
         for pos, soh in enumerate(history):
             records.append(
@@ -564,6 +601,7 @@ def _collect_retrieval_topk_segments(
                     "retrieval_alpha": float(retrieval_alpha[rank]),
                     "composite_distance": float(composite_distance[rank]),
                     **{name: float(values[rank]) for name, values in distance_columns.items()},
+                    "history_shape_rmse": history_shape_rmse,
                     "source_dataset": neighbor_dataset,
                     "chemistry_family": neighbor_chemistry,
                     "cell_uid": neighbor_cell,
@@ -585,6 +623,7 @@ def _collect_retrieval_topk_segments(
                     "retrieval_alpha": float(retrieval_alpha[rank]),
                     "composite_distance": float(composite_distance[rank]),
                     **{name: float(values[rank]) for name, values in distance_columns.items()},
+                    "history_shape_rmse": history_shape_rmse,
                     "source_dataset": neighbor_dataset,
                     "chemistry_family": neighbor_chemistry,
                     "cell_uid": neighbor_cell,
@@ -782,7 +821,10 @@ def run_experiment(
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
     model = BatterySOHForecaster(**model_init)
-    model.load_state_dict(checkpoint["model_state"])
+    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    critical_missing = [key for key in missing if "horizon_calibrator" not in key]
+    if critical_missing or unexpected:
+        raise RuntimeError(f"Incompatible checkpoint. missing={critical_missing}, unexpected={list(unexpected)}")
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))
     model.to(device)
     model.eval()
@@ -908,7 +950,7 @@ def run_experiment(
         history_length=selected_history_length,
         future_length=selected_future_length,
     )
-    _plot_expert_weights(blocks, expert_figure, list(model.expert_names))
+    _plot_expert_weights(blocks, expert_figure, list(model.expert_names), segment_frame=segment_frame)
     _plot_retrieval_topk_segments(
         retrieval_segments,
         retrieval_figure,

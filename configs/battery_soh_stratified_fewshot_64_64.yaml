@@ -14,6 +14,10 @@ datasets:
   xjtu:
     enabled: true
     root: datasets/xjtu_dataset
+    exclude_file_path_contains:
+      - Batch-4
+      - Batch-5
+      - Batch-6
     exclude_raw_cell_id_patterns:
       - "Sim_satellite_*"
   tju:
@@ -39,6 +43,9 @@ split:
     - Blend
   exclude_file_path_contains:
     - Dataset_3_NCM_NCA_battery
+    - Batch-4
+    - Batch-5
+    - Batch-6
   min_query_cells_per_stratum: 1
   large_train_cells: 4
   large_val_cells: 2
@@ -109,11 +116,11 @@ retrieval:
   retrieval_feature_config_path: configs/retrieval_features.yaml
   db_splits: ["source_train"]
   metric: cosine
-  top_m: 50
+  top_m: 200
   top_k: 5
   same_cell_policy: exclude
   allow_cross_chemistry: true
-  retrieval_temperature: 0.1
+  retrieval_temperature: 0.2
   stage1_embedding: handcrafted
   use_mmr: true
   mmr_lambda: 0.75
@@ -133,10 +140,10 @@ model:
     - NCM
     - NCA
   expert_names:
-    - slow_linear
-    - accelerating
-    - high_polarization
-    - curve_polarization_expert
+    - high_temperature_expert
+    - high_current_expert
+    - high_cycle_expert
+    - high_power_expert
   top_k_experts: 2
   router_type: semantic_hierarchical
   fusion_router_type: grouped_additive
@@ -147,20 +154,22 @@ model:
   residual_terminal_max_abs: 0.045
   residual_terminal_profile_power: 1.35
   residual_terminal_step_max_abs: 0.001
-  residual_max_abs: 0.002
-  residual_confidence_floor: 0.20
+  residual_output_scale: 1.75
+  residual_late_output_scale: 1.40
+  residual_max_abs: 0.0035
+  residual_confidence_floor: 0.35
   residual_reference_dispersion_scale: 0.004
-  residual_reference_agreement_floor: 0.05
+  residual_reference_agreement_floor: 0.12
   base_trend_blend: 0.60
-  residual_stage_floor: 0.05
+  residual_stage_floor: 0.15
   residual_stage_mid_soh: 0.975
   residual_stage_sharpness: 70.0
   residual_smoothing_window: 9
-  residual_max_step_abs: 0.00025
-  residual_opposition_scale: 0.20
-  residual_trend_cap_fraction: 0.25
-  residual_trend_cap_floor: 0.00005
-  residual_deployment_max_abs: 0.002
+  residual_max_step_abs: 0.00035
+  residual_opposition_scale: 0.30
+  residual_trend_cap_fraction: 0.55
+  residual_trend_cap_floor: 0.00012
+  residual_deployment_max_abs: 0.0045
 
 train_base:
   enabled: true
@@ -182,19 +191,21 @@ loss:
   horizon_end_weight: 1.35
   forecast: 1.0
   pairwise: 0.5
-  residual: 1.0
-  route_kl: 0.01
+  residual: 2.0
+  route_kl: 0.03
   monotonic: 0.05
   smoothness: 0.05
-  residual_smoothness: 0.50
-  residual_total_variation: 0.25
-  residual_magnitude: 0.05
+  residual_smoothness: 0.40
+  residual_total_variation: 0.15
+  residual_magnitude: 0.00
   late_horizon_fraction: 0.35
   late_forecast: 0.40
-  terminal_forecast: 0.30
-  late_residual: 0.25
+  terminal_forecast: 0.45
+  late_residual: 0.75
   under_degradation: 0.03
   expert_balance: 0.01
+  horizon_router_diversity: 0.001
+  horizon_router_smoothness: 0.01
   retrieval_consistency: 0.02
   fusion_regularization: 0.0
   monotonic_epsilon: 0.0005

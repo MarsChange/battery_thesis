@@ -1,8 +1,16 @@
 """Physical proxy features for numerical battery SOH forecasting.
 
-The current public datasets in this project do not expose a reliable
-charge-end rest segment. The main physical feature vector combines Q-V polarization proxies from
-`DeltaV(Q)` and `R(Q)` with a small set of partial-charging summaries.
+The current mainline does not use relaxation, internal-resistance proxies, TSFM
+embeddings, or text knowledge. The 12-D vector below is a compact, named
+numeric summary that every supported dataset can either extract directly or
+mark as missing:
+
+- discharge-window Q-V shape: dQ/dV peak, peak voltage, area, capacity span;
+- operation stress: temperature and absolute current summaries;
+- power and cycle-aging proxies.
+
+Function names remain compatible with the older pipeline so existing case-bank,
+dataset, and model code can keep the same array filenames.
 """
 
 from __future__ import annotations
@@ -19,18 +27,18 @@ import pandas as pd
 
 
 PHYSICS_FEATURE_NAMES = [
-    "delta_v_mean",
-    "delta_v_std",
-    "delta_v_q95",
-    "r_mean",
-    "r_std",
-    "r_q95",
-    "vc_curve_slope_mean",
-    "vd_curve_slope_mean",
-    "q_total",
-    "q_mean",
-    "q_std",
-    "dq_dv_peak_value",
+    "qv_dqdv_peak_value",
+    "qv_dqdv_peak_voltage",
+    "qv_dqdv_area",
+    "qv_capacity_span",
+    "temperature_mean",
+    "temperature_std",
+    "temperature_max",
+    "current_abs_mean",
+    "current_abs_std",
+    "current_abs_max",
+    "power_energy_proxy",
+    "cycle_aging_index",
 ]
 
 
@@ -162,29 +170,50 @@ def compute_physics_features(
     partial_charge_curve: np.ndarray,
     partial_charge_mask: bool,
     qv_curve_stats: Dict[str, float],
+    operation_stats: Dict[str, float] | None = None,
+    cycle_context: Dict[str, float] | None = None,
 ) -> Dict[str, object]:
-    """Compute named physical proxy features.
+    """Compute 12 named numeric stress features.
 
-    输出 12 维特征：
-    - 8 维 Q-V 极化 proxy：`delta_v_*`、`r_*` 和充放电曲线斜率；
-    - 4 维 partial-charge summary：`q_total`、`q_mean`、`q_std`、`dq_dv_peak_value`。
+    中文含义：把一个 cycle 的放电 Q-V 窗口形态、温度、电流、功率和循环老化
+    状态汇总为 12 维可解释特征。这里不使用 partial charging 作为主线输入；
+    `partial_charge_curve` 参数只为保持旧接口兼容。
     """
 
     features = np.zeros(len(PHYSICS_FEATURE_NAMES), dtype=np.float32)
     mask = np.zeros(len(PHYSICS_FEATURE_NAMES), dtype=np.float32)
 
-    aliases = {
-        "delta_v_q95": ("delta_v_q95", "delta_v_max"),
-        "vc_curve_slope_mean": ("vc_curve_slope_mean", "vc_slope_mean"),
-        "vd_curve_slope_mean": ("vd_curve_slope_mean", "vd_slope_mean"),
+    operation_stats = operation_stats or {}
+    cycle_context = cycle_context or {}
+    sources = {
+        "qv_dqdv_peak_value": qv_curve_stats,
+        "qv_dqdv_peak_voltage": qv_curve_stats,
+        "qv_dqdv_area": qv_curve_stats,
+        "qv_capacity_span": qv_curve_stats,
+        "temperature_mean": operation_stats,
+        "temperature_std": operation_stats,
+        "temperature_max": operation_stats,
+        "current_abs_mean": operation_stats,
+        "current_abs_std": operation_stats,
+        "current_abs_max": operation_stats,
+        "power_energy_proxy": {**qv_curve_stats, **operation_stats},
+        "cycle_aging_index": cycle_context,
     }
-    for idx, name in enumerate(PHYSICS_FEATURE_NAMES[:8]):
+    aliases = {
+        "qv_dqdv_peak_value": ("qv_dqdv_peak_value", "dq_dv_peak_value"),
+        "qv_dqdv_peak_voltage": ("qv_dqdv_peak_voltage", "dq_dv_peak_position"),
+        "qv_dqdv_area": ("qv_dqdv_area",),
+        "qv_capacity_span": ("qv_capacity_span", "q_total"),
+        "power_energy_proxy": ("power_energy_proxy", "qv_power_energy_proxy", "energy_charge_delta_1", "energy_discharge_delta_1"),
+    }
+    for idx, name in enumerate(PHYSICS_FEATURE_NAMES):
+        source = sources.get(name, {})
         keys = aliases.get(name, (name,))
         value = 0.0
         present = False
         for key in keys:
-            if key in qv_curve_stats:
-                value = qv_curve_stats[key]
+            if key in source:
+                value = source[key]
                 present = True
                 break
         try:
@@ -194,14 +223,6 @@ def compute_physics_features(
         if present and np.isfinite(value):
             features[idx] = np.float32(value)
             mask[idx] = 1.0
-
-    partial_charge_curve = np.asarray(partial_charge_curve, dtype=np.float32)
-    if bool(partial_charge_mask) and partial_charge_curve.size >= 4:
-        q = partial_charge_curve.astype(np.float32)
-        dq = np.gradient(q)
-        peak_idx = int(np.argmax(dq))
-        features[8:] = np.asarray([float(q[-1]), float(q.mean()), float(q.std()), float(dq[peak_idx])], dtype=np.float32)
-        mask[8:] = 1.0
 
     return {
         "physics_features": features,

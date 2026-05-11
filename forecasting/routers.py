@@ -19,17 +19,16 @@ from torch import nn
 
 CHEMISTRY_FAMILIES = ["LFP", "NCM", "NCA"]
 SEMANTIC_EXPERT_MODES = [
-    "slow_linear",
-    "accelerating",
-    "high_polarization",
-    "curve_polarization_expert",
+    "high_temperature_expert",
+    "high_current_expert",
+    "high_cycle_expert",
+    "high_power_expert",
 ]
 SEMANTIC_CONCEPT_NAMES = [
-    "concept_slow_linear",
-    "concept_accelerating",
-    "concept_high_polarization",
-    "concept_curve_polarization",
-    "concept_high_operation_stress",
+    "concept_high_temperature",
+    "concept_high_current",
+    "concept_high_cycle_aging",
+    "concept_high_power",
     "concept_low_retrieval_reliability",
 ]
 
@@ -99,8 +98,8 @@ class PhysicalDegradationRouter(GroupedAdditiveRouter):
 
     GROUP_DESCRIPTIONS = {
         "soh_state": "anchor_soh、recent_soh_slope、recent_soh_curvature，用于判断相对退化状态和趋势。",
-        "qv_polarization": "DeltaV(Q) 与 R(Q) 统计 proxy，用于表示极化和内阻相关状态。",
-        "operation": "充放电倍率、温度统计和 protocol_change_rate，用于表示运行压力。",
+        "qv_polarization": "放电 Q-V 窗口 dQ/dV 峰值、峰值电压、面积和容量跨度。",
+        "operation": "温度、电流、功率/能量 proxy 和容量变化统计，用于表示运行压力。",
         "chemistry": "电池 chemistry metadata embedding，用于材料体系上下文。",
         "retrieval": "RAG confidence、top-k 距离统计和参考适配度，用于判断历史案例是否可靠。",
         "neighbor_vote": "top-k 邻居物理模式投票，用于把检索邻居的模式信息传给专家路由。",
@@ -149,46 +148,48 @@ class SemanticConceptExtractor(nn.Module):
         retrieval: torch.Tensor,
     ) -> torch.Tensor:
         soh_state = torch.nan_to_num(_pad_or_trim(soh_state.to(torch.float32), 3))
-        qv = torch.nan_to_num(_pad_or_trim(qv_polarization.to(torch.float32), 8))
-        partial = torch.nan_to_num(_pad_or_trim(partial_charge_shape.to(torch.float32), 4))
+        qv = torch.nan_to_num(_pad_or_trim(qv_polarization.to(torch.float32), 12))
         operation = torch.nan_to_num(operation_stress.to(torch.float32))
         retrieval = torch.nan_to_num(_pad_or_trim(retrieval.to(torch.float32), 6))
 
-        slope = soh_state[:, 1]
-        curvature = soh_state[:, 2]
-        neg_slope = torch.sigmoid(-250.0 * slope)
-        neg_curvature = torch.sigmoid(-1000.0 * curvature)
-        stable_slope = torch.exp(-250.0 * slope.abs().clamp_max(0.05))
-        stable_curvature = torch.exp(-1000.0 * curvature.abs().clamp_max(0.02))
+        anchor_soh = soh_state[:, 0].clamp(0.0, 1.2)
+        if operation.shape[-1] >= 24:
+            hist_mean = operation[:, :8]
+            hist_std = operation[:, 8:16]
+            future_mean = operation[:, 16:24]
+        else:
+            hist_mean = _pad_or_trim(operation, 8)
+            hist_std = torch.zeros_like(hist_mean)
+            future_mean = torch.zeros_like(hist_mean)
 
-        delta_v_std = qv[:, 1].abs()
-        delta_v_q95 = qv[:, 2].abs()
-        r_mean = qv[:, 3].abs()
-        r_std = qv[:, 4].abs()
-        r_q95 = qv[:, 5].abs()
-        vc_slope = qv[:, 6].abs()
-        vd_slope = qv[:, 7].abs()
-        dq_dv_peak = partial[:, 3].abs()
+        # Feature indices follow DEFAULT_OPERATION_FEATURES:
+        # current_abs_mean/std/max, temp_mean/std/max, energy_charge_delta_1,
+        # energy_discharge_delta_1.
+        current_level = torch.maximum(hist_mean[:, 0].abs(), hist_mean[:, 2].abs())
+        current_level = torch.maximum(current_level, qv[:, 9].abs() if qv.shape[-1] > 9 else qv[:, 7].abs())
+        temp_level = torch.maximum(hist_mean[:, 3], hist_mean[:, 5])
+        temp_level = torch.maximum(temp_level, qv[:, 6] if qv.shape[-1] > 6 else qv[:, 4])
+        energy_level = hist_mean[:, 6].abs() + hist_mean[:, 7].abs()
+        energy_level = torch.maximum(energy_level, qv[:, 10].abs() if qv.shape[-1] > 10 else torch.zeros_like(energy_level))
 
-        operation_level = operation.abs().mean(dim=-1)
-        operation_volatility = operation.std(dim=-1, unbiased=False) if operation.shape[-1] > 1 else torch.zeros_like(operation_level)
-        operation_stress_score = torch.sigmoid(0.6 * operation_level + 0.4 * operation_volatility)
+        has_temperature = temp_level.abs() > 1e-3
+        has_current = current_level.abs() > 1e-6
+        has_power = energy_level.abs() > 1e-8
+
+        high_temperature = torch.where(has_temperature, torch.sigmoid((temp_level - 35.0) / 5.0), torch.zeros_like(temp_level))
+        high_current = torch.where(has_current, torch.sigmoid((current_level - 2.0) / 0.75), torch.zeros_like(current_level))
+        cycle_aging = torch.sigmoid((0.90 - anchor_soh) * 35.0 + qv[:, 11].clamp(0.0, 1.5) - 0.5)
+        high_power = torch.where(has_power, torch.sigmoid((torch.log1p(energy_level.abs()) - 1.0) / 0.75), torch.zeros_like(energy_level))
 
         retrieval_confidence = retrieval[:, 0].clamp(0.0, 1.0)
         low_retrieval_reliability = (1.0 - retrieval_confidence).clamp(0.0, 1.0)
 
-        slow_linear = (stable_slope * stable_curvature * torch.exp(-operation_stress_score)).clamp(0.0, 1.0)
-        accelerating = torch.sigmoid(2.0 * neg_slope + 2.0 * neg_curvature + operation_volatility - 2.5)
-        high_polarization = torch.sigmoid(1.2 * r_mean + 1.0 * r_std + 1.4 * r_q95 + 0.3 * operation_stress_score - 1.0)
-        curve_polarization = torch.sigmoid(1.0 * delta_v_std + 1.2 * delta_v_q95 + 0.5 * vc_slope + 0.7 * vd_slope + 0.8 * dq_dv_peak - 1.0)
-
         concepts = torch.stack(
             [
-                slow_linear,
-                accelerating,
-                high_polarization,
-                curve_polarization,
-                operation_stress_score,
+                high_temperature,
+                high_current,
+                cycle_aging,
+                high_power,
                 low_retrieval_reliability,
             ],
             dim=-1,
@@ -201,7 +202,7 @@ class SemanticHierarchicalRouter(nn.Module):
 
     Chemistry selection is hard-routed outside this module using known metadata.
     This router only chooses the semantic mode inside the selected chemistry
-    branch: slow-linear, accelerating, high-polarization, or curve-polarization.
+    branch: high-temperature, high-current, high-cycle, or high-power factor.
     """
 
     REQUIRED_GROUPS = [
@@ -219,6 +220,8 @@ class SemanticHierarchicalRouter(nn.Module):
         mode_names: Iterable[str] | None = None,
         gamma: float = 0.2,
         rag_eta: float = 0.5,
+        horizon_context_dim: int = 6,
+        horizon_prior_strength: float = 1.4,
     ):
         super().__init__()
         self.mode_names = list(mode_names or SEMANTIC_EXPERT_MODES)
@@ -226,6 +229,8 @@ class SemanticHierarchicalRouter(nn.Module):
         self.group_dims = {name: int(dim) for name, dim in group_dims.items()}
         self.gamma = float(gamma)
         self.rag_eta = float(rag_eta)
+        self.horizon_context_dim = int(horizon_context_dim)
+        self.horizon_prior_strength = float(horizon_prior_strength)
         self.concept_extractor = SemanticConceptExtractor()
         self.semantic_to_mode = nn.Linear(len(SEMANTIC_CONCEPT_NAMES), self.num_modes)
         self.group_calibrators = nn.ModuleDict(
@@ -234,20 +239,21 @@ class SemanticHierarchicalRouter(nn.Module):
                 for name, dim in self.group_dims.items()
             }
         )
+        self.horizon_calibrator = nn.Linear(max(self.horizon_context_dim, 1), self.num_modes)
         self._init_semantic_prior()
 
     def _init_semantic_prior(self) -> None:
         with torch.no_grad():
             self.semantic_to_mode.weight.zero_()
             self.semantic_to_mode.bias.zero_()
-            # Columns: slow_linear, accelerating, high_polarization,
-            # curve_polarization, operation_stress, low_retrieval_reliability.
+            # Columns: high_temperature, high_current, high_cycle,
+            # high_power, low_retrieval_reliability.
             template = torch.tensor(
                 [
-                    [2.0, -0.8, -0.6, -0.6, -0.4, 0.0],
-                    [-0.8, 2.2, 0.2, 0.2, 0.4, 0.0],
-                    [-0.6, 0.2, 2.2, 0.6, 0.5, 0.0],
-                    [-0.6, 0.2, 0.6, 2.2, 0.2, 0.0],
+                    [2.2, -0.4, 0.1, 0.4, 0.0],
+                    [-0.4, 2.2, 0.1, 0.5, 0.0],
+                    [0.0, 0.0, 2.3, 0.2, 0.1],
+                    [0.5, 0.5, 0.2, 2.2, 0.0],
                 ],
                 dtype=self.semantic_to_mode.weight.dtype,
             )
@@ -256,6 +262,68 @@ class SemanticHierarchicalRouter(nn.Module):
             for calibrator in self.group_calibrators.values():
                 nn.init.zeros_(calibrator.weight)
                 nn.init.zeros_(calibrator.bias)
+            # Horizon-wise routing starts equivalent to the global semantic
+            # router. Residual-expert training can then learn small step-wise
+            # corrections without immediately breaking the semantic prior.
+            nn.init.zeros_(self.horizon_calibrator.weight)
+            nn.init.zeros_(self.horizon_calibrator.bias)
+
+    def _horizon_semantic_logits(
+        self,
+        concepts: torch.Tensor,
+        horizon_context: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Return horizon-wise semantic logit offsets for expert switching.
+
+        The window-level semantic prior says which expert mode is plausible for
+        the current battery state. This horizon term says how that plausibility
+        should evolve as the forecast moves from near-term to far-term:
+
+        - high-cycle and high-power factors can increase toward later horizon
+          steps because accumulated stress matters more as the forecast extends;
+        - high-temperature and high-current factors remain active throughout the
+          horizon when their measured values are elevated;
+        - low retrieval reliability keeps the router more conservative.
+
+        It uses only named semantic concept scores and prediction-time horizon
+        context. It does not access target future SOH.
+        """
+
+        if horizon_context is None:
+            return None
+        horizon_context = torch.nan_to_num(horizon_context.to(torch.float32))
+        horizon_context = _pad_or_trim(horizon_context, self.horizon_context_dim)
+        step_fraction = horizon_context[..., 0].clamp(0.0, 1.0)
+        near = (1.0 - step_fraction).clamp(0.0, 1.0)
+        far = step_fraction
+
+        temperature_concept = concepts[:, 0].unsqueeze(1)
+        current_concept = concepts[:, 1].unsqueeze(1)
+        cycle_concept = concepts[:, 2].unsqueeze(1)
+        power_concept = concepts[:, 3].unsqueeze(1)
+        low_retrieval_concept = concepts[:, 4].unsqueeze(1)
+
+        offsets = torch.zeros(
+            horizon_context.shape[0],
+            horizon_context.shape[1],
+            self.num_modes,
+            device=horizon_context.device,
+            dtype=horizon_context.dtype,
+        )
+        mode_to_idx = {name: idx for idx, name in enumerate(self.mode_names)}
+        if "high_temperature_expert" in mode_to_idx:
+            offsets[..., mode_to_idx["high_temperature_expert"]] = 1.2 * temperature_concept + 0.2 * far * power_concept
+        if "high_current_expert" in mode_to_idx:
+            offsets[..., mode_to_idx["high_current_expert"]] = 1.2 * current_concept + 0.3 * far * power_concept
+        if "high_cycle_expert" in mode_to_idx:
+            offsets[..., mode_to_idx["high_cycle_expert"]] = 1.6 * far * cycle_concept + 0.4 * far * low_retrieval_concept
+        if "high_power_expert" in mode_to_idx:
+            offsets[..., mode_to_idx["high_power_expert"]] = 1.5 * far * power_concept + 0.4 * (temperature_concept + current_concept)
+
+        # Remove per-step mean so this term changes relative expert preference
+        # without globally sharpening or flattening the distribution.
+        offsets = offsets - offsets.mean(dim=-1, keepdim=True)
+        return self.horizon_prior_strength * offsets
 
     def semantic_prior_from_groups(self, group_inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         concepts = self.concept_extractor(
@@ -291,6 +359,7 @@ class SemanticHierarchicalRouter(nn.Module):
         self,
         group_inputs: Dict[str, torch.Tensor],
         rag_semantic_prior: torch.Tensor | None = None,
+        horizon_context: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor | Dict[str, torch.Tensor]]:
         prior_payload = self.semantic_prior_from_groups(group_inputs)
         query_prior = prior_payload["semantic_prior"]
@@ -303,25 +372,51 @@ class SemanticHierarchicalRouter(nn.Module):
         blend = (1.0 - self.rag_eta * retrieval_confidence).unsqueeze(-1) * query_prior
         blend = blend + (self.rag_eta * retrieval_confidence).unsqueeze(-1) * rag_semantic_prior
         final_prior = blend / blend.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        horizon_semantic_offsets = self._horizon_semantic_logits(
+            prior_payload["concepts"],
+            horizon_context,
+        )
+        if horizon_semantic_offsets is None:
+            final_prior_by_horizon = final_prior.unsqueeze(1)
+        else:
+            horizon_prior_logits = torch.log(final_prior.clamp_min(1e-6)).unsqueeze(1) + horizon_semantic_offsets
+            final_prior_by_horizon = torch.softmax(horizon_prior_logits, dim=-1)
 
         calibration, calibration_contributions = self._calibration_logits(group_inputs)
         logits = torch.log(final_prior.clamp_min(1e-6)) + calibration
-        weights = torch.softmax(logits, dim=-1)
+        if horizon_context is None:
+            weights_by_horizon = torch.softmax(logits, dim=-1).unsqueeze(1)
+            logits_by_horizon = logits.unsqueeze(1)
+            horizon_contribution = torch.zeros_like(logits_by_horizon)
+        else:
+            horizon_context = torch.nan_to_num(horizon_context.to(torch.float32))
+            horizon_context = _pad_or_trim(horizon_context, self.horizon_calibrator.in_features)
+            horizon_contribution = self.gamma * self.horizon_calibrator(horizon_context)
+            logits_by_horizon = torch.log(final_prior_by_horizon.clamp_min(1e-6)) + calibration.unsqueeze(1) + horizon_contribution
+            weights_by_horizon = torch.softmax(logits_by_horizon, dim=-1)
+        weights = weights_by_horizon.mean(dim=1)
         topk_mask = torch.ones_like(weights)
         contributions = {
             **calibration_contributions,
             "semantic_prior": torch.log(final_prior.clamp_min(1e-6)),
             "calibrator": calibration,
+            "horizon_dynamic": horizon_contribution,
+            "horizon_semantic_prior": horizon_semantic_offsets
+            if horizon_semantic_offsets is not None
+            else torch.zeros_like(logits_by_horizon),
         }
         return {
             "logits": logits,
+            "logits_by_horizon": logits_by_horizon,
             "weights": weights,
+            "weights_by_horizon": weights_by_horizon,
             "topk_mask": topk_mask,
             "contributions": contributions,
             "concept_scores": prior_payload["concepts"],
             "semantic_prior": query_prior,
             "rag_semantic_prior": rag_semantic_prior,
             "final_prior": final_prior,
+            "final_prior_by_horizon": final_prior_by_horizon,
         }
 
 
@@ -331,4 +426,3 @@ def semantic_mode_names() -> List[str]:
 
 def chemistry_family_names() -> List[str]:
     return list(CHEMISTRY_FAMILIES)
-

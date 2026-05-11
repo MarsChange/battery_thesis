@@ -187,7 +187,24 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
 
     query_rows = rows[rows["split"].isin(["source_val", "target_query"])].copy()
     if len(query_rows) > num_queries:
-        query_rows = query_rows.iloc[:num_queries].copy()
+        rng = np.random.default_rng(int(cfg.get("random_seed", 7)))
+        strata_cols = [
+            col
+            for col in ["split", "source_dataset", "chemistry_family", "domain_label"]
+            if col in query_rows.columns
+        ]
+        selected_indices: List[int] = []
+        if strata_cols:
+            grouped = query_rows.groupby(strata_cols, dropna=False, sort=True)
+            for _, sub in grouped:
+                selected_indices.append(int(rng.choice(sub.index.to_numpy(dtype=np.int64))))
+                if len(selected_indices) >= num_queries:
+                    break
+        remaining = query_rows.index.difference(pd.Index(selected_indices)).to_numpy(dtype=np.int64)
+        if len(selected_indices) < num_queries and len(remaining):
+            fill = rng.choice(remaining, size=min(num_queries - len(selected_indices), len(remaining)), replace=False)
+            selected_indices.extend([int(idx) for idx in fill.tolist()])
+        query_rows = query_rows.loc[selected_indices].sort_values("case_id").copy()
 
     component_rows: List[Dict[str, object]] = []
     summary_rows: List[Dict[str, object]] = []
@@ -395,16 +412,16 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
     enabled_components = [name for name in COMPONENT_NAMES if bool(retriever.rag_config.get(name, False))]
     enabled_feature_summary = {
         "d_soh_state": ["anchor_soh", "recent_soh_slope", "recent_soh_curvature", "degradation_stage"],
-        "d_qv_shape": ["Vd(Q)", "DeltaV(Q)", "R(Q)", "qv_summary_stats"],
-        "d_physics": ["delta_v_mean", "delta_v_std", "delta_v_q95", "r_mean", "r_std", "r_q95"],
+        "d_qv_shape": ["Qd(V)", "dQ/dV(V)", "qv_window_summary"],
+        "d_physics": ["qv_dqdv_peak_value", "qv_dqdv_peak_voltage", "qv_dqdv_area", "qv_capacity_span"],
         "d_operation": ["disabled by default", "legacy compatibility output"],
         "d_metadata": [
             "chemistry_family",
             "domain_label",
             "voltage_window_bucket",
-            "charge_current_seq",
-            "discharge_current_seq",
+            "current_abs_seq",
             "temperature_seq",
+            "power_energy_seq",
             "normalized_capacity_delta_seq",
         ],
     }
@@ -437,7 +454,7 @@ def validate_retrieval_quality(cfg: Dict[str, object], num_queries: int = 100) -
         if float(compare_df["retrieved_mean_d_qv_shape"].mean()) >= float(compare_df["random_mean_d_qv_shape"].mean()):
             suggestion = "提高 d_qv_shape 权重或增强 qv 曲线摘要特征。"
         elif float(compare_df["retrieved_mean_d_physics"].mean()) >= float(compare_df["random_mean_d_physics"].mean()):
-            suggestion = "提高 d_physics 权重或检查 ΔV/R 物理 proxy 的可用率。"
+            suggestion = "提高 d_physics 权重或检查 dQ/dV 峰值、峰位、面积和容量跨度的可用率。"
 
     summary_lines = [
         "# 检索质量验证总结",

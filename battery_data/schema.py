@@ -15,6 +15,7 @@ CANONICAL_NUMERIC_COLUMNS = [
     "voltage_max",
     "voltage_min",
     "current_mean",
+    "current_abs_mean",
     "current_max",
     "current_min",
     "temp_mean",

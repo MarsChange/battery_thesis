@@ -59,15 +59,14 @@ def _semantic_explanation(outputs: Dict[str, torch.Tensor], model: BatterySOHFor
     dominant_mode = model.expert_names[dominant_idx]
     concept_map = {name: float(concepts[pos]) for pos, name in enumerate(SEMANTIC_CONCEPT_NAMES)}
     evidence = {}
-    if concept_map.get("concept_accelerating", 0.0) >= 0.55:
-        evidence["recent_soh_slope"] = "degradation trend supports accelerating mode"
-        evidence["recent_soh_curvature"] = "curvature signal supports accelerating mode"
-    if concept_map.get("concept_high_polarization", 0.0) >= 0.55:
-        evidence["r_q95"] = "resistance proxy is elevated"
-    if concept_map.get("concept_curve_polarization", 0.0) >= 0.55:
-        evidence["delta_v_q95"] = "strong local curve polarization appears"
-    if concept_map.get("concept_high_operation_stress", 0.0) >= 0.55:
-        evidence["operation_stress"] = "current, temperature or protocol variation is high"
+    if concept_map.get("concept_high_temperature", 0.0) >= 0.55:
+        evidence["temperature"] = "temperature stress supports the high-temperature expert"
+    if concept_map.get("concept_high_current", 0.0) >= 0.55:
+        evidence["current"] = "absolute current stress supports the high-current expert"
+    if concept_map.get("concept_high_cycle_aging", 0.0) >= 0.55:
+        evidence["cycle_aging"] = "SOH/cycle aging state supports the high-cycle expert"
+    if concept_map.get("concept_high_power", 0.0) >= 0.55:
+        evidence["power"] = "power or energy-throughput proxy supports the high-power expert"
     if concept_map.get("concept_low_retrieval_reliability", 0.0) >= 0.55:
         evidence["retrieval_confidence"] = "retrieved cases are less reliable"
     else:
@@ -94,7 +93,10 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
 
     model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
     model = BatterySOHForecaster(**model_init)
-    model.load_state_dict(checkpoint["model_state"])
+    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    critical_missing = [key for key in missing if "horizon_calibrator" not in key]
+    if critical_missing or unexpected:
+        raise RuntimeError(f"Incompatible checkpoint. missing={critical_missing}, unexpected={list(unexpected)}")
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))
     model.to(device)
     model.eval()
@@ -136,6 +138,12 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
                     "anchor_soh": float(row["anchor_soh"]),
                     "chemistry_branch": explanation["chemistry_branch"],
                     "expert_weights_json": json.dumps(outputs["expert_weights"][idx].numpy().astype(float).tolist()),
+                    "expert_weights_by_horizon_json": json.dumps(
+                        outputs.get("expert_weights_by_horizon", outputs["expert_weights"].unsqueeze(1))[idx]
+                        .numpy()
+                        .astype(float)
+                        .tolist()
+                    ),
                     "dominant_expert": explanation["dominant_mode"],
                     "fusion_weights_json": json.dumps(outputs["fusion_weights"][idx].numpy().astype(float).tolist()),
                     "expert_router_contributions_json": json.dumps({k: v[idx].numpy().astype(float).tolist() for k, v in outputs["expert_router_contributions"].items()}),

@@ -14,13 +14,18 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+tqdm.monitor_interval = 0
+
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import (
+    expert_horizon_diversity_loss,
+    expert_horizon_smoothness_loss,
     expert_load_balance_loss,
     forecast_loss,
     late_horizon_mse_loss,
     monotonic_loss,
     residual_magnitude_loss,
+    route_kl_loss,
     smoothness_loss,
     terminal_mse_loss,
     total_variation_loss,
@@ -42,7 +47,10 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
     model = BatterySOHForecaster(**model_init)
-    model.load_state_dict(checkpoint["model_state"])
+    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    critical_missing = [key for key in missing if "horizon_calibrator" not in key]
+    if critical_missing or unexpected:
+        raise RuntimeError(f"Incompatible checkpoint. missing={critical_missing}, unexpected={list(unexpected)}")
 
     support_splits = list(cfg.get("fewshot", {}).get("support_splits", ["target_support"]))
     dataset = BatterySOHForecastDataset(
@@ -101,7 +109,17 @@ def fewshot_adapt(cfg: Dict[str, object], checkpoint_path: str | Path) -> Dict[s
                 + float(loss_cfg.get("residual_smoothness", 0.0)) * smoothness_loss(outputs["moe_residual"])
                 + float(loss_cfg.get("residual_total_variation", 0.0)) * total_variation_loss(outputs["moe_residual"])
                 + float(loss_cfg.get("residual_magnitude", 0.0)) * residual_magnitude_loss(outputs["moe_residual"])
-                + float(loss_cfg.get("expert_balance", 0.01)) * expert_load_balance_loss(outputs["expert_weights"])
+                + float(loss_cfg.get("expert_balance", 0.01))
+                * expert_load_balance_loss(outputs.get("expert_weights_by_horizon", outputs["expert_weights"]))
+                + float(loss_cfg.get("route_kl", loss_cfg.get("route", 0.01)))
+                * route_kl_loss(
+                    outputs.get("final_router_prior_by_horizon", outputs["final_router_prior"]),
+                    outputs.get("expert_weights_by_horizon", outputs["expert_weights"]),
+                )
+                + float(loss_cfg.get("horizon_router_diversity", 0.0))
+                * expert_horizon_diversity_loss(outputs.get("expert_weights_by_horizon", outputs["expert_weights"]))
+                + float(loss_cfg.get("horizon_router_smoothness", 0.0))
+                * expert_horizon_smoothness_loss(outputs.get("expert_weights_by_horizon", outputs["expert_weights"]))
             )
             optimizer.zero_grad()
             loss.backward()

@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from tqdm import tqdm
 
+tqdm.monitor_interval = 0
+
 from .index import FAISSIndex
 from .io import save_sidecar
 from .schema import WindowSample

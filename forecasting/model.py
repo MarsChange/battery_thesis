@@ -2,7 +2,8 @@
 
 The model is intentionally free of external time-series foundation models. It
 uses named battery signals, RAG references, a reference-conditioned pairwise
-branch, and LSTM specialists selected by an interpretable physical router.
+branch, and attention-GRU residual specialists selected by an interpretable
+factor router.
 """
 
 from __future__ import annotations
@@ -139,11 +140,11 @@ class MLPHead(nn.Module):
         return self.net(x)
 
 
-class ResidualLSTMExpert(nn.Module):
-    """LSTM specialist that predicts only a residual correction.
+class AttentionGRUResidualExpert(nn.Module):
+    """Attention-GRU specialist that predicts only a residual correction.
 
     输入：
-    - expert_seq: SOH、Q-V proxy、DeltaV/R 和工况组成的窗口级数值序列。
+    - expert_seq: SOH、Q-V window、温度、电流、循环老化和功率 proxy 序列。
     - expert_context: 可解释全局上下文，包括 SOH 状态、物理 proxy、metadata、检索置信度和 baseline summary。
     - baseline_delta_detached: 当前基础预测，使用 detach 防止专家反向影响基础分支。
 
@@ -168,7 +169,8 @@ class ResidualLSTMExpert(nn.Module):
         self.residual_decoder_type = str(residual_decoder_type)
         self.residual_basis_points = max(2, min(int(residual_basis_points), self.horizon))
         self.input_proj = nn.Linear(expert_seq_dim, hidden_dim)
-        self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=1, batch_first=True)
+        self.gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=1, batch_first=True)
+        self.attention_score = nn.Linear(hidden_dim, 1)
         self.context_proj = nn.Sequential(nn.Linear(expert_context_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout))
         self.future_gru = nn.GRU(future_operation_dim, hidden_dim, batch_first=True) if future_operation_dim > 0 else None
         decoder_output_dim = self.residual_basis_points if self.residual_decoder_type == "smooth_basis" else self.horizon
@@ -195,8 +197,11 @@ class ResidualLSTMExpert(nn.Module):
         future_ops_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_hidden = self.input_proj(expert_seq)
-        _, (last_hidden, _) = self.lstm(seq_hidden)
-        seq_summary = last_hidden[-1]
+        gru_outputs, last_hidden = self.gru(seq_hidden)
+        attn_logits = self.attention_score(gru_outputs).squeeze(-1)
+        attn_weights = torch.softmax(attn_logits, dim=-1)
+        seq_summary = torch.sum(gru_outputs * attn_weights.unsqueeze(-1), dim=1)
+        seq_summary = 0.5 * seq_summary + 0.5 * last_hidden[-1]
         context_summary = self.context_proj(expert_context)
         if self.future_gru is not None and future_ops is not None and future_ops_mask is not None:
             _, future_hidden = self.future_gru(future_ops * future_ops_mask)
@@ -205,6 +210,10 @@ class ResidualLSTMExpert(nn.Module):
             future_summary = torch.zeros_like(seq_summary)
         decoder_input = torch.cat([seq_summary, context_summary, future_summary, baseline_delta_detached], dim=-1)
         return self._decode_residual(decoder_input)
+
+
+# Backward-compatible import alias. The implementation is attention-GRU, not LSTM.
+ResidualLSTMExpert = AttentionGRUResidualExpert
 
 
 class BatterySOHForecaster(nn.Module):
@@ -234,6 +243,8 @@ class BatterySOHForecaster(nn.Module):
         residual_terminal_max_abs: float = 0.0,
         residual_terminal_profile_power: float = 1.25,
         residual_terminal_step_max_abs: float = 0.0,
+        residual_output_scale: float = 1.0,
+        residual_late_output_scale: float = 1.0,
         residual_max_abs: float = 0.006,
         residual_confidence_floor: float = 0.35,
         residual_reference_dispersion_scale: float = 0.004,
@@ -265,6 +276,8 @@ class BatterySOHForecaster(nn.Module):
         self.residual_terminal_max_abs = float(residual_terminal_max_abs)
         self.residual_terminal_profile_power = float(residual_terminal_profile_power)
         self.residual_terminal_step_max_abs = float(residual_terminal_step_max_abs)
+        self.residual_output_scale = max(float(residual_output_scale), 0.0)
+        self.residual_late_output_scale = max(float(residual_late_output_scale), 0.0)
         self.residual_max_abs = float(residual_max_abs)
         self.residual_confidence_floor = float(residual_confidence_floor)
         self.residual_reference_dispersion_scale = float(residual_reference_dispersion_scale)
@@ -305,7 +318,7 @@ class BatterySOHForecaster(nn.Module):
             {
                 chemistry: nn.ModuleDict(
                     {
-                        mode_name: ResidualLSTMExpert(
+                        mode_name: AttentionGRUResidualExpert(
                             expert_seq_dim=self.expert_seq_dim,
                             expert_context_dim=expert_context_dim,
                             horizon=self.horizon,
@@ -325,8 +338,8 @@ class BatterySOHForecaster(nn.Module):
         self.semantic_router = SemanticHierarchicalRouter(
             group_dims={
                 "soh_state": 3,
-                "qv_polarization": min(8, physics_dim),
-                "partial_charge_shape": max(physics_dim - 8, 0),
+                "qv_polarization": physics_dim,
+                "partial_charge_shape": 0,
                 "operation_stress": operation_dim * 2 + future_operation_dim,
                 "retrieval": 6,
                 "neighbor_vote": len(self.expert_names),
@@ -488,6 +501,31 @@ class BatterySOHForecaster(nn.Module):
         total_bound = direct_bound * max(direct_fraction, 0.0) + terminal_bound.unsqueeze(-1).abs()
         return direct_residual, terminal_component, total_bound
 
+    def _scale_raw_residual(self, raw_residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply a controlled residual gain before safety caps.
+
+        The residual expert bank is trained as a correction module, not as a
+        full predictor. This gain lets the correction be visible when the base
+        branch under-corrects, while downstream caps, smoothing, trend guards
+        and monotonic losses still prevent unsupported SOH spikes.
+        """
+
+        base_scale = max(float(self.residual_output_scale), 0.0)
+        late_scale = max(float(self.residual_late_output_scale), 0.0)
+        if raw_residual.shape[-1] <= 1:
+            scale = raw_residual.new_full((1, raw_residual.shape[-1]), base_scale)
+            return raw_residual * scale, scale
+
+        step_fraction = torch.linspace(
+            0.0,
+            1.0,
+            raw_residual.shape[-1],
+            device=raw_residual.device,
+            dtype=raw_residual.dtype,
+        ).unsqueeze(0)
+        horizon_scale = base_scale * (1.0 + (late_scale - 1.0) * step_fraction)
+        return raw_residual * horizon_scale, horizon_scale
+
     def _trend_consistency_gate(
         self,
         residual: torch.Tensor,
@@ -537,6 +575,45 @@ class BatterySOHForecaster(nn.Module):
         cap = cap.clamp_min(0.0)
         return residual.clamp(-cap, cap), cap
 
+    def _horizon_router_context(
+        self,
+        *,
+        base_delta: torch.Tensor,
+        trend_delta: torch.Tensor,
+        retrieval_confidence: torch.Tensor,
+        anchor_soh: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build named step-wise context for dynamic expert routing.
+
+        The semantic router still starts from one interpretable window-level
+        prior. This context lets the small calibrator adjust expert weights at
+        each forecast step using only prediction-time information:
+        horizon progress, base delta, local-trend delta, base-vs-trend gap,
+        retrieval confidence, and anchor SOH.
+        """
+
+        batch, horizon = base_delta.shape
+        step_fraction = torch.linspace(
+            1.0 / max(horizon, 1),
+            1.0,
+            horizon,
+            device=base_delta.device,
+            dtype=base_delta.dtype,
+        ).unsqueeze(0).expand(batch, -1)
+        retrieval_level = retrieval_confidence.to(base_delta.dtype).unsqueeze(-1).expand(-1, horizon)
+        anchor_level = anchor_soh.to(base_delta.dtype).unsqueeze(-1).expand(-1, horizon)
+        return torch.stack(
+            [
+                step_fraction,
+                base_delta.detach(),
+                trend_delta.detach(),
+                (base_delta - trend_delta).detach(),
+                retrieval_level,
+                anchor_level,
+            ],
+            dim=-1,
+        )
+
     def _reference_future_agreement_gate(
         self,
         ref_future_delta: torch.Tensor,
@@ -578,7 +655,11 @@ class BatterySOHForecaster(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         h_cycle = self.cycle_encoder(cycle_stats, soh_seq)
         h_qv = self.qv_encoder(qv_maps, qv_masks)
-        h_pc = self.partial_charge_encoder(partial_charge, partial_charge_mask)
+        # Mainline feature policy does not use partial-charge or relaxation
+        # features. Keep this slot as zeros for dimensional compatibility with
+        # older checkpoints/tests while preventing the expert/base branches from
+        # depending on unavailable partial-charge signals.
+        h_pc = torch.zeros_like(h_qv)
         h_future_ops, future_horizon_context = self.future_op_encoder(future_ops, future_ops_mask)
         meta_embedding = self._meta_encode(meta_ids)
         return {
@@ -750,8 +831,8 @@ class BatterySOHForecaster(nn.Module):
         ref_prior_payload = self.semantic_router.semantic_prior_from_groups(
             {
                 "soh_state": ref_state,
-                "qv_polarization": ref_anchor_physics[..., : min(8, self.physics_dim)],
-                "partial_charge_shape": ref_anchor_physics[..., 8:],
+                "qv_polarization": ref_anchor_physics,
+                "partial_charge_shape": torch.zeros(batch_size * top_k, 0, device=device, dtype=torch.float32),
                 "operation_stress": ref_operation_group,
                 "retrieval": ref_retrieval_features,
             }
@@ -764,13 +845,23 @@ class BatterySOHForecaster(nn.Module):
 
         router_inputs = {
             "soh_state": state_features,
-            "qv_polarization": query["anchor_physics_features"].to(torch.float32)[..., : min(8, self.physics_dim)],
-            "partial_charge_shape": query["anchor_physics_features"].to(torch.float32)[..., 8:],
+            "qv_polarization": query["anchor_physics_features"].to(torch.float32),
+            "partial_charge_shape": torch.zeros(batch_size, 0, device=device, dtype=torch.float32),
             "operation_stress": operation_group,
             "retrieval": retrieval_features,
             "neighbor_vote": neighbor_vote,
         }
-        router_out = self.semantic_router(router_inputs, rag_semantic_prior=rag_semantic_prior)
+        horizon_router_context = self._horizon_router_context(
+            base_delta=base_delta,
+            trend_delta=trend_delta,
+            retrieval_confidence=retrieval["retrieval_confidence"].to(torch.float32),
+            anchor_soh=anchor_soh,
+        )
+        router_out = self.semantic_router(
+            router_inputs,
+            rag_semantic_prior=rag_semantic_prior,
+            horizon_context=horizon_router_context,
+        )
 
         baseline_detached = base_delta.detach()
         baseline_summary = torch.stack([baseline_detached.mean(dim=-1), baseline_detached.std(dim=-1), baseline_detached[:, -1]], dim=-1)
@@ -813,7 +904,9 @@ class BatterySOHForecaster(nn.Module):
         all_expert_outputs = torch.stack(chemistry_outputs, dim=1)
         chemistry_one_hot = F.one_hot(chemistry_ids, num_classes=len(self.chemistry_families)).to(all_expert_outputs.dtype)
         expert_outputs = torch.sum(all_expert_outputs * chemistry_one_hot[:, :, None, None], dim=1)
-        raw_moe_residual = torch.sum(expert_outputs * router_out["weights"].unsqueeze(-1), dim=1)
+        expert_weights_by_horizon = router_out["weights_by_horizon"].to(expert_outputs.dtype)
+        raw_moe_residual = torch.sum(expert_outputs.transpose(1, 2) * expert_weights_by_horizon, dim=-1)
+        scaled_raw_moe_residual, residual_output_scale_by_horizon = self._scale_raw_residual(raw_moe_residual)
         retrieval_residual_gate = retrieval["retrieval_confidence"].to(torch.float32).clamp(0.0, 1.0)
         retrieval_residual_gate = float(self.residual_confidence_floor) + (1.0 - float(self.residual_confidence_floor)) * retrieval_residual_gate
         reference_agreement_gate, reference_future_dispersion = self._reference_future_agreement_gate(
@@ -825,7 +918,7 @@ class BatterySOHForecaster(nn.Module):
         stage_progress_gate = float(self.residual_stage_floor) + (1.0 - float(self.residual_stage_floor)) * stage_progress_gate
         residual_gate = (retrieval_residual_gate * reference_agreement_gate * stage_progress_gate).clamp(0.0, 1.0)
         direct_residual_component, terminal_rate_residual_component, residual_bound = self._residual_components(
-            raw_moe_residual,
+            scaled_raw_moe_residual,
             residual_gate,
         )
         moe_residual = direct_residual_component + terminal_rate_residual_component
@@ -851,6 +944,8 @@ class BatterySOHForecaster(nn.Module):
             "trend_blend": trend_blend.squeeze(-1),
             "moe_residual": moe_residual,
             "raw_moe_residual": raw_moe_residual,
+            "scaled_raw_moe_residual": scaled_raw_moe_residual,
+            "residual_output_scale_by_horizon": residual_output_scale_by_horizon,
             "direct_residual_component": direct_residual_component,
             "terminal_rate_residual_component": terminal_rate_residual_component,
             "residual_gate": residual_gate,
@@ -864,12 +959,15 @@ class BatterySOHForecaster(nn.Module):
             "retrieval_alpha": retrieval_alpha,
             "retrieval_confidence": retrieval["retrieval_confidence"].to(torch.float32),
             "expert_weights": router_out["weights"],
+            "expert_weights_by_horizon": expert_weights_by_horizon,
             "expert_logits": router_out["logits"],
+            "expert_logits_by_horizon": router_out["logits_by_horizon"],
             "expert_router_contributions": router_out["contributions"],
             "semantic_concepts": router_out["concept_scores"],
             "semantic_prior": router_out["semantic_prior"],
             "rag_semantic_prior": router_out["rag_semantic_prior"],
             "final_router_prior": router_out["final_prior"],
+            "final_router_prior_by_horizon": router_out["final_prior_by_horizon"],
             "chemistry_branch_id": chemistry_ids,
             "selected_mode_residuals": expert_outputs,
             "fusion_weights": fusion_out["weights"],

@@ -1,13 +1,15 @@
 """battery_data.build_case_bank
 
 构建用于少样本跨工况电池 SOH 多步预测的数值案例库。
-输出包含监督标签、Q-V 曲线特征、ΔV/R 物理 proxy、工况特征和 LSTM expert 序列。
+输出包含监督标签、放电 Q-V 窗口特征、温度/电流/功率工况特征和
+attention-GRU residual expert 序列。主线不使用 TSFM、弛豫或内阻 proxy。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -36,46 +38,42 @@ from battery_data.splits import assert_no_split_leakage, build_split_manifest
 
 
 DEFAULT_QV_CURVE_STATS = [
-    "delta_v_mean",
-    "delta_v_std",
-    "delta_v_q95",
-    "r_mean",
-    "r_std",
-    "r_q95",
-    "vc_curve_slope_mean",
-    "vd_curve_slope_mean",
-    "ic_mean",
-    "id_mean",
-    "v_charge_mean",
-    "v_discharge_mean",
+    "qv_dqdv_peak_value",
+    "qv_dqdv_peak_voltage",
+    "qv_dqdv_area",
+    "qv_capacity_span",
+    "qv_voltage_min",
+    "qv_voltage_max",
+    "qv_window_available",
+    "qv_power_energy_proxy",
 ]
 
 DEFAULT_OPERATION_FEATURES = [
     "current_abs_mean",
+    "current_abs_std",
+    "current_abs_max",
     "temp_mean",
-    "cc_time",
-    "cv_time",
-    "charge_throughput_delta_1",
-    "discharge_throughput_delta_1",
+    "temp_std",
+    "temp_max",
     "energy_charge_delta_1",
     "energy_discharge_delta_1",
 ]
 
 EXPERT_SEQ_FEATURES = [
     "soh_t",
-    "voltage_mean_t",
-    "current_abs_mean_t",
-    "temp_mean_t",
-    "delta_v_mean_t",
-    "delta_v_std_t",
-    "r_mean_t",
-    "r_std_t",
-    "delta_v_q95_t",
-    "r_q95_t",
-    "charge_c_rate_mean_t",
-    "discharge_c_rate_mean_t",
+    "qv_dqdv_peak_value_t",
+    "qv_dqdv_peak_voltage_t",
+    "qv_dqdv_area_t",
+    "qv_capacity_span_t",
+    "temperature_mean_t",
+    "temperature_std_t",
     "temperature_max_t",
-    "protocol_change_rate_t",
+    "current_abs_mean_t",
+    "current_abs_std_t",
+    "current_abs_max_t",
+    "power_energy_proxy_t",
+    "cycle_aging_index_t",
+    "soh_below_0p9_t",
 ]
 
 
@@ -109,6 +107,18 @@ def _safe_numeric(df: pd.DataFrame, column: str | None) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce").astype("float64")
 
 
+def _frame_numeric(frame: pd.DataFrame, column: str, default: float = 0.0, abs_value: bool = False) -> pd.Series:
+    """Return a finite numeric Series for a per-cycle feature column."""
+
+    if column in frame.columns:
+        series = pd.to_numeric(frame[column], errors="coerce")
+    else:
+        series = pd.Series([default] * len(frame), index=frame.index, dtype="float32")
+    if abs_value:
+        series = series.abs()
+    return series.fillna(default).astype("float32")
+
+
 def _load_raw_cycle_tables(source_dataset: str, file_path: str) -> Dict[int, pd.DataFrame]:
     path = Path(file_path)
     if not path.exists():
@@ -125,7 +135,7 @@ def _load_raw_cycle_tables(source_dataset: str, file_path: str) -> Dict[int, pd.
                     "voltage": pd.to_numeric(grp.get("Voltage (V)"), errors="coerce"),
                     "current": pd.to_numeric(grp.get("Current (mA)"), errors="coerce") / 1000.0,
                     "capacity": pd.to_numeric(grp.get("Capacity (mAh)"), errors="coerce") / 1000.0,
-                    "temperature": np.nan,
+                    "temperature": 30.0,
                     "step": grp.get("Status"),
                 }
             )
@@ -133,6 +143,8 @@ def _load_raw_cycle_tables(source_dataset: str, file_path: str) -> Dict[int, pd.
 
     if source_dataset == "tju":
         raw_df = pd.read_csv(path)
+        match = re.match(r"CY(?P<temp>\d+)-", path.stem)
+        temperature = float(match.group("temp")) if match else np.nan
         grouped = raw_df.groupby("cycle number", sort=True)
         result = {}
         for cycle_idx, grp in grouped:
@@ -146,7 +158,7 @@ def _load_raw_cycle_tables(source_dataset: str, file_path: str) -> Dict[int, pd.
                     "voltage": pd.to_numeric(grp.get("Ecell/V"), errors="coerce"),
                     "current": current,
                     "capacity": capacity,
-                    "temperature": np.nan,
+                    "temperature": temperature,
                     "step": np.where(current > 0, "charge", "discharge"),
                 }
             )
@@ -240,14 +252,26 @@ def _collect_cycle_feature_names(cfg: Dict[str, object]) -> List[str]:
 
 
 def _select_operation_features(frame: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-    columns = [name for name in DEFAULT_OPERATION_FEATURES if name in frame.columns]
     values = []
     for name in DEFAULT_OPERATION_FEATURES:
-        if name in frame.columns:
-            series = pd.to_numeric(frame[name], errors="coerce").fillna(0.0).astype("float32")
+        if name == "current_abs_std":
+            source_name = "current_mean_std_5" if "current_mean_std_5" in frame.columns else "current_abs_std"
+            series = _frame_numeric(frame, source_name, abs_value=True)
+        elif name == "current_abs_max":
+            if "current_abs_max" in frame.columns:
+                series = _frame_numeric(frame, "current_abs_max", abs_value=True)
+            else:
+                current_max = _frame_numeric(frame, "current_max")
+                current_min = _frame_numeric(frame, "current_min")
+                series = np.maximum(current_max.abs(), current_min.abs()).astype("float32")
+        elif name == "temp_std":
+            source_name = "temp_mean_std_5" if "temp_mean_std_5" in frame.columns else "temp_std"
+            series = _frame_numeric(frame, source_name, abs_value=True)
+        elif name in frame.columns:
+            series = _frame_numeric(frame, name)
         else:
             series = pd.Series([0.0] * len(frame), dtype="float32")
-        values.append(series.to_numpy(dtype=np.float32))
+        values.append(np.asarray(series, dtype=np.float32))
     return np.stack(values, axis=-1), list(DEFAULT_OPERATION_FEATURES)
 
 
@@ -290,39 +314,43 @@ def _build_expert_seq(
     physics_features_all: np.ndarray,
     anchor_capacity_values: np.ndarray,
 ) -> np.ndarray:
-    voltage_mean = pd.to_numeric(feature_frame.get("voltage_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    current_abs_mean = pd.to_numeric(feature_frame.get("current_abs_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    temp_mean = pd.to_numeric(feature_frame.get("temp_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    soh = pd.to_numeric(feature_frame.get("soh", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    delta_v_mean = pd.to_numeric(feature_frame.get("delta_v_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    delta_v_std = pd.to_numeric(feature_frame.get("delta_v_std", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    delta_v_q95 = pd.to_numeric(feature_frame.get("delta_v_q95", feature_frame.get("delta_v_max", 0.0)), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    r_mean = pd.to_numeric(feature_frame.get("r_mean", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    r_std = pd.to_numeric(feature_frame.get("r_std", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    r_q95 = pd.to_numeric(feature_frame.get("r_q95", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    temp_max = pd.to_numeric(feature_frame.get("temp_max", feature_frame.get("temp_mean", 0.0)), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    safe_capacity = np.maximum(np.asarray(anchor_capacity_values, dtype=np.float32), 1e-6)
-    charge_c_rate = current_abs_mean / safe_capacity
-    discharge_c_rate = current_abs_mean / safe_capacity
-    protocol_change_rate = np.zeros_like(charge_c_rate, dtype=np.float32)
-    if len(protocol_change_rate) > 1:
-        protocol_change_rate[1:] = np.abs(np.diff(charge_c_rate))
+    qv_peak = _frame_numeric(feature_frame, "qv_dqdv_peak_value").to_numpy(dtype=np.float32)
+    qv_peak_voltage = _frame_numeric(feature_frame, "qv_dqdv_peak_voltage").to_numpy(dtype=np.float32)
+    qv_area = _frame_numeric(feature_frame, "qv_dqdv_area").to_numpy(dtype=np.float32)
+    qv_capacity_span = _frame_numeric(feature_frame, "qv_capacity_span").to_numpy(dtype=np.float32)
+    soh = _frame_numeric(feature_frame, "soh").to_numpy(dtype=np.float32)
+    current_abs_mean = _frame_numeric(feature_frame, "current_abs_mean").to_numpy(dtype=np.float32)
+    current_abs_std = _frame_numeric(feature_frame, "current_mean_std_5", abs_value=True).to_numpy(dtype=np.float32)
+    current_max = _frame_numeric(feature_frame, "current_max").to_numpy(dtype=np.float32)
+    current_min = _frame_numeric(feature_frame, "current_min").to_numpy(dtype=np.float32)
+    current_abs_max = np.maximum(np.abs(current_max), np.abs(current_min)).astype(np.float32)
+    temp_mean = _frame_numeric(feature_frame, "temp_mean").to_numpy(dtype=np.float32)
+    temp_std = _frame_numeric(feature_frame, "temp_mean_std_5", abs_value=True).to_numpy(dtype=np.float32)
+    temp_max = (_frame_numeric(feature_frame, "temp_max") if "temp_max" in feature_frame.columns else _frame_numeric(feature_frame, "temp_mean")).to_numpy(dtype=np.float32)
+    power_energy_proxy = _frame_numeric(feature_frame, "qv_power_energy_proxy").to_numpy(dtype=np.float32)
+    if not np.isfinite(power_energy_proxy).any() or float(np.nanmax(np.abs(power_energy_proxy))) == 0.0:
+        charge_energy = _frame_numeric(feature_frame, "energy_charge_delta_1", abs_value=True).to_numpy(dtype=np.float32)
+        discharge_energy = _frame_numeric(feature_frame, "energy_discharge_delta_1", abs_value=True).to_numpy(dtype=np.float32)
+        power_energy_proxy = charge_energy + discharge_energy
+    denom = max(len(feature_frame) - 1, 1)
+    cycle_aging_index = (np.arange(len(feature_frame), dtype=np.float32) / float(denom)).astype(np.float32)
+    soh_below_0p9 = np.maximum(0.0, 0.9 - soh).astype(np.float32)
     return np.stack(
         [
             soh,
-            voltage_mean,
-            current_abs_mean,
+            qv_peak,
+            qv_peak_voltage,
+            qv_area,
+            qv_capacity_span,
             temp_mean,
-            delta_v_mean,
-            delta_v_std,
-            r_mean,
-            r_std,
-            delta_v_q95,
-            r_q95,
-            charge_c_rate,
-            discharge_c_rate,
+            temp_std,
             temp_max,
-            protocol_change_rate,
+            current_abs_mean,
+            current_abs_std,
+            current_abs_max,
+            power_energy_proxy,
+            cycle_aging_index,
+            soh_below_0p9,
         ],
         axis=-1,
     ).astype(np.float32)
@@ -388,59 +416,54 @@ def _attach_semantic_labels(rows_df: pd.DataFrame, arrays: Dict[str, np.ndarray]
     rows = rows_df.copy()
     anchor_physics = np.asarray(arrays["case_anchor_physics_features.npy"], dtype=np.float32)
     operation_seq = np.asarray(arrays["case_operation_seq.npy"], dtype=np.float32)
-    slope_z = _robust_z(-pd.to_numeric(rows["recent_soh_slope"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32))
-    curvature_z = _robust_z(-pd.to_numeric(rows["recent_soh_curvature"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32))
-    delta_v_std_z = _robust_z(anchor_physics[:, 1] if anchor_physics.shape[1] > 1 else np.zeros(len(rows), dtype=np.float32))
-    delta_v_q95_z = _robust_z(anchor_physics[:, 2] if anchor_physics.shape[1] > 2 else np.zeros(len(rows), dtype=np.float32))
-    r_mean_z = _robust_z(anchor_physics[:, 3] if anchor_physics.shape[1] > 3 else np.zeros(len(rows), dtype=np.float32))
-    r_q95_z = _robust_z(anchor_physics[:, 5] if anchor_physics.shape[1] > 5 else np.zeros(len(rows), dtype=np.float32))
-    dq_dv_peak_z = _robust_z(anchor_physics[:, 11] if anchor_physics.shape[1] > 11 else np.zeros(len(rows), dtype=np.float32))
-    operation_abs = np.nan_to_num(np.abs(operation_seq).mean(axis=(1, 2)), nan=0.0)
-    operation_z = _robust_z(operation_abs)
+    anchor_soh = pd.to_numeric(rows["anchor_soh"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)
+    temperature_z = _robust_z(anchor_physics[:, 6] if anchor_physics.shape[1] > 6 else np.zeros(len(rows), dtype=np.float32))
+    current_z = _robust_z(anchor_physics[:, 9] if anchor_physics.shape[1] > 9 else np.zeros(len(rows), dtype=np.float32))
+    power_z = _robust_z(anchor_physics[:, 10] if anchor_physics.shape[1] > 10 else np.zeros(len(rows), dtype=np.float32))
+    cycle_z = _robust_z(anchor_physics[:, 11] if anchor_physics.shape[1] > 11 else np.zeros(len(rows), dtype=np.float32))
+    soh_aging_z = _robust_z(np.maximum(0.0, 0.9 - anchor_soh))
 
-    concept_slow_linear = np.exp(-np.abs(slope_z)) * np.exp(-np.abs(curvature_z)) * np.exp(-np.maximum(operation_z, 0.0))
-    concept_accelerating = _sigmoid(0.9 * slope_z + 1.0 * curvature_z + 0.35 * operation_z)
-    concept_high_polarization = _sigmoid(0.9 * r_mean_z + 1.1 * r_q95_z + 0.25 * operation_z)
-    concept_curve_polarization = _sigmoid(0.8 * delta_v_std_z + 1.0 * delta_v_q95_z + 0.7 * dq_dv_peak_z)
-    concept_high_operation_stress = _sigmoid(operation_z)
+    concept_high_temperature = _sigmoid(temperature_z)
+    concept_high_current = _sigmoid(current_z)
+    concept_high_cycle = _sigmoid(0.7 * cycle_z + 0.8 * soh_aging_z)
+    concept_high_power = _sigmoid(power_z)
 
     mode_scores = np.stack(
         [
-            concept_slow_linear,
-            concept_accelerating + 0.15 * concept_high_operation_stress,
-            concept_high_polarization + 0.10 * concept_high_operation_stress,
-            concept_curve_polarization,
+            concept_high_temperature,
+            concept_high_current,
+            concept_high_cycle,
+            concept_high_power,
         ],
         axis=-1,
     )
-    mode_names = np.asarray(["slow_linear", "accelerating", "high_polarization", "curve_polarization_expert"], dtype=object)
+    mode_names = np.asarray(["high_temperature_expert", "high_current_expert", "high_cycle_expert", "high_power_expert"], dtype=object)
     mode_indices = np.argmax(mode_scores, axis=-1)
 
     concept_rows = []
     text_rows = []
     for idx, mode_idx in enumerate(mode_indices.tolist()):
         concepts = {
-            "concept_slow_linear": float(concept_slow_linear[idx]),
-            "concept_accelerating": float(concept_accelerating[idx]),
-            "concept_high_polarization": float(concept_high_polarization[idx]),
-            "concept_curve_polarization": float(concept_curve_polarization[idx]),
-            "concept_high_operation_stress": float(concept_high_operation_stress[idx]),
+            "temperature_stress_score": float(concept_high_temperature[idx]),
+            "current_stress_score": float(concept_high_current[idx]),
+            "cycle_aging_score": float(concept_high_cycle[idx]),
+            "power_stress_score": float(concept_high_power[idx]),
         }
         scores = {str(mode_names[pos]): float(mode_scores[idx, pos]) for pos in range(len(mode_names))}
         concept_rows.append(json.dumps({"concepts": concepts, "mode_scores": scores}, ensure_ascii=True))
         dominant = str(mode_names[mode_idx])
         chemistry = str(rows.iloc[idx].get("chemistry_family", "unknown"))
         evidence = []
-        if concept_accelerating[idx] >= 0.55:
-            evidence.append("recent SOH trend suggests accelerating degradation")
-        if concept_high_polarization[idx] >= 0.55:
-            evidence.append("R(Q) proxy is elevated")
-        if concept_curve_polarization[idx] >= 0.55:
-            evidence.append("DeltaV(Q)/dQ-dV shape indicates curve polarization")
-        if concept_high_operation_stress[idx] >= 0.55:
-            evidence.append("operation stress proxy is high")
+        if concept_high_temperature[idx] >= 0.55:
+            evidence.append("temperature stress is elevated")
+        if concept_high_current[idx] >= 0.55:
+            evidence.append("absolute current stress is elevated")
+        if concept_high_cycle[idx] >= 0.55:
+            evidence.append("SOH/cycle aging state indicates deeper cycling degradation")
+        if concept_high_power[idx] >= 0.55:
+            evidence.append("energy or power-throughput proxy is elevated")
         if not evidence:
-            evidence.append("SOH slope and curvature are relatively smooth")
+            evidence.append("no dominant stress factor is elevated")
         text_rows.append(f"chemistry={chemistry}; semantic_mode={dominant}; evidence=" + "; ".join(evidence))
 
     rows["chemistry_branch_label"] = rows["chemistry_family"].astype(str)
@@ -547,7 +570,7 @@ def _save_case_bank_figures(case_rows: pd.DataFrame, arrays: Dict[str, np.ndarra
         if len(idx) == 0:
             continue
         case_idx = int(idx[0])
-        q_grid = np.linspace(0.0, 1.0, arrays["case_qv_maps.npy"].shape[-1], dtype=np.float32)
+        q_grid = arrays["case_qv_maps.npy"][case_idx, -1, 0].astype(np.float32)
         plot_qv_feature_map(
             q_grid=q_grid,
             qv_map=arrays["case_qv_maps.npy"][case_idx, -1],
@@ -558,8 +581,9 @@ def _save_case_bank_figures(case_rows: pd.DataFrame, arrays: Dict[str, np.ndarra
         plotted = True
         break
     if not plotted:
+        fallback_q_grid = arrays["case_qv_maps.npy"][0, -1, 0].astype(np.float32)
         plot_qv_feature_map(
-            q_grid=np.linspace(0.0, 1.0, arrays["case_qv_maps.npy"].shape[-1], dtype=np.float32),
+            q_grid=fallback_q_grid,
             qv_map=np.zeros_like(arrays["case_qv_maps.npy"][0, -1]),
             qv_mask=np.zeros_like(arrays["case_qv_masks.npy"][0, -1]),
             save_path=figure_dir / "example_qv_maps_by_chemistry.png",
@@ -654,14 +678,18 @@ def build_case_bank_from_cells(
 
         for _, row in feature_frame.iterrows():
             cycle_idx = int(row["cycle_idx"])
+            chemistry_for_window = str(row.get("chemistry_family") or cell_cycles.iloc[0].get("chemistry_family") or "")
+            source_for_window = str(row.get("source_dataset") or cell.source_dataset)
+            is_mit_calibration_cycle = source_for_window.lower() == "mit" and cycle_idx == int(feature_frame["cycle_idx"].min())
             raw_cycle_df = raw_cycle_map.get(cycle_idx)
             if raw_cycle_df is None or raw_cycle_df.empty:
-                qv_result = {
-                    "qv_map": np.zeros((6, q_grid_size), dtype=np.float32),
-                    "qv_mask": np.zeros(6, dtype=np.float32),
-                    "q_grid": q_grid,
-                    "curve_stats": {name: 0.0 for name in DEFAULT_QV_CURVE_STATS},
-                }
+                qv_result = extract_q_indexed_feature_map(
+                    pd.DataFrame(),
+                    q_grid_size=q_grid_size,
+                    source_dataset=source_for_window,
+                    chemistry_family=chemistry_for_window,
+                    skip_feature_extraction=True,
+                )
                 partial_result = {
                     "partial_charge_curve": np.zeros(partial_charge_segments, dtype=np.float32),
                     "partial_charge_mask": False,
@@ -672,15 +700,33 @@ def build_case_bank_from_cells(
                     raw_cycle_df,
                     q_grid_size=q_grid_size,
                     rolling_median_window=rolling_window,
+                    source_dataset=source_for_window,
+                    chemistry_family=chemistry_for_window,
+                    skip_feature_extraction=is_mit_calibration_cycle,
                 )
                 partial_result = extract_partial_charge_curve(
                     raw_cycle_df,
                     voltage_grid_size=partial_charge_segments,
                 )
+            operation_stats = {
+                "temperature_mean": _safe_float(row.get("temp_mean")),
+                "temperature_std": _safe_float(row.get("temp_mean_std_5")),
+                "temperature_max": _safe_float(row.get("temp_max", row.get("temp_mean"))),
+                "current_abs_mean": _safe_float(abs(_safe_float(row.get("current_mean")))),
+                "current_abs_std": _safe_float(abs(_safe_float(row.get("current_mean_std_5")))),
+                "current_abs_max": max(abs(_safe_float(row.get("current_max"))), abs(_safe_float(row.get("current_min")))),
+                "energy_charge_delta_1": abs(_safe_float(row.get("energy_charge_delta_1"))),
+                "energy_discharge_delta_1": abs(_safe_float(row.get("energy_discharge_delta_1"))),
+            }
+            cycle_context = {
+                "cycle_aging_index": float(len(physics_features_all) / max(len(feature_frame) - 1, 1)),
+            }
             physics_result = compute_physics_features(
                 partial_charge_curve=partial_result["partial_charge_curve"],
                 partial_charge_mask=bool(partial_result["partial_charge_mask"]),
                 qv_curve_stats=qv_result["curve_stats"],
+                operation_stats=operation_stats,
+                cycle_context=cycle_context,
             )
             qv_maps_all.append(np.asarray(qv_result["qv_map"], dtype=np.float32))
             qv_masks_all.append(np.asarray(qv_result["qv_mask"], dtype=np.float32))
@@ -805,7 +851,8 @@ def build_case_bank_from_cells(
                 future_operation_seq=np.nan_to_num(future_ops, nan=0.0).astype(np.float32),
                 future_operation_mask=np.nan_to_num(future_ops_mask, nan=0.0).astype(np.float32),
                 metadata={
-                    "q_grid": q_grid.tolist(),
+                    "q_grid": qv_maps_all[anchor_idx, 0].astype(float).tolist(),
+                    "q_grid_semantics": "discharge voltage grid stored in qv_maps channel 0",
                     "split_manifest_domain": split_row["domain_label"],
                     "raw_file_path": cell.file_path,
                 },

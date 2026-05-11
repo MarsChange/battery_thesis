@@ -1,5 +1,5 @@
-output_dir: output/case_bank_stratified_fewshot_32_64
-model_output_dir: output/forecasting_stratified_fewshot_32_64
+output_dir: output/case_bank_new_64_64
+model_output_dir: output/forecasting_new_64_64
 random_seed: 7
 cell_uid_prefix: cell
 adapter_cache: true
@@ -64,7 +64,7 @@ split:
   pair_support_cells: 0
 
 memory:
-  lookback_length: 32
+  lookback_length: 64
   prediction_length: 64
   stride: 10
   target_type: delta_soh
@@ -172,8 +172,8 @@ train_base:
 generate_oof_baseline:
   enabled: true
   num_folds: 5
-  epochs: 3
-  lr: 0.0005
+  epochs: 8
+  lr: 0.001
 
 train_residual_experts:
   enabled: true
@@ -233,7 +233,7 @@ experiments:
     num_plot_examples: 20
   retrieval_validation:
     enabled: true
-    output_dir: output/experiments/retrieval_validation
+    output_dir: tests/artifacts/rag_new_features_64_64
     num_queries: 100
     num_plot_queries: 20
     compare_random_baseline: true

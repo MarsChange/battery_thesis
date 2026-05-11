@@ -80,6 +80,7 @@ def load_hust_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                     "voltage_max": float(voltage.max()),
                     "voltage_min": float(voltage.min()),
                     "current_mean": float(current_a.mean()),
+                    "current_abs_mean": float(current_a.abs().mean()),
                     "current_max": float(current_a.max()),
                     "current_min": float(current_a.min()),
                     "temp_mean": HUST_TEMPERATURE_C,

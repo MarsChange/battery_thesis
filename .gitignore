@@ -6,6 +6,7 @@ docs
 tests
 .pytest_cache
 .vscode
+logs
 models
 .DS_Store
 PROJECT_CODE.md

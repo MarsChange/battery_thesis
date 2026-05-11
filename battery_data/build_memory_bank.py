@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+tqdm.monitor_interval = 0
+
 from retrieval.build_db import build_and_save
 from retrieval.search import RetrieverSearcher
 

@@ -12,6 +12,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+tqdm.monitor_interval = 0
+
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import compute_base_model_loss
 from forecasting.metrics import horizon_metrics, regression_metrics
@@ -72,6 +74,8 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "residual_terminal_max_abs": float(model_cfg.get("residual_terminal_max_abs", 0.0)),
         "residual_terminal_profile_power": float(model_cfg.get("residual_terminal_profile_power", 1.25)),
         "residual_terminal_step_max_abs": float(model_cfg.get("residual_terminal_step_max_abs", 0.0)),
+        "residual_output_scale": float(model_cfg.get("residual_output_scale", 1.0)),
+        "residual_late_output_scale": float(model_cfg.get("residual_late_output_scale", 1.0)),
         "residual_max_abs": float(model_cfg.get("residual_max_abs", 0.006)),
         "residual_confidence_floor": float(model_cfg.get("residual_confidence_floor", 0.35)),
         "residual_reference_dispersion_scale": float(model_cfg.get("residual_reference_dispersion_scale", 0.004)),
@@ -97,6 +101,8 @@ MODEL_INIT_CONFIG_OVERRIDE_KEYS = [
     "residual_terminal_max_abs",
     "residual_terminal_profile_power",
     "residual_terminal_step_max_abs",
+    "residual_output_scale",
+    "residual_late_output_scale",
     "residual_max_abs",
     "residual_confidence_floor",
     "residual_reference_dispersion_scale",

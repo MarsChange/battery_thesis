@@ -73,9 +73,34 @@ def total_variation_loss(sequence: torch.Tensor) -> torch.Tensor:
 def expert_load_balance_loss(expert_weights: torch.Tensor) -> torch.Tensor:
     if expert_weights.numel() == 0:
         return expert_weights.new_tensor(0.0)
-    mean_weight = expert_weights.mean(dim=0)
+    weights = expert_weights.reshape(-1, expert_weights.shape[-1])
+    mean_weight = weights.mean(dim=0)
     uniform = torch.full_like(mean_weight, 1.0 / max(expert_weights.size(-1), 1))
     return F.kl_div((mean_weight + 1e-8).log(), uniform, reduction="batchmean")
+
+
+def expert_horizon_diversity_loss(expert_weights_by_horizon: torch.Tensor) -> torch.Tensor:
+    """Encourage expert weights to change between early and late horizons.
+
+    This term is intentionally weak and bounded by the simplex geometry. It
+    does not choose a particular expert; it only prevents the horizon router
+    from collapsing into a constant per-window distribution when the semantic
+    horizon prior provides step-dependent evidence.
+    """
+
+    if expert_weights_by_horizon.ndim != 3 or expert_weights_by_horizon.size(1) < 2:
+        return expert_weights_by_horizon.new_tensor(0.0)
+    early = expert_weights_by_horizon[:, 0, :]
+    late = expert_weights_by_horizon[:, -1, :]
+    return -(late - early).abs().mean()
+
+
+def expert_horizon_smoothness_loss(expert_weights_by_horizon: torch.Tensor) -> torch.Tensor:
+    """Keep step-wise expert weights smooth after making them horizon-aware."""
+
+    if expert_weights_by_horizon.ndim != 3 or expert_weights_by_horizon.size(1) < 2:
+        return expert_weights_by_horizon.new_tensor(0.0)
+    return (expert_weights_by_horizon[:, 1:, :] - expert_weights_by_horizon[:, :-1, :]).pow(2).mean()
 
 
 def route_kl_loss(final_prior: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
@@ -83,6 +108,11 @@ def route_kl_loss(final_prior: torch.Tensor, expert_weights: torch.Tensor) -> to
 
     prior = final_prior.detach().clamp_min(1e-8)
     weights = expert_weights.clamp_min(1e-8)
+    if weights.ndim == 3 and prior.ndim == 2:
+        prior = prior.unsqueeze(1).expand_as(weights)
+    if weights.ndim > 2:
+        weights = weights.reshape(-1, weights.shape[-1])
+        prior = prior.reshape(-1, prior.shape[-1])
     return F.kl_div(weights.log(), prior, reduction="batchmean")
 
 
@@ -218,8 +248,12 @@ def compute_residual_expert_loss(
     terminal_forecast = terminal_mse_loss(pred_delta, target_delta)
     late_residual = late_horizon_mse_loss(outputs["moe_residual"], residual_target, fraction=late_fraction)
     under_degradation = under_degradation_loss(pred_delta, target_delta, fraction=late_fraction)
-    expert_balance = expert_load_balance_loss(outputs["expert_weights"])
-    route_kl = route_kl_loss(outputs["final_router_prior"], outputs["expert_weights"])
+    horizon_expert_weights = outputs.get("expert_weights_by_horizon", outputs["expert_weights"])
+    horizon_router_prior = outputs.get("final_router_prior_by_horizon", outputs["final_router_prior"])
+    expert_balance = expert_load_balance_loss(horizon_expert_weights)
+    route_kl = route_kl_loss(horizon_router_prior, horizon_expert_weights)
+    horizon_diversity = expert_horizon_diversity_loss(horizon_expert_weights)
+    horizon_smoothness = expert_horizon_smoothness_loss(horizon_expert_weights)
     total = (
         float(loss_cfg.get("forecast", 1.0)) * final_forecast
         + float(loss_cfg.get("residual", 1.0)) * residual_loss
@@ -234,6 +268,8 @@ def compute_residual_expert_loss(
         + float(loss_cfg.get("residual_total_variation", 0.0)) * residual_tv
         + float(loss_cfg.get("residual_magnitude", 0.0)) * residual_mag
         + float(loss_cfg.get("expert_balance", 0.01)) * expert_balance
+        + float(loss_cfg.get("horizon_router_diversity", 0.0)) * horizon_diversity
+        + float(loss_cfg.get("horizon_router_smoothness", 0.0)) * horizon_smoothness
     )
     return {
         "loss": total,
@@ -250,6 +286,8 @@ def compute_residual_expert_loss(
         "under_degradation_loss": under_degradation,
         "expert_load_balance_loss": expert_balance,
         "route_kl_loss": route_kl,
+        "horizon_router_diversity_loss": horizon_diversity,
+        "horizon_router_smoothness_loss": horizon_smoothness,
     }
 
 

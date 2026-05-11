@@ -34,7 +34,7 @@ from .schema import CANONICAL_COLUMNS, CANONICAL_NUMERIC_COLUMNS, CanonicalCell
 # ---------------------------------------------------------------------------
 
 _CACHE_DIR_NAME = ".canonical_cache"
-_ADAPTER_CACHE_SCHEMA_VERSION = 2
+_ADAPTER_CACHE_SCHEMA_VERSION = 4
 
 
 def _adapter_cache_config_signature(cfg: Dict[str, object] | None) -> str:

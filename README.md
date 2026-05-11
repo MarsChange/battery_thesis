@@ -1,8 +1,8 @@
 # Battery SOH Forecasting
 
-本项目是用于少样本、跨工况电池 SOH 多步预测的纯数值框架。核心对象是滑动窗口级 case，每个 case 包含历史 SOH、容量-电压曲线、DeltaV/R 极化 proxy、工况统计、metadata 和未来多步 SOH 标签。
+本项目是用于少样本、跨工况锂电池 SOH 多步预测的纯数值框架。样本单位是滑动窗口 case：过去 `lookback` 个 cycle 的数值特征用于预测未来 `horizon` 个 cycle 的 SOH。
 
-本项目不使用 LLM，不使用文本知识库，也不使用外部时序基础模型嵌入。历史数据库是 numerical historical degradation case memory。
+本项目不使用 LLM，不使用文本知识库，不使用 TSFM / Chronos / foundation-model embedding，也不使用充电后静置弛豫特征。历史数据库是 numerical historical degradation case memory。
 
 ## 预测目标
 
@@ -13,88 +13,72 @@ target_delta_soh = future_soh - anchor_soh
 pred_soh = anchor_soh + pred_delta_soh
 ```
 
-其中 `anchor_soh` 是输入窗口最后一个循环的 SOH，`future_soh` 是未来 K 个循环的真实 SOH。
+其中 `anchor_soh` 是输入窗口最后一个循环的 SOH。
 
 ## 主线模块
 
-当前预测主干由四部分组成：
+- `case_bank`: 将每个电芯按 cycle 切成窗口级监督样本，并提取 SOH、放电 Q-V 窗口曲线、温度、电流、功率/能量 proxy 和 metadata。
+- `RAG retrieval`: 使用可解释数值距离从历史 case memory 检索 top-k 相似窗口，不使用外部 embedding。
+- `base model`: 融合普通数值时序分支、RAG prior 分支和 reference-conditioned pairwise 分支，输出 `base_delta`。
+- `semantic router`: 第一层按已知 `chemistry_family` hard routing 到 LFP/NCM/NCA；第二层在对应 chemistry branch 内输出 4 个因子专家的动态权重。
+- `factor residual experts`: 每个 chemistry branch 下有 4 个 attention-GRU residual experts，只输出 `moe_residual`，最终 `pred_delta = base_delta + moe_residual`。
 
-- `case_bank`: 将电池循环数据切成窗口级监督样本，提取 SOH、Q-V、DeltaV/R、partial-charge、工况和 metadata 特征。
-- `RAG retrieval`: 使用可解释数值距离从历史 case memory 中检索 top-k 相似窗口。
-- `semantic hierarchical router`: 第一层使用已知 `chemistry_family` 做 hard routing，第二层用语义概念先验和小校准器输出 4 个模式专家权重。
-- `residual LSTM experts`: 每个 chemistry branch 下有 4 个 LSTM residual experts，只输出 `moe_residual`，最终 `pred_delta = base_delta + moe_residual`。
+## 特征工程
 
-长 horizon 配置支持 `residual_output_mode: hybrid_rate`。该模式把专家输出拆成小幅逐点 residual 和平滑终端退化轨迹 residual：前者修正局部偏差，后者用于修正预测末端漂移，并通过平滑 profile、step-change limit 和 residual gate 抑制突然上升或锯齿振荡。
+当前主线只使用四类可跨数据集稳定提取的数值特征：
 
-主方法检索和专家输入均不依赖外部序列 embedding。公开数据集中无法稳定提取的充电后静置电压恢复曲线不进入主线特征。
+- SOH 状态：`anchor_soh`、`soh_seq`、`recent_soh_slope`、`recent_soh_curvature`、`degradation_stage`。
+- 放电 Q-V 窗口：MIT/HUST LFP 使用 2.8-3.6 V；TJU/XJTU NCM 和 TJU-NCA 使用 3.6-4.1 V；MIT 第一个容量标定 cycle 不用于 Q-V 特征。
+- Q-V summary：`qv_dqdv_peak_value`、`qv_dqdv_peak_voltage`、`qv_dqdv_area`、`qv_capacity_span`。
+- 工况/压力：温度均值/标准差/最大值、绝对电流均值/标准差/最大值、功率或能量 proxy、循环老化状态。
+
+旧的 `DeltaV(Q)`、`R(Q)`、内阻 proxy 和 relaxation voltage 不进入当前主线预测、RAG、Router 或专家库。
 
 ## RAG 检索特征配置
 
-RAG 检索由 [configs/retrieval_features.yaml](/Users/marc/DeepScientist/battery_ts_rag/configs/retrieval_features.yaml) 控制。每个距离分量是一个布尔开关，`true` 表示参与 `composite_distance`，`false` 表示关闭。
+RAG 检索由 [configs/retrieval_features.yaml](/Users/marc/DeepScientist/battery_ts_rag/configs/retrieval_features.yaml) 控制。每个距离分量是一个布尔开关，`true` 表示参与 `composite_distance`。
 
-默认启用的距离分量：
+默认启用：
 
-- `d_soh_state`: SOH 状态距离，比较 `anchor_soh`、近期斜率、曲率和退化阶段。
-- `d_qv_shape`: 容量-电压曲线形状距离，比较 `Vd(Q)`、`DeltaV(Q)` 和 `R(Q)`。
-- `d_physics`: 物理 proxy 距离，比较 DeltaV/R 统计量、曲线斜率和 partial-charge 统计量。
-- `d_metadata`: metadata 与原始工况数值距离，比较 chemistry family、domain label、电压窗口，以及充电电流序列、放电电流序列、温度序列、归一化容量变化序列。
+- `d_soh_state`: 比较 anchor SOH、近期斜率/曲率、退化阶段和 anchor 对齐的历史 SOH 形状。
+- `d_qv_shape`: 比较指定放电电压窗口内的 `Qd(V)` 和 `dQ/dV(V)` 曲线形状。
+- `d_physics`: 比较 dQ/dV 峰值、峰值电压、Q-V 面积和容量跨度。
+- `d_metadata`: 比较 chemistry、domain、电压窗口，以及电流、温度、功率/能量 proxy、归一化容量变化的滑窗数值序列。
 
-`d_operation` 保留为兼容旧 CSV / batch 字段的诊断输出，但主配置默认关闭，不参与 `composite_distance`。原先 `d_operation` 的 C-rate 分位数、切换率、时长和 throughput 细项不再作为独立检索分量。
+默认关闭：
 
-`composite_distance` 是启用距离分量的加权和，数值越小表示 query 和 reference 越相似。`retrieval_confidence` 表示本次 top-k 检索是否可靠，数值越大越可信。
+- `d_operation`: 仅保留兼容旧输出，不作为独立检索分量。
 
-Stage-1 粗检索默认使用 `handcrafted_retrieval_embedding`，由 `anchor_soh`、SOH 斜率/曲率、Q-V summary、DeltaV/R proxy 和 metadata raw numeric summary 拼接得到。
+Stage-1 粗检索固定使用 `handcrafted_retrieval_embedding`，由 SOH 状态、Q-V summary、物理 summary 和 metadata numeric summary 拼接得到。
 
-## Router 输入
+## 专家库
 
-Router 的目标是用语义可解释的数值特征选择专家。它分两层：
-
-- 第一层：使用 metadata 中已知的 `chemistry_family` 直接 hard route 到 `LFP`、`NCM` 或 `NCA` branch，不训练 chemistry classifier。
-- 第二层：在对应 chemistry branch 内，对 4 个 residual expert mode 做 soft routing。
-
-第二层 `SemanticHierarchicalRouter` 默认输入分组：
-
-- `soh_state`: `anchor_soh`、`recent_soh_slope`、`recent_soh_curvature`。
-- `qv_polarization`: `delta_v_mean`、`delta_v_std`、`delta_v_q95`、`r_mean`、`r_std`、`r_q95`、Q-V 曲线斜率和平台形态统计。
-- `partial_charge_shape`: `q_total`、`q_mean`、`q_std`、`dq_dv_peak_value`。
-- `operation_stress`: 电流、温度、CC/CV 时长、throughput/energy 变化和 `protocol_change_rate`。
-- `retrieval`: `retrieval_confidence`、top-k 综合距离均值/标准差、top-1 距离、特征可用率和 chemistry match ratio。
-- `neighbor_vote`: top-k 历史邻居的 semantic mode vote。
-
-Router 先构造 `concept_slow_linear`、`concept_accelerating`、`concept_high_polarization`、`concept_curve_polarization`、`concept_high_operation_stress`、`concept_low_retrieval_reliability`，再形成 semantic prior，最后用小校准器做有限修正。`expert_router_contributions` 和 `semantic_explanation_json` 会记录每个输入分组和语义概念对专家选择的影响。
-
-## Expert Library
-
-默认层次专家库定义在 [configs/battery_soh.yaml](/Users/marc/DeepScientist/battery_ts_rag/configs/battery_soh.yaml)：
-
-第一层 chemistry branches：
+第一层 chemistry branch：
 
 - `LFP`
 - `NCM`
 - `NCA`
 
-每个 chemistry branch 下都有 4 个 residual LSTM experts：
+每个 chemistry branch 下有 4 个因子 residual experts：
 
-- `slow_linear`
-- `accelerating`
-- `high_polarization`
-- `curve_polarization_expert`
+- `high_temperature_expert`: 高温暴露因子。
+- `high_current_expert`: 高绝对电流因子。
+- `high_cycle_expert`: 低 SOH / 高循环老化因子。
+- `high_power_expert`: 高功率或高能量吞吐因子。
 
-总计 12 个 experts。所有 experts 都是 residual experts，不输出完整 SOH 预测。不再保留 `shared` 专家。`curve_polarization_expert` 用 Q-V 曲线、`DeltaV(Q)` 和 `R(Q)` 表示极化强度，不依赖充电后静置曲线。
+总计 12 个 experts。没有 `shared` expert；通用预测由 base model 承担。更详细说明见 [EXPERTS.md](/Users/marc/DeepScientist/battery_ts_rag/EXPERTS.md)。
 
-更详细说明见 [EXPERTS.md](/Users/marc/DeepScientist/battery_ts_rag/EXPERTS.md)。
+## Router 解释输出
 
-## Feature Documentation
+Router 先从命名数值特征构造语义概念：
 
-全项目统一特征说明由 [battery_data/feature_registry.py](/Users/marc/DeepScientist/battery_ts_rag/battery_data/feature_registry.py) 维护，并生成 [FEATURES.md](/Users/marc/DeepScientist/battery_ts_rag/FEATURES.md)。
+- `concept_high_temperature`
+- `concept_high_current`
+- `concept_high_cycle_aging`
+- `concept_high_power`
+- `concept_low_retrieval_reliability`
 
-每个特征都记录：
-
-- 中文含义和英文含义。
-- shape 和单位。
-- 数据来源和提取方法。
-- 在预测、检索、router 或 expert 中的用途。
-- 缺失处理方式和默认启用状态。
+再结合 top-k reference 的语义投票和小校准器，输出逐 horizon 的 expert weights。评估与随机片段实验会保存 `semantic_explanation_json` 和 markdown 解释，供后续外部自然语言分析使用；当前代码本身不调用 LLM。
 
 ## 运行顺序
 
@@ -122,7 +106,7 @@ Stage A 训练基础模型：
 python -m forecasting.train --config configs/battery_soh.yaml
 ```
 
-Stage B 生成按 cell_uid 划分的 OOF baseline：
+Stage B 生成按 `cell_uid` 划分的 OOF baseline：
 
 ```bash
 python -m forecasting.generate_baseline_oof --config configs/battery_soh.yaml
@@ -146,15 +130,13 @@ python -m forecasting.fewshot_adapt --config configs/battery_soh.yaml --checkpoi
 python -m forecasting.eval --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/best_adapted.pt --split target_query
 ```
 
-随机片段 SOH 预测实验：
+随机片段预测：
 
 ```bash
-python -m experiments.random_segment_soh_prediction --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/best_adapted.pt --source-dataset mit --chemistry LFP --split target_query --history-length 32 --future-length 64
+python -m experiments.random_segment_soh_prediction --config configs/battery_soh.yaml --checkpoint output/forecasting/checkpoints/best_adapted.pt --split target_query --history-length 64 --future-length 64
 ```
 
-该实验从 MIT/LFP 的目标电池中随机抽取 early、middle、late 三个退化阶段片段。每个片段给定 `N` 个历史 SOH 作为可观测上下文，预测后续 `K` 个 SOH，其中默认 `K >= 2N`。论文叙事应表述为“随机片段的多步 SOH 预测”，而不是完整生命周期预测。
-
-随机片段实验还会额外输出 `*_retrieval_topk_segments.png` 和 `*_retrieval_topk_segments.csv`。该图把 query 片段和 RAG top-k reference cases 的历史 32 步、未来 64 步按 anchor SOH 对齐后画在同一坐标系中，用于判断检索参考案例是否在退化轨迹形状上可比。
+随机片段实验会额外输出 `*_retrieval_topk_segments.png` 和 `*_retrieval_topk_segments.csv`，用于检查 query 与 top-k reference 在历史片段和未来片段上的形态是否可比。
 
 ## 输出路径
 
@@ -168,5 +150,5 @@ python -m experiments.random_segment_soh_prediction --config configs/battery_soh
 
 - `target_query` 不得进入训练集。
 - `target_query` 不得进入 RAG reference database。
-- `target_query` 可以作为 query 用于检索质量诊断和最终评估。
-- split 必须按 `cell_uid` 组织，不能把同一个电芯的窗口随机分到训练和测试两侧。
+- `target_query` 可以作为 query 用于检索诊断和最终评估。
+- split 必须按 `cell_uid` 组织，不能按窗口随机切分。

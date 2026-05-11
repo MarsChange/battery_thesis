@@ -207,7 +207,11 @@ def augment_cycle_feature_frame(
     df["capacity_ratio"] = _numeric_series(df, "soh")
     df["voltage_range"] = _numeric_series(df, "voltage_max") - _numeric_series(df, "voltage_min")
     df["temp_range"] = _numeric_series(df, "temp_max") - _numeric_series(df, "temp_min")
-    df["current_abs_mean"] = _numeric_series(df, "current_mean").abs()
+    current_abs_mean = _numeric_series(df, "current_abs_mean").abs()
+    if current_abs_mean.notna().any():
+        df["current_abs_mean"] = current_abs_mean
+    else:
+        df["current_abs_mean"] = _numeric_series(df, "current_mean").abs()
 
     for column in ["soh", "voltage_mean", "temp_mean", "current_mean"]:
         series = _numeric_series(df, column)

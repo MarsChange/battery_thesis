@@ -13,6 +13,42 @@ from battery_data.schema import CanonicalCell
 MIT_CHEMISTRY_FAMILY = "LFP"
 
 
+def _load_mit_cycle_signal_stats(summary_path: Path) -> pd.DataFrame:
+    """Aggregate raw MIT per-cycle voltage/current/temperature statistics.
+
+    The MIT summary files contain capacity, energy and temperature summaries,
+    but they do not include current statistics. The interpolated cycle table is
+    the authoritative source for current and voltage extrema used by operation
+    features, RAG diagnostics, and residual expert inputs.
+    """
+
+    raw_path = summary_path.with_name(summary_path.name.replace("_structure_summary.csv", "_structure_cycles_interpolated.csv"))
+    if not raw_path.exists():
+        return pd.DataFrame()
+
+    usecols = ["cycle_index", "voltage", "current", "temperature"]
+    raw = pd.read_csv(raw_path, usecols=usecols)
+    for col in usecols:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    raw["current_abs"] = raw["current"].abs()
+
+    grouped = raw.groupby("cycle_index", sort=True)
+    stats = grouped.agg(
+        voltage_max=("voltage", "max"),
+        voltage_min=("voltage", "min"),
+        current_mean=("current", "mean"),
+        current_abs_mean=("current_abs", "mean"),
+        current_max=("current", "max"),
+        current_min=("current", "min"),
+        temp_mean=("temperature", "mean"),
+        temp_max=("temperature", "max"),
+        temp_min=("temperature", "min"),
+    ).reset_index()
+    stats = stats.rename(columns={"cycle_index": "cycle_idx"})
+    stats["cycle_idx"] = stats["cycle_idx"].astype(int)
+    return stats
+
+
 def _infer_mit_metadata(summary_path: Path, meta_path: Path | None, cfg: Dict[str, object]) -> Dict[str, object]:
     protocol = None
     if meta_path and meta_path.exists():
@@ -70,6 +106,24 @@ def load_mit_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 "energy_discharge": summary["discharge_energy"].astype(float),
             }
         )
+        signal_stats = _load_mit_cycle_signal_stats(summary_path)
+        if not signal_stats.empty:
+            base = base.merge(signal_stats, on="cycle_idx", how="left", suffixes=("", "_raw"))
+            for col in [
+                "voltage_max",
+                "voltage_min",
+                "current_mean",
+                "current_abs_mean",
+                "current_max",
+                "current_min",
+                "temp_mean",
+                "temp_max",
+                "temp_min",
+            ]:
+                raw_col = f"{col}_raw"
+                if raw_col in base.columns:
+                    base[col] = base[col].combine_first(base[raw_col])
+                    base = base.drop(columns=[raw_col])
         meta_path = summary_path.with_name(summary_path.name.replace("_summary.csv", "_meta.csv"))
         canonical = finalize_canonical_cell_frame(base, _infer_mit_metadata(summary_path, meta_path, cfg), cfg)
         cells.append(

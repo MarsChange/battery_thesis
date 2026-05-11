@@ -203,7 +203,7 @@ def _expert_names_from_predictions(prediction_rows: pd.DataFrame) -> List[str]:
                 mode_weights = payload.get("mode_weights", {})
                 if isinstance(mode_weights, Mapping) and mode_weights:
                     return list(mode_weights.keys())
-    return ["slow_linear", "accelerating", "high_polarization", "curve_polarization_expert"]
+    return ["high_temperature_expert", "high_current_expert", "high_cycle_expert", "high_power_expert"]
 
 
 def _expert_weights_for_row(row: pd.Series, expert_names: List[str]) -> np.ndarray:
@@ -264,10 +264,10 @@ def _collect_expert_weights(
 def _write_expert_weight_plot(frame: pd.DataFrame, x_col: str, expert_names: List[str], output_path: Path, title: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     colors = {
-        "slow_linear": "#2563eb",
-        "accelerating": "#dc2626",
-        "high_polarization": "#f59e0b",
-        "curve_polarization_expert": "#16a34a",
+        "high_temperature_expert": "#dc2626",
+        "high_current_expert": "#2563eb",
+        "high_cycle_expert": "#7c3aed",
+        "high_power_expert": "#f59e0b",
     }
     figure, axis = plt.subplots(figsize=(11, 5.5), dpi=180)
     for name in expert_names:
@@ -395,10 +395,10 @@ def _write_semantic_markdown(
         f"- Lifecycle RMSE: {float(metrics.get('rmse', float('nan'))):.6f}",
         "",
         "## Expert Semantics",
-        "- `slow_linear`: slow and near-linear degradation residual correction.",
-        "- `accelerating`: accelerated degradation or knee-like residual correction.",
-        "- `high_polarization`: correction driven by elevated resistance or operation stress.",
-        "- `curve_polarization_expert`: correction driven by Q-V curve shape and local polarization signals.",
+        "- `high_temperature_expert`: residual correction associated with high thermal exposure.",
+        "- `high_current_expert`: residual correction associated with high absolute current stress.",
+        "- `high_cycle_expert`: residual correction associated with low SOH / late-cycle aging state.",
+        "- `high_power_expert`: residual correction associated with high power or energy-throughput stress.",
         "",
         "## Mean Expert Weights By Prediction Horizon",
     ]

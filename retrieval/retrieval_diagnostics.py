@@ -211,34 +211,40 @@ def save_qv_overlay(
     retriever: MultiStageBatteryRetriever,
     save_path: str | Path,
 ) -> None:
-    """保存 query 与 top-k reference 的 DeltaV(Q) / R(Q) 叠加图。"""
+    """保存 query 与 top-k reference 的 Qd(V) / dQdV(V) 叠加图。
+
+    当前主线 Q-V 特征只使用指定放电电压窗口内的数值曲线：
+    channel 0 是电压网格，channel 1 是窗口内累计放电容量 Qd(V)，
+    channel 2 是 dQ/dV(V)。不再绘制旧的 DeltaV(Q) 或 R(Q) proxy。
+    """
 
     figure, axes = plt.subplots(1, 2, figsize=(12, 4.5), dpi=180)
     query_qv = retriever.arrays["qv_maps"][query_idx, -1]
     query_mask = retriever.arrays["qv_masks"][query_idx, -1]
-    q_grid = np.linspace(0.0, 1.0, query_qv.shape[-1], dtype=np.float32)
-    if query_mask[4] > 0:
-        axes[0].plot(q_grid, query_qv[4], label="query DeltaV(Q)", linewidth=2.0, color="black")
+    query_voltage = query_qv[0] if query_qv.shape[0] > 0 and query_mask[0] > 0 else np.linspace(0.0, 1.0, query_qv.shape[-1])
+    if query_mask[1] > 0:
+        axes[0].plot(query_voltage, query_qv[1], label="query Qd(V)", linewidth=2.0, color="black")
     else:
-        axes[0].text(0.5, 0.5, "query DeltaV unavailable", ha="center", va="center", transform=axes[0].transAxes)
-    if query_mask[5] > 0:
-        axes[1].plot(q_grid, query_qv[5], label="query R(Q)", linewidth=2.0, color="black")
+        axes[0].text(0.5, 0.5, "query Qd(V) unavailable", ha="center", va="center", transform=axes[0].transAxes)
+    if query_mask[2] > 0:
+        axes[1].plot(query_voltage, query_qv[2], label="query dQ/dV(V)", linewidth=2.0, color="black")
     else:
-        axes[1].text(0.5, 0.5, "query R(Q) unavailable", ha="center", va="center", transform=axes[1].transAxes)
+        axes[1].text(0.5, 0.5, "query dQ/dV(V) unavailable", ha="center", va="center", transform=axes[1].transAxes)
     valid = np.flatnonzero(result.retrieval_mask > 0)
     for rank, pos in enumerate(valid.tolist(), start=1):
         ref_case_id = int(result.neighbor_case_ids[pos])
         ref_idx = retriever.case_id_to_index[ref_case_id]
         ref_qv = retriever.arrays["qv_maps"][ref_idx, -1]
         ref_mask = retriever.arrays["qv_masks"][ref_idx, -1]
-        if ref_mask[4] > 0:
-            axes[0].plot(q_grid, ref_qv[4], alpha=0.4, linewidth=1.0, label=f"ref_{rank}" if rank <= 3 else None)
-        if ref_mask[5] > 0:
-            axes[1].plot(q_grid, ref_qv[5], alpha=0.4, linewidth=1.0, label=f"ref_{rank}" if rank <= 3 else None)
-    axes[0].set_title("DeltaV(Q) overlay")
-    axes[1].set_title("R(Q) overlay")
+        ref_voltage = ref_qv[0] if ref_qv.shape[0] > 0 and ref_mask[0] > 0 else np.linspace(0.0, 1.0, ref_qv.shape[-1])
+        if ref_mask[1] > 0:
+            axes[0].plot(ref_voltage, ref_qv[1], alpha=0.4, linewidth=1.0, label=f"ref_{rank}" if rank <= 3 else None)
+        if ref_mask[2] > 0:
+            axes[1].plot(ref_voltage, ref_qv[2], alpha=0.4, linewidth=1.0, label=f"ref_{rank}" if rank <= 3 else None)
+    axes[0].set_title("Qd(V) overlay in selected discharge window")
+    axes[1].set_title("dQ/dV(V) overlay in selected discharge window")
     for axis in axes:
-        axis.set_xlabel("Normalized capacity Q")
+        axis.set_xlabel("Voltage (V)")
         axis.grid(True, alpha=0.25)
         handles, labels = axis.get_legend_handles_labels()
         if labels:

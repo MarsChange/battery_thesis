@@ -6,34 +6,54 @@
 
 schema_version: "1.0"
 
-# SOH 状态距离：anchor_soh、recent_soh_slope、recent_soh_curvature 和退化阶段。
+# SOH 状态距离：anchor_soh、recent_soh_slope、recent_soh_curvature、
+# anchor 对齐的完整历史 SOH 形态、历史斜率序列和退化阶段。
 d_soh_state: true
 
-# 容量-电压曲线形状距离：Vd(Q)、DeltaV(Q)、R(Q) 和 Q-V 统计量。
+# 容量-电压曲线形状距离：指定放电电压窗口内的 Qd(V)、dQ/dV(V) 和 Q-V summary。
 d_qv_shape: true
 
-# 物理 proxy 距离：DeltaV(Q) 与 R(Q) 的均值、标准差、高分位和曲线斜率。
+# 物理 proxy 距离：dQ/dV 峰值、峰值电压、曲线面积和窗口容量跨度。
 d_physics: true
 
 # 工况距离已默认关闭：
 # 原 `d_operation` 的细项不再作为独立检索分量使用。
-# 充放电电流、温度、归一化容量变化这些原始滑窗数值已并入 d_metadata 的 numeric raw matching。
+# 温度、电流、功率和归一化容量变化这些滑窗数值已并入 d_metadata 的 numeric matching。
 d_operation: false
 
 # 元信息距离：类别 metadata penalty + 原始滑窗数值匹配。
-# 数值匹配包括充电电流序列、放电电流序列、温度序列和归一化容量变化序列。
+# 数值匹配包括绝对电流序列、温度序列、功率/能量 proxy 序列和归一化容量变化序列。
 d_metadata: true
 
 weights:
-  d_soh_state: 0.25
-  d_qv_shape: 0.30
-  d_physics: 0.20
+  d_soh_state: 0.85
+  d_qv_shape: 0.08
+  d_physics: 0.03
   d_operation: 0.00
-  d_metadata: 0.25
+  d_metadata: 0.04
+
+soh_state:
+  # current_state: anchor_soh + recent slope + curvature.
+  # history_shape: lookback SOH sequence after subtracting anchor SOH.
+  # history_slope: cycle-to-cycle SOH change sequence inside the lookback window.
+  # stage: early/middle/late categorical degradation stage.
+  current_state_weight: 0.03
+  history_shape_weight: 0.90
+  history_slope_weight: 0.05
+  stage_weight: 0.02
+  # SOH-scale normalizers. 0.015 means a 1.5 percentage-point mismatch over
+  # the anchored history is treated as a substantial shape mismatch.
+  history_shape_scale: 0.015
+  # Per-cycle slope-scale normalizer for the history derivative sequence.
+  history_slope_scale: 0.0008
+  # Larger values emphasize cycles closer to the anchor.
+  recency_weight_power: 1.5
+  # Stage-1 coarse retrieval includes a resampled anchored SOH history vector.
+  stage1_history_points: 16
 
 stage1_retrieval:
   # Stage-1 粗检索固定使用 handcrafted battery embedding：
-  # anchor SOH + SOH slope/curvature + Q-V summary + ΔV/R proxy + metadata raw numeric matching features。
+  # anchor SOH + SOH slope/curvature + Q-V window summary + metadata numeric matching features。
   top_m: 200
 
 final_topk:
@@ -46,9 +66,9 @@ final_topk:
 
 qv_shape:
   channel_weights:
-    Vd: 0.25
-    DeltaV: 0.40
-    R: 0.35
+    Qd: 0.35
+    dQdV: 0.65
+  channels: ["Qd", "dQdV"]
   use_vc: false
   use_ic: false
   use_id: false
@@ -64,12 +84,12 @@ metadata_distance_weights:
   raw_numeric: 0.60
 
 metadata_numeric_weights:
-  # 充电电流原始滑窗序列，来自 Q-V feature map 的 Ic(Q) 通道按 cycle 聚合。
-  charge_current_seq: 0.25
-  # 放电电流原始滑窗序列，来自 Q-V feature map 的 Id(Q) 通道按 cycle 聚合后取绝对值。
-  discharge_current_seq: 0.25
-  # 温度原始滑窗序列，来自 per-cycle temp_mean / operation sequence。
-  temperature_seq: 0.20
+  # 绝对电流滑窗序列，来自 Q-V feature map 的 Id_abs(V) 或 operation summary。
+  current_abs_seq: 0.25
+  # 温度滑窗序列，来自 per-cycle temp_mean / operation sequence。
+  temperature_seq: 0.25
+  # 功率/能量 proxy 滑窗序列，来自 |V*I| 或 charge/discharge energy delta。
+  power_energy_seq: 0.20
   # 归一化容量变化序列，使用 SOH/capacity ratio 的 cycle-to-cycle 差分。
   normalized_capacity_delta_seq: 0.30
 

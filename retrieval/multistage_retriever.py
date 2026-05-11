@@ -24,6 +24,7 @@ from retrieval.physics_distance import (
     CORE_COMPONENT_NAMES,
     OPTIONAL_COMPONENT_NAMES,
     QV_CHANNEL_TO_INDEX,
+    curve_shape_distance,
     compute_composite_distance,
     compute_metadata_distance,
     compute_operation_distance,
@@ -32,6 +33,7 @@ from retrieval.physics_distance import (
     compute_retrieval_confidence,
     compute_soh_state_distance,
     degradation_stage_distance,
+    soh_history_shape_distance,
 )
 
 try:
@@ -43,7 +45,7 @@ except Exception:  # pragma: no cover - fallback path is enough for tests withou
 CORE_COMPONENTS = list(CORE_COMPONENT_NAMES)
 COMPONENT_NAMES = list(ALL_COMPONENT_NAMES)
 OPTIONAL_COMPONENTS = list(OPTIONAL_COMPONENT_NAMES)
-RETRIEVAL_CACHE_SCHEMA_VERSION = "retrieval_confidence_reference_quality_v1"
+RETRIEVAL_CACHE_SCHEMA_VERSION = "qv_window_factor_experts_v1"
 
 
 def _read_case_rows(case_bank_dir: Path) -> pd.DataFrame:
@@ -269,24 +271,29 @@ class MultiStageBatteryRetriever:
         self._row_target_horizon = self.case_rows["target_horizon"].fillna(0).to_numpy(dtype=np.int64)
         self._future_delta_finite = np.isfinite(np.asarray(self.arrays["future_delta"], dtype=np.float32)).all(axis=1)
         self._state_matrix = self.case_rows[["anchor_soh", "recent_soh_slope", "recent_soh_curvature"]].fillna(0.0).to_numpy(dtype=np.float32)
+        self._soh_history_delta_matrix, self._soh_history_slope_matrix = self._build_soh_history_shape_matrices()
         self._qv_summary_matrix, self._qv_summary_mask = self._build_qv_summary_matrix()
         self._physics_matrix = np.asarray(self.arrays["anchor_physics_features"], dtype=np.float32)
         self._physics_mask_matrix = np.asarray(self.arrays["physics_feature_masks"][:, -1, :], dtype=np.float32)
         self._metadata_summary_matrix = np.asarray(self.handcrafted_retrieval_embedding[:, -12:], dtype=np.float32)
+
+    def _build_soh_history_shape_matrices(self) -> tuple[np.ndarray, np.ndarray]:
+        soh_seq = np.asarray(self.arrays["soh_seq"], dtype=np.float32)
+        anchors = soh_seq[:, -1:]
+        anchors = np.where(np.isfinite(anchors), anchors, np.nanmean(soh_seq, axis=1, keepdims=True))
+        delta = (soh_seq - anchors).astype(np.float32)
+        slope = np.diff(soh_seq, axis=1).astype(np.float32)
+        return delta, slope
 
     def _build_qv_summary_matrix(self) -> tuple[np.ndarray, np.ndarray]:
         cycle_last = np.asarray(self.arrays["cycle_stats"][:, -1, :], dtype=np.float32)
         values = []
         masks = []
         for name, fallback in [
-            ("delta_v_mean", None),
-            ("delta_v_std", None),
-            ("delta_v_q95", "delta_v_max"),
-            ("r_mean", None),
-            ("r_std", None),
-            ("r_q95", None),
-            ("vc_curve_slope_mean", "vc_slope_mean"),
-            ("vd_curve_slope_mean", "vd_slope_mean"),
+            ("qv_dqdv_peak_value", "dq_dv_peak_value"),
+            ("qv_dqdv_peak_voltage", "dq_dv_peak_position"),
+            ("qv_dqdv_area", None),
+            ("qv_capacity_span", "q_total"),
         ]:
             feature_idx = self._cycle_feature_index(name)
             if feature_idx is None and fallback is not None:
@@ -402,27 +409,24 @@ class MultiStageBatteryRetriever:
         cycle_last = np.asarray(self.arrays["cycle_stats"][idx, -1], dtype=np.float32)
         stats: Dict[str, float] = {}
         for name in [
-            "delta_v_mean",
-            "delta_v_std",
-            "delta_v_q95",
-            "delta_v_max",
-            "r_mean",
-            "r_std",
-            "r_q95",
-            "vc_slope_mean",
-            "vd_slope_mean",
-            "vc_curve_slope_mean",
-            "vd_curve_slope_mean",
+            "qv_dqdv_peak_value",
+            "qv_dqdv_peak_voltage",
+            "qv_dqdv_area",
+            "qv_capacity_span",
+            "qv_power_energy_proxy",
+            "dq_dv_peak_value",
+            "dq_dv_peak_position",
+            "q_total",
         ]:
             feature_idx = self._cycle_feature_index(name)
             if feature_idx is not None and feature_idx < cycle_last.shape[0]:
                 stats[name] = float(cycle_last[feature_idx])
-        if "delta_v_q95" not in stats and "delta_v_max" in stats:
-            stats["delta_v_q95"] = stats["delta_v_max"]
-        if "vc_curve_slope_mean" not in stats and "vc_slope_mean" in stats:
-            stats["vc_curve_slope_mean"] = stats["vc_slope_mean"]
-        if "vd_curve_slope_mean" not in stats and "vd_slope_mean" in stats:
-            stats["vd_curve_slope_mean"] = stats["vd_slope_mean"]
+        if "qv_dqdv_peak_value" not in stats and "dq_dv_peak_value" in stats:
+            stats["qv_dqdv_peak_value"] = stats["dq_dv_peak_value"]
+        if "qv_dqdv_peak_voltage" not in stats and "dq_dv_peak_position" in stats:
+            stats["qv_dqdv_peak_voltage"] = stats["dq_dv_peak_position"]
+        if "qv_capacity_span" not in stats and "q_total" in stats:
+            stats["qv_capacity_span"] = stats["q_total"]
         return stats
 
     def _state_dict(self, idx: int) -> Dict[str, object]:
@@ -434,6 +438,7 @@ class MultiStageBatteryRetriever:
             "recent_soh_curvature": float(row.get("recent_soh_curvature", 0.0)),
             "degradation_stage": str(row.get("degradation_stage", "unknown")),
             "normalized_cycle_index": float(int(row.get("window_end", 0)) / max(lookback, 1)),
+            "soh_seq": np.asarray(self.arrays["soh_seq"][idx], dtype=np.float32),
         }
 
     def _qv_dict(self, idx: int) -> Dict[str, object]:
@@ -506,9 +511,9 @@ class MultiStageBatteryRetriever:
             "nominal_capacity_bucket": row.get("nominal_capacity_bucket", "unknown"),
             "temperature_bucket": row.get("temperature_bucket", "unknown"),
             "charge_rate_bucket": row.get("charge_rate_bucket", "unknown"),
-            "charge_current_seq": _qv_channel_sequence(QV_CHANNEL_TO_INDEX["Ic"], absolute=True),
-            "discharge_current_seq": _qv_channel_sequence(QV_CHANNEL_TO_INDEX["Id"], absolute=True),
+            "current_abs_seq": _qv_channel_sequence(QV_CHANNEL_TO_INDEX["Id_abs"], absolute=True),
             "temperature_seq": _operation_sequence("temp_mean"),
+            "power_energy_seq": _qv_channel_sequence(QV_CHANNEL_TO_INDEX["Power_abs"], absolute=True),
             "normalized_capacity_delta_seq": capacity_delta,
         }
 
@@ -545,13 +550,13 @@ class MultiStageBatteryRetriever:
             capacity_delta[1:] = np.diff(soh_seq)
             capacity_delta[~np.isfinite(capacity_delta)] = np.nan
         metadata = {
-            "charge_current_seq": _qv_mean_sequence(QV_CHANNEL_TO_INDEX["Ic"]),
-            "discharge_current_seq": _qv_mean_sequence(QV_CHANNEL_TO_INDEX["Id"]),
+            "current_abs_seq": _qv_mean_sequence(QV_CHANNEL_TO_INDEX["Id_abs"]),
             "temperature_seq": _operation_sequence("temp_mean"),
+            "power_energy_seq": _qv_mean_sequence(QV_CHANNEL_TO_INDEX["Power_abs"]),
             "normalized_capacity_delta_seq": capacity_delta,
         }
         values: list[float] = []
-        for name in ["charge_current_seq", "discharge_current_seq", "temperature_seq", "normalized_capacity_delta_seq"]:
+        for name in ["current_abs_seq", "temperature_seq", "power_energy_seq", "normalized_capacity_delta_seq"]:
             seq = np.asarray(metadata.get(name, []), dtype=np.float32).reshape(-1)
             finite = seq[np.isfinite(seq)]
             if finite.size:
@@ -563,8 +568,8 @@ class MultiStageBatteryRetriever:
     def _metadata_numeric_matrix(self, chunk_size: int = 1024) -> np.ndarray:
         """Build Stage-1 numeric metadata summaries for all cases.
 
-        The 12 dimensions are mean/std/last for charge-current sequence,
-        discharge-current sequence, temperature sequence and normalized SOH
+        The 12 dimensions are mean/std/last for absolute-current sequence,
+        temperature sequence, power/energy proxy sequence and normalized SOH
         delta sequence. This is equivalent to `_metadata_numeric_summary`, but
         uses chunked NumPy operations to avoid slow per-row parquet/pandas access.
         """
@@ -599,7 +604,7 @@ class MultiStageBatteryRetriever:
             chunk_maps = qv_maps[start:end]
             chunk_masks = qv_masks[start:end]
             sequences: list[np.ndarray] = []
-            for channel_idx in [QV_CHANNEL_TO_INDEX["Ic"], QV_CHANNEL_TO_INDEX["Id"]]:
+            for channel_idx in [QV_CHANNEL_TO_INDEX["Id_abs"]]:
                 values = np.abs(chunk_maps[:, :, channel_idx, :]).astype(np.float32)
                 values = np.where(np.isfinite(values), values, np.nan)
                 seq = np.nanmean(values, axis=2).astype(np.float32)
@@ -609,6 +614,17 @@ class MultiStageBatteryRetriever:
 
             if temp_pos is not None:
                 sequences.append(op_seq[start:end, :, temp_pos].astype(np.float32))
+            else:
+                sequences.append(np.full((end - start, soh_seq.shape[1]), np.nan, dtype=np.float32))
+
+            power_idx = QV_CHANNEL_TO_INDEX["Power_abs"]
+            if qv_maps.shape[2] > power_idx:
+                power_values = np.abs(chunk_maps[:, :, power_idx, :]).astype(np.float32)
+                power_values = np.where(np.isfinite(power_values), power_values, np.nan)
+                power_seq = np.nanmean(power_values, axis=2).astype(np.float32)
+                if chunk_masks.ndim == 3 and chunk_masks.shape[2] > power_idx:
+                    power_seq = np.where(chunk_masks[:, :, power_idx] > 0, power_seq, np.nan).astype(np.float32)
+                sequences.append(power_seq)
             else:
                 sequences.append(np.full((end - start, soh_seq.shape[1]), np.nan, dtype=np.float32))
 
@@ -627,7 +643,7 @@ class MultiStageBatteryRetriever:
         r_phy = np.asarray(self.arrays["physics_feature_masks"][ref_idx, -1], dtype=np.float32)
         q_metadata = self._metadata_dict(query_idx)
         r_metadata = self._metadata_dict(ref_idx)
-        metadata_keys = ["charge_current_seq", "discharge_current_seq", "temperature_seq", "normalized_capacity_delta_seq"]
+        metadata_keys = ["current_abs_seq", "temperature_seq", "power_energy_seq", "normalized_capacity_delta_seq"]
         metadata_common = np.asarray(
             [
                 1.0
@@ -664,24 +680,35 @@ class MultiStageBatteryRetriever:
 
     def _build_handcrafted_embeddings(self) -> np.ndarray:
         cache_path = self.case_bank_dir / "case_handcrafted_retrieval_embedding.npy"
-        expected_dim = 3 + 8 + int(np.asarray(self.arrays["anchor_physics_features"]).shape[1]) + 12
+        history_points = int(dict(self.rag_config.get("soh_state", {}) or {}).get("stage1_history_points", 16))
+        expected_dim = 3 + history_points + 4 + int(np.asarray(self.arrays["anchor_physics_features"]).shape[1]) + 12
         if cache_path.exists():
             cached = np.load(cache_path)
             if cached.shape == (len(self.case_rows), expected_dim):
                 return np.asarray(cached, dtype=np.float32)
 
         state = self.case_rows[["anchor_soh", "recent_soh_slope", "recent_soh_curvature"]].fillna(0.0).to_numpy(dtype=np.float32)
+        soh_seq = np.asarray(self.arrays["soh_seq"], dtype=np.float32)
+        anchored_history = soh_seq - soh_seq[:, -1:]
+        if history_points > 0:
+            source_positions = np.linspace(0, max(soh_seq.shape[1] - 1, 0), soh_seq.shape[1], dtype=np.float32)
+            target_positions = np.linspace(0, max(soh_seq.shape[1] - 1, 0), history_points, dtype=np.float32)
+            history_vec = np.stack(
+                [
+                    np.interp(target_positions, source_positions, np.nan_to_num(row, nan=0.0)).astype(np.float32)
+                    for row in anchored_history
+                ],
+                axis=0,
+            )
+        else:
+            history_vec = np.zeros((anchored_history.shape[0], 0), dtype=np.float32)
         cycle_last = np.asarray(self.arrays["cycle_stats"][:, -1, :], dtype=np.float32)
         qv_columns = []
         for name, fallback in [
-            ("delta_v_mean", None),
-            ("delta_v_std", None),
-            ("delta_v_q95", "delta_v_max"),
-            ("r_mean", None),
-            ("r_std", None),
-            ("r_q95", None),
-            ("vc_curve_slope_mean", "vc_slope_mean"),
-            ("vd_curve_slope_mean", "vd_slope_mean"),
+            ("qv_dqdv_peak_value", "dq_dv_peak_value"),
+            ("qv_dqdv_peak_voltage", "dq_dv_peak_position"),
+            ("qv_dqdv_area", None),
+            ("qv_capacity_span", "q_total"),
         ]:
             feature_idx = self._cycle_feature_index(name)
             if feature_idx is None and fallback is not None:
@@ -693,12 +720,25 @@ class MultiStageBatteryRetriever:
         qv_vec = np.stack(qv_columns, axis=1).astype(np.float32)
         physics = np.asarray(self.arrays["anchor_physics_features"], dtype=np.float32)
         metadata_numeric = self._metadata_numeric_matrix()
-        embedding = np.concatenate([state, qv_vec, physics, metadata_numeric], axis=1).astype(np.float32)
+        embedding = np.concatenate([state, history_vec, qv_vec, physics, metadata_numeric], axis=1).astype(np.float32)
         np.save(cache_path, embedding)
         return embedding
 
     def _build_stage1_embeddings(self) -> np.ndarray:
-        return np.asarray(self.handcrafted_embeddings, dtype=np.float32)
+        raw = np.asarray(self.handcrafted_embeddings, dtype=np.float32)
+        if raw.size == 0 or len(self.db_indices) == 0:
+            return np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        db_values = raw[self.db_indices]
+        center = np.nanmedian(db_values, axis=0)
+        q25 = np.nanpercentile(db_values, 25, axis=0)
+        q75 = np.nanpercentile(db_values, 75, axis=0)
+        scale = q75 - q25
+        fallback_scale = np.nanstd(db_values, axis=0)
+        scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, fallback_scale)
+        scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
+        standardized = (raw - center[None, :]) / scale[None, :]
+        standardized = np.nan_to_num(standardized, nan=0.0, posinf=8.0, neginf=-8.0)
+        return np.clip(standardized, -8.0, 8.0).astype(np.float32)
 
     def _coarse_candidates(self, query_idx: int) -> np.ndarray:
         if len(self.db_case_ids) == 0:
@@ -874,7 +914,42 @@ class MultiStageBatteryRetriever:
         state_scale = np.asarray([0.1, 0.01, 0.005], dtype=np.float32)
         d_state_numeric = np.sqrt(np.mean(((r_state - q_state[None, :]) / state_scale[None, :]) ** 2, axis=1))
         d_stage = (self._row_degradation_stage[ref_indices] != self._row_degradation_stage[query_idx]).astype(np.float32)
-        d_soh_state = (0.85 * d_state_numeric + 0.15 * d_stage).astype(np.float32)
+        soh_cfg = dict(self.rag_config.get("soh_state", {}) or {})
+        recency_power = float(soh_cfg.get("recency_weight_power", 1.5))
+        history_scale = max(float(soh_cfg.get("history_shape_scale", 0.015)), 1e-8)
+        slope_scale = max(float(soh_cfg.get("history_slope_scale", 0.0008)), 1e-8)
+        q_hist = self._soh_history_delta_matrix[query_idx]
+        r_hist = self._soh_history_delta_matrix[ref_indices]
+        hist_mask = np.isfinite(r_hist) & np.isfinite(q_hist[None, :])
+        hist_weights = np.linspace(1.0 / q_hist.shape[0], 1.0, q_hist.shape[0], dtype=np.float32) ** max(recency_power, 0.0)
+        hist_weights = hist_weights / max(float(np.mean(hist_weights)), 1e-6)
+        hist_diff = ((r_hist - q_hist[None, :]) / history_scale) ** 2
+        hist_weighted = hist_diff * hist_mask * hist_weights[None, :]
+        hist_denom = np.maximum((hist_mask * hist_weights[None, :]).sum(axis=1), 1e-6)
+        d_history_shape = np.sqrt(hist_weighted.sum(axis=1) / hist_denom).astype(np.float32)
+
+        q_slope = self._soh_history_slope_matrix[query_idx]
+        r_slope = self._soh_history_slope_matrix[ref_indices]
+        slope_mask = np.isfinite(r_slope) & np.isfinite(q_slope[None, :])
+        slope_weights = np.linspace(1.0 / max(q_slope.shape[0], 1), 1.0, q_slope.shape[0], dtype=np.float32) ** max(recency_power, 0.0)
+        slope_weights = slope_weights / max(float(np.mean(slope_weights)), 1e-6)
+        slope_diff = ((r_slope - q_slope[None, :]) / slope_scale) ** 2
+        slope_weighted = slope_diff * slope_mask * slope_weights[None, :]
+        slope_denom = np.maximum((slope_mask * slope_weights[None, :]).sum(axis=1), 1e-6)
+        d_history_slope = np.sqrt(slope_weighted.sum(axis=1) / slope_denom).astype(np.float32)
+
+        current_weight = max(float(soh_cfg.get("current_state_weight", 0.30)), 0.0)
+        history_weight = max(float(soh_cfg.get("history_shape_weight", 0.50)), 0.0)
+        slope_weight = max(float(soh_cfg.get("history_slope_weight", 0.15)), 0.0)
+        stage_weight = max(float(soh_cfg.get("stage_weight", 0.05)), 0.0)
+        soh_weight_sum = max(current_weight + history_weight + slope_weight + stage_weight, 1e-6)
+        d_soh_state = (
+            current_weight * d_state_numeric
+            + history_weight * d_history_shape
+            + slope_weight * d_history_slope
+            + stage_weight * d_stage
+        ) / soh_weight_sum
+        d_soh_state = d_soh_state.astype(np.float32)
 
         qv_maps = np.asarray(self.arrays["qv_maps"], dtype=np.float32)
         qv_masks = np.asarray(self.arrays["qv_masks"], dtype=np.float32)
@@ -883,16 +958,31 @@ class MultiStageBatteryRetriever:
         q_mask = qv_masks[query_idx, -1]
         r_masks = qv_masks[ref_indices, -1]
         qv_cfg = dict(self.rag_config.get("qv_shape", {}) or {})
-        qv_weights = dict(qv_cfg.get("channel_weights", {}) or {"Vd": 0.25, "DeltaV": 0.40, "R": 0.35})
+        qv_weights = dict(qv_cfg.get("channel_weights", {}) or {"Qd": 0.35, "dQdV": 0.65})
         qv_terms = np.zeros(ref_indices.size, dtype=np.float32)
         qv_weight_sum = np.zeros(ref_indices.size, dtype=np.float32)
-        for channel_name in ["Vd", "DeltaV", "R"]:
+        for channel_name in list(qv_cfg.get("channels", ["Qd", "dQdV"])):
             channel_idx = QV_CHANNEL_TO_INDEX[channel_name]
             common = (q_mask[channel_idx] > 0) & (r_masks[:, channel_idx] > 0)
             if not np.any(common):
                 continue
-            diff = r_maps[:, channel_idx, :] - q_map[channel_idx][None, :]
-            channel_dist = np.sqrt(np.nanmean(diff * diff, axis=1)).astype(np.float32)
+            q_curve = q_map[channel_idx].astype(np.float32)
+            r_curves = r_maps[:, channel_idx, :].astype(np.float32)
+            finite = np.isfinite(r_curves) & np.isfinite(q_curve[None, :])
+            safe_r = np.where(finite, r_curves, np.nan)
+            safe_q = np.where(np.isfinite(q_curve), q_curve, np.nan)
+            q_mean = np.nanmean(safe_q).astype(np.float32)
+            q_std = max(float(np.nanstd(safe_q)), 1e-4)
+            ref_mean = np.nanmean(safe_r, axis=1).astype(np.float32)
+            ref_std = np.maximum(np.nanstd(safe_r, axis=1).astype(np.float32), 1e-4)
+            q_shape = (q_curve[None, :] - q_mean) / q_std
+            ref_shape = (r_curves - ref_mean[:, None]) / ref_std[:, None]
+            shape_diff = np.where(finite, (ref_shape - q_shape) ** 2, 0.0)
+            denom = np.maximum(finite.sum(axis=1), 1)
+            shape_dist = np.sqrt(shape_diff.sum(axis=1) / denom).astype(np.float32)
+            level_scale = np.maximum.reduce([np.abs(ref_mean), np.full_like(ref_mean, abs(float(q_mean))), ref_std, np.full_like(ref_mean, q_std), np.full_like(ref_mean, 1e-4)])
+            level_dist = np.abs(ref_mean - float(q_mean)) / level_scale
+            channel_dist = (0.85 * shape_dist + 0.15 * level_dist).astype(np.float32)
             weight = float(qv_weights.get(channel_name, 1.0))
             qv_terms[common] += weight * channel_dist[common]
             qv_weight_sum[common] += weight
@@ -909,10 +999,10 @@ class MultiStageBatteryRetriever:
             qv_weight_sum[has_summary] += 1.0
         d_qv_shape = np.where(qv_weight_sum > 0, qv_terms / np.maximum(qv_weight_sum, 1e-6), 1.0).astype(np.float32)
 
-        q_phys = self._physics_matrix[query_idx]
-        r_phys = self._physics_matrix[ref_indices]
-        q_phys_mask = self._physics_mask_matrix[query_idx]
-        r_phys_mask = self._physics_mask_matrix[ref_indices]
+        q_phys = self._physics_matrix[query_idx, :4]
+        r_phys = self._physics_matrix[ref_indices, :4]
+        q_phys_mask = self._physics_mask_matrix[query_idx, :4]
+        r_phys_mask = self._physics_mask_matrix[ref_indices, :4]
         common_phys = (q_phys_mask[None, :] > 0) & (r_phys_mask > 0)
         phys_scale = np.maximum(np.maximum(np.abs(r_phys), np.abs(q_phys[None, :])), 1e-4)
         phys_diff = ((r_phys - q_phys[None, :]) / phys_scale) ** 2

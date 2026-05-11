@@ -68,18 +68,30 @@ def _infer_xjtu_metadata(path: Path, cfg: Dict[str, object]) -> Dict[str, object
     }
 
 
-def _load_xjtu_temperature_frame(summary_path: Path) -> pd.DataFrame | None:
+def _load_xjtu_operation_frame(summary_path: Path) -> pd.DataFrame | None:
     data_path = summary_path.with_name(summary_path.name.replace("_summary.csv", "_data.csv"))
     if not data_path.exists():
         return None
 
-    df = pd.read_csv(data_path, usecols=["cycle_index", "temperature_C"])
+    df = pd.read_csv(data_path, usecols=["cycle_index", "voltage_V", "current_A", "temperature_C"])
     if df.empty:
         return None
+    for column in ["voltage_V", "current_A", "temperature_C"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     grouped = (
-        df.groupby("cycle_index", sort=True)["temperature_C"]
-        .agg(temp_mean="mean", temp_max="max", temp_min="min")
+        df.groupby("cycle_index", sort=True)
+        .agg(
+            voltage_max=("voltage_V", "max"),
+            voltage_min=("voltage_V", "min"),
+            current_mean=("current_A", "mean"),
+            current_abs_mean=("current_A", lambda values: values.abs().mean()),
+            current_max=("current_A", "max"),
+            current_min=("current_A", "min"),
+            temp_mean=("temperature_C", "mean"),
+            temp_max=("temperature_C", "max"),
+            temp_min=("temperature_C", "min"),
+        )
         .reset_index()
         .rename(columns={"cycle_index": "cycle_idx"})
     )
@@ -97,7 +109,7 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
     cells: List[CanonicalCell] = []
     for path in paths:
         df = pd.read_csv(path)
-        temp_frame = _load_xjtu_temperature_frame(path)
+        operation_frame = _load_xjtu_operation_frame(path)
         charge_capacity = df["charge_capacity_Ah"].astype(float)
         discharge_capacity = df["discharge_capacity_Ah"].astype(float)
         finite_initial = discharge_capacity.replace([np.inf, -np.inf], np.nan).dropna()
@@ -136,9 +148,19 @@ def load_xjtu_cells(cfg: Dict[str, object]) -> List[CanonicalCell]:
                 "energy_discharge": df["discharge_power_Wh"].astype(float),
             }
         )
-        if temp_frame is not None:
-            base = base.merge(temp_frame, on="cycle_idx", how="left", suffixes=("", "_from_data"))
-            for column in ["temp_mean", "temp_max", "temp_min"]:
+        if operation_frame is not None:
+            base = base.merge(operation_frame, on="cycle_idx", how="left", suffixes=("", "_from_data"))
+            for column in [
+                "voltage_max",
+                "voltage_min",
+                "current_mean",
+                "current_abs_mean",
+                "current_max",
+                "current_min",
+                "temp_mean",
+                "temp_max",
+                "temp_min",
+            ]:
                 merged_col = f"{column}_from_data"
                 if merged_col in base.columns:
                     base[column] = base[merged_col]

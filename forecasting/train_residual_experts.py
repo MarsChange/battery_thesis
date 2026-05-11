@@ -16,6 +16,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+tqdm.monitor_interval = 0
+
 from forecasting.data import BatterySOHForecastDataset
 from forecasting.losses import compute_residual_expert_loss
 from forecasting.model import BatterySOHForecaster

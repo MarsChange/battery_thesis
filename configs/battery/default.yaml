@@ -7,6 +7,10 @@ datasets:
     enabled: true
     root: "datasets/xjtu_dataset"
     chemistry_family: null
+    exclude_file_path_contains:
+      - Batch-4
+      - Batch-5
+      - Batch-6
   tju:
     enabled: true
     root: "datasets/TJU_dataset"
