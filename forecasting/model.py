@@ -259,6 +259,12 @@ class BatterySOHForecaster(nn.Module):
         residual_trend_cap_fraction: float = 0.0,
         residual_trend_cap_floor: float = 0.0,
         residual_deployment_max_abs: float = 0.0,
+        residual_use_direction_head: bool = True,
+        conditional_temperature_expert: bool = True,
+        temperature_expert_active_threshold: float = 0.05,
+        router_group_calibration_logit_clip: float = 0.75,
+        router_total_calibration_logit_clip: float = 1.25,
+        router_horizon_calibration_logit_clip: float = 0.35,
     ):
         super().__init__()
         del qv_width
@@ -292,6 +298,12 @@ class BatterySOHForecaster(nn.Module):
         self.residual_trend_cap_fraction = float(residual_trend_cap_fraction)
         self.residual_trend_cap_floor = float(residual_trend_cap_floor)
         self.residual_deployment_max_abs = float(residual_deployment_max_abs)
+        self.residual_use_direction_head = bool(residual_use_direction_head)
+        self.conditional_temperature_expert = bool(conditional_temperature_expert)
+        self.temperature_expert_active_threshold = float(temperature_expert_active_threshold)
+        self.router_group_calibration_logit_clip = float(router_group_calibration_logit_clip)
+        self.router_total_calibration_logit_clip = float(router_total_calibration_logit_clip)
+        self.router_horizon_calibration_logit_clip = float(router_horizon_calibration_logit_clip)
         requested_experts = list(expert_names or DEFAULT_EXPERT_NAMES)
         self.expert_names = [name for name in requested_experts if name in SEMANTIC_EXPERT_MODES]
         if not self.expert_names:
@@ -347,6 +359,9 @@ class BatterySOHForecaster(nn.Module):
             mode_names=self.expert_names,
             gamma=0.2,
             rag_eta=0.5,
+            group_calibration_logit_clip=self.router_group_calibration_logit_clip,
+            total_calibration_logit_clip=self.router_total_calibration_logit_clip,
+            horizon_calibration_logit_clip=self.router_horizon_calibration_logit_clip,
         )
         # Compatibility alias for older training utilities/tests. This is the
         # semantic router, not the old opaque hidden-state router.
@@ -359,6 +374,15 @@ class BatterySOHForecaster(nn.Module):
                 "chemistry": meta_embedding_dim,
             },
             num_branches=3,
+        )
+        # Horizon-wise direction head: predicts whether residual experts should
+        # lift the base forecast upward or push it downward. Experts provide
+        # factor-specific correction magnitudes; this head provides the sign.
+        self.residual_direction_head = nn.Sequential(
+            nn.Linear(12, max(hidden_dim // 2, 16)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(hidden_dim // 2, 16), 1),
         )
 
     def _meta_encode(self, meta_ids: torch.Tensor) -> torch.Tensor:
@@ -430,6 +454,45 @@ class BatterySOHForecaster(nn.Module):
             pad = torch.zeros(seq.shape[0], seq.shape[1], self.expert_seq_dim - seq.shape[-1], device=seq.device, dtype=seq.dtype)
             seq = torch.cat([seq, pad], dim=-1)
         return seq[..., : self.expert_seq_dim]
+
+    def _temperature_expert_score(self, query: Dict[str, torch.Tensor], expert_seq: torch.Tensor) -> torch.Tensor:
+        """Return high-temperature evidence in [0, 1] for conditional expert use.
+
+        Score 0 means room-temperature or missing-temperature evidence. The
+        baseline follows the dataset decision: 25-30 degC is room temperature,
+        and temperatures above 30 degC increasingly activate the temperature
+        residual expert.
+        """
+
+        if "residual_factor_scores" in query:
+            factor_scores = torch.nan_to_num(query["residual_factor_scores"].to(expert_seq.device, dtype=torch.float32))
+            if factor_scores.ndim == 2 and factor_scores.shape[-1] >= 1:
+                return factor_scores[:, 0].clamp(0.0, 1.0)
+        if expert_seq.shape[-1] <= 7:
+            return torch.zeros(expert_seq.shape[0], device=expert_seq.device, dtype=expert_seq.dtype)
+        temp_mean = expert_seq[..., 5].mean(dim=1)
+        temp_max = expert_seq[..., 7].max(dim=1).values
+        temp_level = torch.maximum(temp_mean, temp_max)
+        return ((temp_level - 30.0) / 15.0).clamp(0.0, 1.0)
+
+    def _expert_active_mask(self, query: Dict[str, torch.Tensor], expert_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build a hard active mask for conditional residual experts.
+
+        The temperature expert is disabled for room-temperature or
+        missing-temperature windows. Other factor experts stay globally
+        available because their stress signals appear across datasets.
+        """
+
+        batch_size = expert_seq.shape[0]
+        mask = torch.ones(batch_size, len(self.expert_names), device=expert_seq.device, dtype=torch.bool)
+        temperature_score = self._temperature_expert_score(query, expert_seq)
+        if self.conditional_temperature_expert and "high_temperature_expert" in self.expert_names:
+            temperature_idx = self.expert_names.index("high_temperature_expert")
+            mask[:, temperature_idx] = temperature_score >= self.temperature_expert_active_threshold
+            all_disabled = ~mask.any(dim=-1)
+            if bool(all_disabled.any()):
+                mask[all_disabled, temperature_idx] = True
+        return mask, temperature_score
 
     def _smooth_horizon_sequence(self, values: torch.Tensor, window: int) -> torch.Tensor:
         """MPS-safe moving average over the forecast horizon.
@@ -610,6 +673,58 @@ class BatterySOHForecaster(nn.Module):
                 (base_delta - trend_delta).detach(),
                 retrieval_level,
                 anchor_level,
+            ],
+            dim=-1,
+        )
+
+    def _residual_direction_context(
+        self,
+        *,
+        base_delta: torch.Tensor,
+        trend_delta: torch.Tensor,
+        fm_delta: torch.Tensor,
+        rag_delta: torch.Tensor,
+        pair_delta: torch.Tensor,
+        ref_future_delta: torch.Tensor,
+        retrieval_alpha: torch.Tensor,
+        retrieval_confidence: torch.Tensor,
+        composite_mean: torch.Tensor,
+        anchor_soh: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build horizon-wise features for residual correction direction.
+
+        Positive residual means the base prediction is too low and should be
+        lifted; negative residual means the base prediction is too high and
+        should be pushed downward. All inputs are available at prediction time.
+        """
+
+        batch, horizon = base_delta.shape
+        step_fraction = torch.linspace(
+            1.0 / max(horizon, 1),
+            1.0,
+            horizon,
+            device=base_delta.device,
+            dtype=base_delta.dtype,
+        ).unsqueeze(0).expand(batch, -1)
+        ref_centered = ref_future_delta - rag_delta.unsqueeze(1)
+        ref_std = torch.sqrt(torch.sum(retrieval_alpha.unsqueeze(-1) * ref_centered.pow(2), dim=1).clamp_min(0.0))
+        retrieval_level = retrieval_confidence.to(base_delta.dtype).unsqueeze(-1).expand(-1, horizon)
+        composite_level = composite_mean.to(base_delta.dtype).unsqueeze(-1).expand(-1, horizon)
+        anchor_level = anchor_soh.to(base_delta.dtype).unsqueeze(-1).expand(-1, horizon)
+        return torch.stack(
+            [
+                step_fraction,
+                base_delta.detach(),
+                trend_delta.detach(),
+                (trend_delta - base_delta).detach(),
+                (fm_delta - base_delta).detach(),
+                (rag_delta - base_delta).detach(),
+                (pair_delta - base_delta).detach(),
+                ref_std.detach(),
+                retrieval_level,
+                composite_level,
+                anchor_level,
+                torch.ones_like(step_fraction),
             ],
             dim=-1,
         )
@@ -843,6 +958,8 @@ class BatterySOHForecaster(nn.Module):
         neighbor_vote = neighbor_vote + rag_semantic_prior
         neighbor_vote = neighbor_vote / neighbor_vote.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
+        expert_seq = query["expert_seq"].to(torch.float32) if "expert_seq" in query else self._fallback_expert_seq(query)
+        expert_active_mask, temperature_expert_score = self._expert_active_mask(query, expert_seq)
         router_inputs = {
             "soh_state": state_features,
             "qv_polarization": query["anchor_physics_features"].to(torch.float32),
@@ -850,6 +967,7 @@ class BatterySOHForecaster(nn.Module):
             "operation_stress": operation_group,
             "retrieval": retrieval_features,
             "neighbor_vote": neighbor_vote,
+            "expert_active_mask": expert_active_mask,
         }
         horizon_router_context = self._horizon_router_context(
             base_delta=base_delta,
@@ -865,7 +983,6 @@ class BatterySOHForecaster(nn.Module):
 
         baseline_detached = base_delta.detach()
         baseline_summary = torch.stack([baseline_detached.mean(dim=-1), baseline_detached.std(dim=-1), baseline_detached[:, -1]], dim=-1)
-        expert_seq = query["expert_seq"].to(torch.float32) if "expert_seq" in query else self._fallback_expert_seq(query)
         expert_context = torch.cat(
             [
                 state_features,
@@ -905,7 +1022,29 @@ class BatterySOHForecaster(nn.Module):
         chemistry_one_hot = F.one_hot(chemistry_ids, num_classes=len(self.chemistry_families)).to(all_expert_outputs.dtype)
         expert_outputs = torch.sum(all_expert_outputs * chemistry_one_hot[:, :, None, None], dim=1)
         expert_weights_by_horizon = router_out["weights_by_horizon"].to(expert_outputs.dtype)
-        raw_moe_residual = torch.sum(expert_outputs.transpose(1, 2) * expert_weights_by_horizon, dim=-1)
+        signed_expert_residual = torch.sum(expert_outputs.transpose(1, 2) * expert_weights_by_horizon, dim=-1)
+        if self.residual_use_direction_head:
+            expert_magnitudes = expert_outputs.abs()
+            raw_moe_magnitude = torch.sum(expert_magnitudes.transpose(1, 2) * expert_weights_by_horizon, dim=-1)
+            residual_direction_context = self._residual_direction_context(
+                base_delta=base_delta,
+                trend_delta=trend_delta,
+                fm_delta=fm_delta,
+                rag_delta=rag_delta,
+                pair_delta=pair_delta,
+                ref_future_delta=ref_future_delta,
+                retrieval_alpha=retrieval_alpha,
+                retrieval_confidence=retrieval["retrieval_confidence"].to(torch.float32),
+                composite_mean=composite_mean,
+                anchor_soh=anchor_soh,
+            )
+            residual_direction = torch.tanh(self.residual_direction_head(residual_direction_context).squeeze(-1))
+            raw_moe_residual = residual_direction * raw_moe_magnitude
+        else:
+            expert_magnitudes = expert_outputs.abs()
+            raw_moe_magnitude = signed_expert_residual.abs()
+            residual_direction = torch.tanh(signed_expert_residual)
+            raw_moe_residual = signed_expert_residual
         scaled_raw_moe_residual, residual_output_scale_by_horizon = self._scale_raw_residual(raw_moe_residual)
         retrieval_residual_gate = retrieval["retrieval_confidence"].to(torch.float32).clamp(0.0, 1.0)
         retrieval_residual_gate = float(self.residual_confidence_floor) + (1.0 - float(self.residual_confidence_floor)) * retrieval_residual_gate
@@ -944,6 +1083,9 @@ class BatterySOHForecaster(nn.Module):
             "trend_blend": trend_blend.squeeze(-1),
             "moe_residual": moe_residual,
             "raw_moe_residual": raw_moe_residual,
+            "signed_expert_residual": signed_expert_residual,
+            "raw_moe_magnitude": raw_moe_magnitude,
+            "residual_direction": residual_direction,
             "scaled_raw_moe_residual": scaled_raw_moe_residual,
             "residual_output_scale_by_horizon": residual_output_scale_by_horizon,
             "direct_residual_component": direct_residual_component,
@@ -960,6 +1102,8 @@ class BatterySOHForecaster(nn.Module):
             "retrieval_confidence": retrieval["retrieval_confidence"].to(torch.float32),
             "expert_weights": router_out["weights"],
             "expert_weights_by_horizon": expert_weights_by_horizon,
+            "expert_active_mask": router_out["expert_active_mask"],
+            "temperature_expert_score": temperature_expert_score,
             "expert_logits": router_out["logits"],
             "expert_logits_by_horizon": router_out["logits_by_horizon"],
             "expert_router_contributions": router_out["contributions"],
@@ -970,6 +1114,7 @@ class BatterySOHForecaster(nn.Module):
             "final_router_prior_by_horizon": router_out["final_prior_by_horizon"],
             "chemistry_branch_id": chemistry_ids,
             "selected_mode_residuals": expert_outputs,
+            "selected_mode_magnitudes": expert_magnitudes,
             "fusion_weights": fusion_out["weights"],
             "base_fusion_weights": fusion_out["weights"],
             "fusion_router_contributions": fusion_out["contributions"],

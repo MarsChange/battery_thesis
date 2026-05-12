@@ -167,6 +167,9 @@ model:
   residual_smoothing_window: 9
   residual_max_step_abs: 0.00035
   residual_opposition_scale: 0.30
+  residual_use_direction_head: true
+  conditional_temperature_expert: true
+  temperature_expert_active_threshold: 0.05
   residual_trend_cap_fraction: 0.55
   residual_trend_cap_floor: 0.00012
   residual_deployment_max_abs: 0.0045
@@ -179,6 +182,7 @@ generate_oof_baseline:
   num_folds: 5
   epochs: 3
   lr: 0.0005
+  reuse_existing: true
 
 train_residual_experts:
   enabled: true
@@ -195,17 +199,10 @@ loss:
   route_kl: 0.03
   monotonic: 0.05
   smoothness: 0.05
-  residual_smoothness: 0.40
-  residual_total_variation: 0.15
-  residual_magnitude: 0.00
-  late_horizon_fraction: 0.35
-  late_forecast: 0.40
-  terminal_forecast: 0.45
-  late_residual: 0.75
-  under_degradation: 0.03
+  residual_direction: 0.20
+  residual_sign: 0.15
+  factor_magnitude: 0.25
   expert_balance: 0.01
-  horizon_router_diversity: 0.001
-  horizon_router_smoothness: 0.01
   retrieval_consistency: 0.02
   fusion_regularization: 0.0
   monotonic_epsilon: 0.0005
@@ -221,6 +218,7 @@ train:
   grad_clip_norm: 1.0
   device: mps
   num_workers: 0
+  compute_train_metrics: false
 
 fewshot:
   enabled: true

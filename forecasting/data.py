@@ -25,6 +25,12 @@ DEFAULT_META_FIELDS = [
 ]
 
 CHEMISTRY_TO_ID = {"LFP": 0, "NCM": 1, "NCA": 2}
+RESIDUAL_FACTOR_NAMES = [
+    "high_temperature_expert",
+    "high_current_expert",
+    "high_cycle_expert",
+    "high_power_expert",
+]
 
 
 def chemistry_family_to_id(value: object) -> int:
@@ -68,6 +74,79 @@ def _normalize_case_rows(rows: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _source_train_quantile(values: np.ndarray, rows: pd.DataFrame, quantile: float, fallback: float) -> float:
+    """Fit robust factor thresholds on source_train only to avoid query leakage."""
+
+    values = np.asarray(values, dtype=np.float32)
+    split = rows["split"].astype(str).to_numpy()
+    mask = (split == "source_train") & np.isfinite(values)
+    if not bool(mask.any()):
+        mask = np.isfinite(values)
+    if not bool(mask.any()):
+        return float(fallback)
+    return float(np.quantile(values[mask], quantile))
+
+
+def _robust_factor_score(values: np.ndarray, rows: pd.DataFrame, low_q: float = 0.50, high_q: float = 0.90) -> np.ndarray:
+    """Map a raw stress feature to [0, 1] using source_train quantiles."""
+
+    values = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    low = _source_train_quantile(values, rows, low_q, fallback=0.0)
+    high = _source_train_quantile(values, rows, high_q, fallback=low + 1.0)
+    denom = max(high - low, 1e-6)
+    return np.clip((values - low) / denom, 0.0, 1.0).astype(np.float32)
+
+
+def compute_residual_factor_scores(rows: pd.DataFrame, expert_seq: np.ndarray | None) -> np.ndarray:
+    """Compute factor scores for residual specialist training.
+
+    Output columns follow `RESIDUAL_FACTOR_NAMES`:
+    high-temperature, high-current, high-cycle-aging, and high-power stress.
+
+    Temperature is anchored to a room-temperature baseline: 25-30 C is treated
+    as near-zero high-temperature evidence, while hotter windows receive larger
+    scores. Current and power use source_train robust quantiles because their
+    absolute scales differ across public datasets and protocols.
+    """
+
+    num_cases = int(len(rows))
+    if expert_seq is None:
+        return np.zeros((num_cases, len(RESIDUAL_FACTOR_NAMES)), dtype=np.float32)
+
+    seq = np.nan_to_num(np.asarray(expert_seq, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if seq.ndim != 3 or seq.shape[0] != num_cases:
+        return np.zeros((num_cases, len(RESIDUAL_FACTOR_NAMES)), dtype=np.float32)
+
+    def _seq_column(index: int) -> np.ndarray:
+        if seq.shape[-1] <= index:
+            return np.zeros(num_cases, dtype=np.float32)
+        return seq[:, :, index].mean(axis=1).astype(np.float32)
+
+    def _seq_column_max(index: int) -> np.ndarray:
+        if seq.shape[-1] <= index:
+            return np.zeros(num_cases, dtype=np.float32)
+        return seq[:, :, index].max(axis=1).astype(np.float32)
+
+    # EXPERT_SEQ_FEATURES indices from battery_data.build_case_bank:
+    # 5 temperature_mean, 7 temperature_max, 8 current_abs_mean,
+    # 10 current_abs_max, 11 power_energy_proxy, 12 cycle_aging_index,
+    # 13 soh_below_0p9.
+    temp_level = np.maximum(_seq_column(5), _seq_column_max(7))
+    current_level = np.maximum(_seq_column(8), _seq_column_max(10))
+    power_level = np.abs(_seq_column(11))
+    cycle_aging = _seq_column(12)
+    soh_below = _seq_column(13)
+
+    anchor_soh = pd.to_numeric(rows.get("anchor_soh", pd.Series([1.0] * num_cases)), errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)
+    high_temperature = np.clip((temp_level - 30.0) / 15.0, 0.0, 1.0).astype(np.float32)
+    high_current = _robust_factor_score(current_level, rows)
+    high_power = _robust_factor_score(power_level, rows)
+    deep_soh = np.clip((0.90 - anchor_soh) / 0.15, 0.0, 1.0).astype(np.float32)
+    high_cycle = np.maximum.reduce([np.clip(cycle_aging, 0.0, 1.0), np.clip(soh_below / 0.15, 0.0, 1.0), deep_soh]).astype(np.float32)
+
+    return np.stack([high_temperature, high_current, high_cycle, high_power], axis=-1).astype(np.float32)
+
+
 class BatterySOHForecastDataset(Dataset):
     def __init__(
         self,
@@ -85,6 +164,8 @@ class BatterySOHForecastDataset(Dataset):
         self.retrieval_cfg = retrieval_cfg or {}
 
         self.arrays = self._load_arrays()
+        if self.arrays.get("residual_factor_scores") is None:
+            self.arrays["residual_factor_scores"] = compute_residual_factor_scores(self.case_rows, self.arrays.get("expert_seq"))
         self.meta_vocab = self._build_meta_vocab(self.case_rows, self.meta_fields)
         self.meta_ids_all = self._encode_meta_ids(self.case_rows, self.meta_fields, self.meta_vocab)
 
@@ -99,28 +180,36 @@ class BatterySOHForecastDataset(Dataset):
             self.retrieval_cache = None
 
     def _load_arrays(self) -> Dict[str, np.ndarray]:
+        def _load_array(filename: str) -> np.ndarray:
+            # copy-on-write mmap avoids reloading multi-GB case-bank arrays for
+            # train/val/OOF/few-shot Dataset instances while keeping slices
+            # writable enough for PyTorch collation.
+            return np.load(self.case_bank_dir / filename, mmap_mode="c")
+
         arrays = {
-            "cycle_stats": np.load(self.case_bank_dir / "case_cycle_stats.npy"),
-            "soh_seq": np.load(self.case_bank_dir / "case_soh_seq.npy"),
-            "qv_maps": np.load(self.case_bank_dir / "case_qv_maps.npy"),
-            "qv_masks": np.load(self.case_bank_dir / "case_qv_masks.npy"),
-            "partial_charge": np.load(self.case_bank_dir / "case_partial_charge.npy"),
-            "partial_charge_mask": np.load(self.case_bank_dir / "case_partial_charge_mask.npy"),
-            "physics_features": np.load(self.case_bank_dir / "case_physics_features.npy"),
-            "physics_feature_masks": np.load(self.case_bank_dir / "case_physics_feature_masks.npy"),
-            "anchor_physics_features": np.load(self.case_bank_dir / "case_anchor_physics_features.npy"),
-            "operation_seq": np.load(self.case_bank_dir / "case_operation_seq.npy"),
-            "future_ops": np.load(self.case_bank_dir / "case_future_ops.npy"),
-            "future_ops_mask": np.load(self.case_bank_dir / "case_future_ops_mask.npy"),
-            "future_delta_soh": np.load(self.case_bank_dir / "case_future_delta_soh.npy"),
-            "future_soh": np.load(self.case_bank_dir / "case_future_soh.npy"),
+            "cycle_stats": _load_array("case_cycle_stats.npy"),
+            "soh_seq": _load_array("case_soh_seq.npy"),
+            "qv_maps": _load_array("case_qv_maps.npy"),
+            "qv_masks": _load_array("case_qv_masks.npy"),
+            "partial_charge": _load_array("case_partial_charge.npy"),
+            "partial_charge_mask": _load_array("case_partial_charge_mask.npy"),
+            "physics_features": _load_array("case_physics_features.npy"),
+            "physics_feature_masks": _load_array("case_physics_feature_masks.npy"),
+            "anchor_physics_features": _load_array("case_anchor_physics_features.npy"),
+            "operation_seq": _load_array("case_operation_seq.npy"),
+            "future_ops": _load_array("case_future_ops.npy"),
+            "future_ops_mask": _load_array("case_future_ops_mask.npy"),
+            "future_delta_soh": _load_array("case_future_delta_soh.npy"),
+            "future_soh": _load_array("case_future_soh.npy"),
         }
         expert_seq_path = self.case_bank_dir / "case_expert_seq.npy"
-        arrays["expert_seq"] = np.load(expert_seq_path) if expert_seq_path.exists() else None
+        arrays["expert_seq"] = np.load(expert_seq_path, mmap_mode="c") if expert_seq_path.exists() else None
         baseline_path = self.case_bank_dir / "case_baseline_delta_oof.npy"
         residual_path = self.case_bank_dir / "case_residual_target_oof.npy"
-        arrays["baseline_delta_oof"] = np.load(baseline_path) if baseline_path.exists() else None
-        arrays["residual_target_oof"] = np.load(residual_path) if residual_path.exists() else None
+        arrays["baseline_delta_oof"] = np.load(baseline_path, mmap_mode="c") if baseline_path.exists() else None
+        arrays["residual_target_oof"] = np.load(residual_path, mmap_mode="c") if residual_path.exists() else None
+        factor_path = self.case_bank_dir / "case_residual_factor_scores.npy"
+        arrays["residual_factor_scores"] = np.load(factor_path, mmap_mode="c") if factor_path.exists() else None
         return arrays
 
     @staticmethod
@@ -241,6 +330,9 @@ class BatterySOHForecastDataset(Dataset):
             query["baseline_delta_oof"] = np.asarray(self.arrays["baseline_delta_oof"][row_idx], dtype=np.float32)
         if self.arrays["residual_target_oof"] is not None:
             query["residual_target_oof"] = np.asarray(self.arrays["residual_target_oof"][row_idx], dtype=np.float32)
+        factor_scores = self.arrays.get("residual_factor_scores")
+        if factor_scores is not None:
+            query["residual_factor_scores"] = np.asarray(factor_scores[row_idx], dtype=np.float32)
 
         if self.retrieval_cache is None:
             top_k = int(self.retrieval_cfg.get("top_k", 8)) if self.retrieval_cfg else 8

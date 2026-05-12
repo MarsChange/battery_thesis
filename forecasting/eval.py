@@ -94,7 +94,11 @@ def evaluate(cfg: Dict[str, object], checkpoint_path: str | Path, split: str | N
     model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
     model = BatterySOHForecaster(**model_init)
     missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
-    critical_missing = [key for key in missing if "horizon_calibrator" not in key]
+    critical_missing = [
+        key
+        for key in missing
+        if "horizon_calibrator" not in key and "residual_direction_head" not in key
+    ]
     if critical_missing or unexpected:
         raise RuntimeError(f"Incompatible checkpoint. missing={critical_missing}, unexpected={list(unexpected)}")
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))

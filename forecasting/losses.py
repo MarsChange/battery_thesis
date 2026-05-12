@@ -62,14 +62,6 @@ def smoothness_loss(pred_soh: torch.Tensor) -> torch.Tensor:
     return second_diff.abs().mean()
 
 
-def total_variation_loss(sequence: torch.Tensor) -> torch.Tensor:
-    """Mean absolute first difference used to suppress residual sawtooth noise."""
-
-    if sequence.size(1) < 2:
-        return sequence.new_tensor(0.0)
-    return (sequence[:, 1:] - sequence[:, :-1]).abs().mean()
-
-
 def expert_load_balance_loss(expert_weights: torch.Tensor) -> torch.Tensor:
     if expert_weights.numel() == 0:
         return expert_weights.new_tensor(0.0)
@@ -77,30 +69,6 @@ def expert_load_balance_loss(expert_weights: torch.Tensor) -> torch.Tensor:
     mean_weight = weights.mean(dim=0)
     uniform = torch.full_like(mean_weight, 1.0 / max(expert_weights.size(-1), 1))
     return F.kl_div((mean_weight + 1e-8).log(), uniform, reduction="batchmean")
-
-
-def expert_horizon_diversity_loss(expert_weights_by_horizon: torch.Tensor) -> torch.Tensor:
-    """Encourage expert weights to change between early and late horizons.
-
-    This term is intentionally weak and bounded by the simplex geometry. It
-    does not choose a particular expert; it only prevents the horizon router
-    from collapsing into a constant per-window distribution when the semantic
-    horizon prior provides step-dependent evidence.
-    """
-
-    if expert_weights_by_horizon.ndim != 3 or expert_weights_by_horizon.size(1) < 2:
-        return expert_weights_by_horizon.new_tensor(0.0)
-    early = expert_weights_by_horizon[:, 0, :]
-    late = expert_weights_by_horizon[:, -1, :]
-    return -(late - early).abs().mean()
-
-
-def expert_horizon_smoothness_loss(expert_weights_by_horizon: torch.Tensor) -> torch.Tensor:
-    """Keep step-wise expert weights smooth after making them horizon-aware."""
-
-    if expert_weights_by_horizon.ndim != 3 or expert_weights_by_horizon.size(1) < 2:
-        return expert_weights_by_horizon.new_tensor(0.0)
-    return (expert_weights_by_horizon[:, 1:, :] - expert_weights_by_horizon[:, :-1, :]).pow(2).mean()
 
 
 def route_kl_loss(final_prior: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
@@ -134,39 +102,47 @@ def residual_supervision_loss(
     return forecast_loss(moe_residual, residual_target, criterion=criterion, horizon_end_weight=horizon_end_weight)
 
 
-def residual_magnitude_loss(moe_residual: torch.Tensor) -> torch.Tensor:
-    """Keep residual experts as small corrections around the base prediction."""
+def residual_direction_loss(residual_direction: torch.Tensor, residual_target: torch.Tensor) -> torch.Tensor:
+    """Supervise whether residual should lift or lower the base forecast."""
 
-    return moe_residual.abs().mean()
-
-
-def late_horizon_mse_loss(pred_delta: torch.Tensor, target_delta: torch.Tensor, fraction: float = 0.35) -> torch.Tensor:
-    """Extra supervision on the forecast tail where long-horizon drift appears."""
-
-    horizon = int(pred_delta.shape[-1])
-    if horizon <= 1:
-        return F.mse_loss(pred_delta, target_delta)
-    start = max(0, min(horizon - 1, int(round(horizon * (1.0 - float(fraction))))))
-    return F.mse_loss(pred_delta[:, start:], target_delta[:, start:])
+    target_sign = torch.sign(residual_target)
+    importance = residual_target.abs()
+    importance = importance / importance.detach().mean().clamp_min(1e-6)
+    return (F.smooth_l1_loss(residual_direction, target_sign, reduction="none") * importance).mean()
 
 
-def terminal_mse_loss(pred_delta: torch.Tensor, target_delta: torch.Tensor) -> torch.Tensor:
-    """MSE on the last predicted horizon step."""
+def residual_sign_error_loss(moe_residual: torch.Tensor, residual_target: torch.Tensor) -> torch.Tensor:
+    """Penalize residual corrections that point opposite to the OOF target."""
 
-    return F.mse_loss(pred_delta[:, -1], target_delta[:, -1])
+    importance = residual_target.abs()
+    importance = importance / importance.detach().mean().clamp_min(1e-6)
+    return (F.relu(-moe_residual * residual_target) * importance).mean()
 
 
-def under_degradation_loss(pred_delta: torch.Tensor, target_delta: torch.Tensor, fraction: float = 0.35) -> torch.Tensor:
-    """Penalize tail predictions that stay above the true SOH trajectory.
+def factor_weighted_magnitude_loss(
+    selected_mode_magnitudes: torch.Tensor,
+    residual_target: torch.Tensor,
+    factor_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Train each factor expert on residual magnitude where its factor is active.
 
-    In delta-SOH space, `pred_delta > target_delta` means the predicted SOH is
-    too high, i.e. the model underestimates degradation. This term is optional
-    and should stay small because it is intentionally asymmetric.
+    `factor_scores` columns correspond to high-temperature, high-current,
+    high-cycle-aging, and high-power experts. This is a soft split: every
+    sample can contribute to multiple experts, but high-score samples dominate
+    the matching expert's magnitude supervision.
     """
 
-    horizon = int(pred_delta.shape[-1])
-    start = max(0, min(horizon - 1, int(round(horizon * (1.0 - float(fraction))))))
-    return F.relu(pred_delta[:, start:] - target_delta[:, start:]).pow(2).mean()
+    if selected_mode_magnitudes.ndim != 3 or factor_scores.ndim != 2:
+        return residual_target.new_tensor(0.0)
+    num_modes = selected_mode_magnitudes.shape[1]
+    factor_scores = factor_scores[:, :num_modes].to(selected_mode_magnitudes.dtype).clamp(0.0, 1.0)
+    if factor_scores.numel() == 0:
+        return residual_target.new_tensor(0.0)
+    weights = factor_scores.unsqueeze(-1)
+    target_magnitude = residual_target.abs().unsqueeze(1)
+    loss = F.smooth_l1_loss(selected_mode_magnitudes, target_magnitude.expand_as(selected_mode_magnitudes), reduction="none")
+    denom = weights.sum().clamp_min(1.0) * residual_target.shape[-1]
+    return (loss * weights).sum() / denom
 
 
 def compute_base_model_loss(
@@ -240,36 +216,43 @@ def compute_residual_expert_loss(
     )
     mono = monotonic_loss(pred_soh, epsilon=float(loss_cfg.get("monotonic_epsilon", 5e-4)))
     smooth = smoothness_loss(pred_soh)
-    residual_smooth = smoothness_loss(outputs["moe_residual"])
-    residual_tv = total_variation_loss(outputs["moe_residual"])
-    residual_mag = residual_magnitude_loss(outputs["moe_residual"])
-    late_fraction = float(loss_cfg.get("late_horizon_fraction", 0.35))
-    late_forecast = late_horizon_mse_loss(pred_delta, target_delta, fraction=late_fraction)
-    terminal_forecast = terminal_mse_loss(pred_delta, target_delta)
-    late_residual = late_horizon_mse_loss(outputs["moe_residual"], residual_target, fraction=late_fraction)
-    under_degradation = under_degradation_loss(pred_delta, target_delta, fraction=late_fraction)
-    horizon_expert_weights = outputs.get("expert_weights_by_horizon", outputs["expert_weights"])
-    horizon_router_prior = outputs.get("final_router_prior_by_horizon", outputs["final_router_prior"])
+    if "residual_direction" in outputs:
+        direction_loss = residual_direction_loss(outputs["residual_direction"], residual_target)
+    else:
+        direction_loss = residual_target.new_tensor(0.0)
+    sign_loss = residual_sign_error_loss(outputs["moe_residual"], residual_target)
+    if "selected_mode_magnitudes" in outputs and "residual_factor_scores" in batch["query"]:
+        factor_magnitude = factor_weighted_magnitude_loss(
+            outputs["selected_mode_magnitudes"],
+            residual_target,
+            batch["query"]["residual_factor_scores"],
+        )
+    else:
+        factor_magnitude = residual_target.new_tensor(0.0)
+    if "expert_weights_by_horizon" in outputs:
+        horizon_expert_weights = outputs["expert_weights_by_horizon"]
+    else:
+        horizon_expert_weights = outputs["expert_weights"]
+    if "final_router_prior_by_horizon" in outputs:
+        horizon_router_prior = outputs["final_router_prior_by_horizon"]
+    else:
+        horizon_router_prior = outputs["final_router_prior"]
     expert_balance = expert_load_balance_loss(horizon_expert_weights)
     route_kl = route_kl_loss(horizon_router_prior, horizon_expert_weights)
-    horizon_diversity = expert_horizon_diversity_loss(horizon_expert_weights)
-    horizon_smoothness = expert_horizon_smoothness_loss(horizon_expert_weights)
+    # Residual expert training is intentionally kept compact:
+    # 1) final forecast accuracy, 2) OOF residual target matching,
+    # 3) residual direction/sign supervision, 4) factor-specific magnitude
+    # supervision, 5) lightweight trajectory/router regularization.
     total = (
         float(loss_cfg.get("forecast", 1.0)) * final_forecast
         + float(loss_cfg.get("residual", 1.0)) * residual_loss
-        + float(loss_cfg.get("late_forecast", 0.0)) * late_forecast
-        + float(loss_cfg.get("terminal_forecast", 0.0)) * terminal_forecast
-        + float(loss_cfg.get("late_residual", 0.0)) * late_residual
-        + float(loss_cfg.get("under_degradation", 0.0)) * under_degradation
         + float(loss_cfg.get("route_kl", loss_cfg.get("route", 0.01))) * route_kl
         + float(loss_cfg.get("monotonic", 0.05)) * mono
         + float(loss_cfg.get("smoothness", 0.01)) * smooth
-        + float(loss_cfg.get("residual_smoothness", 0.0)) * residual_smooth
-        + float(loss_cfg.get("residual_total_variation", 0.0)) * residual_tv
-        + float(loss_cfg.get("residual_magnitude", 0.0)) * residual_mag
+        + float(loss_cfg.get("residual_direction", 0.0)) * direction_loss
+        + float(loss_cfg.get("residual_sign", 0.0)) * sign_loss
+        + float(loss_cfg.get("factor_magnitude", 0.0)) * factor_magnitude
         + float(loss_cfg.get("expert_balance", 0.01)) * expert_balance
-        + float(loss_cfg.get("horizon_router_diversity", 0.0)) * horizon_diversity
-        + float(loss_cfg.get("horizon_router_smoothness", 0.0)) * horizon_smoothness
     )
     return {
         "loss": total,
@@ -277,17 +260,11 @@ def compute_residual_expert_loss(
         "final_forecast_loss": final_forecast,
         "monotonic_loss": mono,
         "smoothness_loss": smooth,
-        "residual_smoothness_loss": residual_smooth,
-        "residual_total_variation_loss": residual_tv,
-        "residual_magnitude_loss": residual_mag,
-        "late_forecast_loss": late_forecast,
-        "terminal_forecast_loss": terminal_forecast,
-        "late_residual_loss": late_residual,
-        "under_degradation_loss": under_degradation,
+        "residual_direction_loss": direction_loss,
+        "residual_sign_loss": sign_loss,
+        "factor_magnitude_loss": factor_magnitude,
         "expert_load_balance_loss": expert_balance,
         "route_kl_loss": route_kl,
-        "horizon_router_diversity_loss": horizon_diversity,
-        "horizon_router_smoothness_loss": horizon_smoothness,
     }
 
 

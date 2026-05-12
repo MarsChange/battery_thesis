@@ -53,7 +53,7 @@ def _load_compatible_state_dict(model: BatterySOHForecaster, state_dict: Dict[st
 def _freeze_for_residual_training(model: BatterySOHForecaster) -> None:
     for param in model.parameters():
         param.requires_grad = False
-    for module in [model.physical_router, model.expert_bank]:
+    for module in [model.physical_router, model.expert_bank, model.residual_direction_head]:
         for param in module.parameters():
             param.requires_grad = True
 
@@ -85,7 +85,15 @@ def train_residual_experts(cfg: Dict[str, object], checkpoint_path: str | Path |
         [param for param in model.parameters() if param.requires_grad],
         lr=float(cfg.get("train_residual_experts", {}).get("lr", 5e-4)),
     )
-    loader = DataLoader(dataset, batch_size=int(cfg.get("train", {}).get("batch_size", 64)), shuffle=True, num_workers=0)
+    train_cfg = cfg.get("train", {})
+    num_workers = int(train_cfg.get("num_workers", 0))
+    loader = DataLoader(
+        dataset,
+        batch_size=int(train_cfg.get("batch_size", 64)),
+        shuffle=True,
+        num_workers=num_workers,
+        persistent_workers=bool(num_workers > 0),
+    )
 
     output_dir = Path(cfg.get("model_output_dir", "output/forecasting"))
     checkpoint_dir = output_dir / "checkpoints"

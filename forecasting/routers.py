@@ -127,6 +127,44 @@ def _pad_or_trim(values: torch.Tensor, target_dim: int) -> torch.Tensor:
     return torch.cat([values, pad], dim=-1)
 
 
+def _prepare_expert_active_mask(
+    mask: torch.Tensor | None,
+    *,
+    batch_size: int,
+    num_modes: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Normalize an optional expert active mask to `[B, M]` boolean form."""
+
+    if mask is None:
+        return None
+    active = _pad_or_trim(torch.nan_to_num(mask.to(device=device, dtype=torch.float32)), num_modes) > 0.5
+    if active.ndim != 2 or active.shape[0] != batch_size:
+        return None
+    # Never allow an all-masked row; this keeps softmax numerically valid if a
+    # caller provides only conditional experts.
+    all_disabled = ~active.any(dim=-1, keepdim=True)
+    return torch.where(all_disabled, torch.ones_like(active), active)
+
+
+def _mask_logits(logits: torch.Tensor, active_mask: torch.Tensor | None) -> torch.Tensor:
+    if active_mask is None:
+        return logits
+    if logits.ndim == 2:
+        return logits.masked_fill(~active_mask, -1.0e9)
+    return logits.masked_fill(~active_mask.unsqueeze(1), -1.0e9)
+
+
+def _mask_distribution(distribution: torch.Tensor, active_mask: torch.Tensor | None) -> torch.Tensor:
+    if active_mask is None:
+        return distribution
+    weight = active_mask.to(distribution.dtype)
+    if distribution.ndim == 3:
+        weight = weight.unsqueeze(1)
+    masked = distribution * weight
+    return masked / masked.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
 class SemanticConceptExtractor(nn.Module):
     """Build semantic concept scores from named physical/state features.
 
@@ -222,6 +260,9 @@ class SemanticHierarchicalRouter(nn.Module):
         rag_eta: float = 0.5,
         horizon_context_dim: int = 6,
         horizon_prior_strength: float = 1.4,
+        group_calibration_logit_clip: float = 0.75,
+        total_calibration_logit_clip: float = 1.25,
+        horizon_calibration_logit_clip: float = 0.35,
     ):
         super().__init__()
         self.mode_names = list(mode_names or SEMANTIC_EXPERT_MODES)
@@ -231,6 +272,9 @@ class SemanticHierarchicalRouter(nn.Module):
         self.rag_eta = float(rag_eta)
         self.horizon_context_dim = int(horizon_context_dim)
         self.horizon_prior_strength = float(horizon_prior_strength)
+        self.group_calibration_logit_clip = max(float(group_calibration_logit_clip), 0.0)
+        self.total_calibration_logit_clip = max(float(total_calibration_logit_clip), 0.0)
+        self.horizon_calibration_logit_clip = max(float(horizon_calibration_logit_clip), 0.0)
         self.concept_extractor = SemanticConceptExtractor()
         self.semantic_to_mode = nn.Linear(len(SEMANTIC_CONCEPT_NAMES), self.num_modes)
         self.group_calibrators = nn.ModuleDict(
@@ -241,6 +285,20 @@ class SemanticHierarchicalRouter(nn.Module):
         )
         self.horizon_calibrator = nn.Linear(max(self.horizon_context_dim, 1), self.num_modes)
         self._init_semantic_prior()
+
+    @staticmethod
+    def _clip_logit_correction(values: torch.Tensor, clip_value: float) -> torch.Tensor:
+        """Bound learned router corrections so they cannot override semantics.
+
+        The router is designed as semantic prior plus a small learnable
+        calibration term. Without a bound, one high-scale group can create
+        extreme logits and collapse the expert weights to a single expert.
+        """
+
+        if clip_value <= 0:
+            return values
+        clip = torch.as_tensor(float(clip_value), device=values.device, dtype=values.dtype)
+        return clip * torch.tanh(values / clip.clamp_min(1e-6))
 
     def _init_semantic_prior(self) -> None:
         with torch.no_grad():
@@ -347,13 +405,14 @@ class SemanticHierarchicalRouter(nn.Module):
                 value = torch.zeros(batch, 1, device=next(iter(group_inputs.values())).device)
             value = torch.nan_to_num(value.to(torch.float32))
             value = _pad_or_trim(value, layer.in_features)
-            contribution = layer(value)
-            contributions[name] = self.gamma * contribution
+            contribution = self.gamma * layer(value)
+            contribution = self._clip_logit_correction(contribution, self.group_calibration_logit_clip)
+            contributions[name] = contribution
             total = contribution if total is None else total + contribution
         if total is None:
             batch = next(iter(group_inputs.values())).shape[0]
             total = torch.zeros(batch, self.num_modes, device=next(iter(group_inputs.values())).device)
-        return self.gamma * total, contributions
+        return self._clip_logit_correction(total, self.total_calibration_logit_clip), contributions
 
     def forward(
         self,
@@ -363,6 +422,12 @@ class SemanticHierarchicalRouter(nn.Module):
     ) -> Dict[str, torch.Tensor | Dict[str, torch.Tensor]]:
         prior_payload = self.semantic_prior_from_groups(group_inputs)
         query_prior = prior_payload["semantic_prior"]
+        active_mask = _prepare_expert_active_mask(
+            group_inputs.get("expert_active_mask"),
+            batch_size=query_prior.shape[0],
+            num_modes=self.num_modes,
+            device=query_prior.device,
+        )
         retrieval_confidence = _pad_or_trim(group_inputs["retrieval"], 6)[:, 0].to(torch.float32).clamp(0.0, 1.0)
         if rag_semantic_prior is None:
             rag_semantic_prior = query_prior
@@ -372,6 +437,7 @@ class SemanticHierarchicalRouter(nn.Module):
         blend = (1.0 - self.rag_eta * retrieval_confidence).unsqueeze(-1) * query_prior
         blend = blend + (self.rag_eta * retrieval_confidence).unsqueeze(-1) * rag_semantic_prior
         final_prior = blend / blend.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        final_prior = _mask_distribution(final_prior, active_mask)
         horizon_semantic_offsets = self._horizon_semantic_logits(
             prior_payload["concepts"],
             horizon_context,
@@ -381,9 +447,10 @@ class SemanticHierarchicalRouter(nn.Module):
         else:
             horizon_prior_logits = torch.log(final_prior.clamp_min(1e-6)).unsqueeze(1) + horizon_semantic_offsets
             final_prior_by_horizon = torch.softmax(horizon_prior_logits, dim=-1)
+        final_prior_by_horizon = _mask_distribution(final_prior_by_horizon, active_mask)
 
         calibration, calibration_contributions = self._calibration_logits(group_inputs)
-        logits = torch.log(final_prior.clamp_min(1e-6)) + calibration
+        logits = _mask_logits(torch.log(final_prior.clamp_min(1e-6)) + calibration, active_mask)
         if horizon_context is None:
             weights_by_horizon = torch.softmax(logits, dim=-1).unsqueeze(1)
             logits_by_horizon = logits.unsqueeze(1)
@@ -392,7 +459,14 @@ class SemanticHierarchicalRouter(nn.Module):
             horizon_context = torch.nan_to_num(horizon_context.to(torch.float32))
             horizon_context = _pad_or_trim(horizon_context, self.horizon_calibrator.in_features)
             horizon_contribution = self.gamma * self.horizon_calibrator(horizon_context)
-            logits_by_horizon = torch.log(final_prior_by_horizon.clamp_min(1e-6)) + calibration.unsqueeze(1) + horizon_contribution
+            horizon_contribution = self._clip_logit_correction(
+                horizon_contribution,
+                self.horizon_calibration_logit_clip,
+            )
+            logits_by_horizon = _mask_logits(
+                torch.log(final_prior_by_horizon.clamp_min(1e-6)) + calibration.unsqueeze(1) + horizon_contribution,
+                active_mask,
+            )
             weights_by_horizon = torch.softmax(logits_by_horizon, dim=-1)
         weights = weights_by_horizon.mean(dim=1)
         topk_mask = torch.ones_like(weights)
@@ -417,6 +491,9 @@ class SemanticHierarchicalRouter(nn.Module):
             "rag_semantic_prior": rag_semantic_prior,
             "final_prior": final_prior,
             "final_prior_by_horizon": final_prior_by_horizon,
+            "expert_active_mask": active_mask
+            if active_mask is not None
+            else torch.ones_like(weights, dtype=torch.bool),
         }
 
 

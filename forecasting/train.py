@@ -90,6 +90,12 @@ def infer_model_init_from_dataset(dataset: BatterySOHForecastDataset, cfg: Dict[
         "residual_trend_cap_fraction": float(model_cfg.get("residual_trend_cap_fraction", 0.0)),
         "residual_trend_cap_floor": float(model_cfg.get("residual_trend_cap_floor", 0.0)),
         "residual_deployment_max_abs": float(model_cfg.get("residual_deployment_max_abs", 0.0)),
+        "residual_use_direction_head": bool(model_cfg.get("residual_use_direction_head", True)),
+        "conditional_temperature_expert": bool(model_cfg.get("conditional_temperature_expert", True)),
+        "temperature_expert_active_threshold": float(model_cfg.get("temperature_expert_active_threshold", 0.05)),
+        "router_group_calibration_logit_clip": float(model_cfg.get("router_group_calibration_logit_clip", 0.75)),
+        "router_total_calibration_logit_clip": float(model_cfg.get("router_total_calibration_logit_clip", 1.25)),
+        "router_horizon_calibration_logit_clip": float(model_cfg.get("router_horizon_calibration_logit_clip", 0.35)),
     }
 
 
@@ -117,6 +123,12 @@ MODEL_INIT_CONFIG_OVERRIDE_KEYS = [
     "residual_trend_cap_fraction",
     "residual_trend_cap_floor",
     "residual_deployment_max_abs",
+    "residual_use_direction_head",
+    "conditional_temperature_expert",
+    "temperature_expert_active_threshold",
+    "router_group_calibration_logit_clip",
+    "router_total_calibration_logit_clip",
+    "router_horizon_calibration_logit_clip",
 ]
 
 
@@ -158,6 +170,7 @@ def run_epoch(
     total_epochs: int | None = None,
     stage: str = "",
     show_progress: bool = True,
+    collect_outputs: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], List[Dict[str, object]]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -194,11 +207,12 @@ def run_epoch(
             loss_accumulator.append({key: float(value.detach().cpu().item()) for key, value in loss_dict.items()})
             running_loss += loss_accumulator[-1].get("loss", 0.0)
             progress.set_postfix(loss=f"{running_loss / step:.6f}")
-            all_pred.append(outputs["base_delta"].detach().cpu().numpy())
-            all_target.append(batch["query"]["target_delta_soh"].detach().cpu().numpy())
-            expert_weights.append(outputs["expert_weights"].detach().cpu().numpy())
-            fusion_weights.append(outputs["fusion_weights"].detach().cpu().numpy())
-            retrieval_confidence.append(outputs["retrieval_confidence"].detach().cpu().numpy())
+            if collect_outputs:
+                all_pred.append(outputs["base_delta"].detach().cpu().numpy())
+                all_target.append(batch["query"]["target_delta_soh"].detach().cpu().numpy())
+                expert_weights.append(outputs["expert_weights"].detach().cpu().numpy())
+                fusion_weights.append(outputs["fusion_weights"].detach().cpu().numpy())
+                retrieval_confidence.append(outputs["retrieval_confidence"].detach().cpu().numpy())
 
     pred = np.concatenate(all_pred, axis=0) if all_pred else np.zeros((0, 0), dtype=np.float32)
     target = np.concatenate(all_target, axis=0) if all_target else np.zeros((0, 0), dtype=np.float32)
@@ -251,8 +265,10 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
         weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
     batch_size = int(train_cfg.get("batch_size", 64))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=int(train_cfg.get("num_workers", 0)))
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=int(train_cfg.get("num_workers", 0)))
+    num_workers = int(train_cfg.get("num_workers", 0))
+    loader_kwargs = {"num_workers": num_workers, "persistent_workers": bool(num_workers > 0)}
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     output_dir = Path(cfg.get("model_output_dir", "output/forecasting"))
     checkpoint_dir = output_dir / "checkpoints"
@@ -275,6 +291,7 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
 
     epochs = int(train_cfg.get("epochs", 100))
     show_progress = bool(train_cfg.get("show_progress", True))
+    compute_train_metrics = bool(train_cfg.get("compute_train_metrics", False))
     for epoch in range(1, epochs + 1):
         model.train(True)
         train_metrics, _, _ = run_epoch(
@@ -288,6 +305,7 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
             total_epochs=epochs,
             stage="train",
             show_progress=show_progress,
+            collect_outputs=compute_train_metrics,
         )
         model.train(False)
         val_metrics, h_metrics, extras = run_epoch(
@@ -300,6 +318,7 @@ def train(cfg: Dict[str, object]) -> Dict[str, object]:
             total_epochs=epochs,
             stage="val",
             show_progress=show_progress,
+            collect_outputs=True,
         )
         if not np.isfinite(val_metrics.get("loss", np.nan)):
             val_metrics = dict(train_metrics)

@@ -207,6 +207,122 @@ def _semantic_text(concepts: Mapping[str, float]) -> Dict[str, str]:
     return text
 
 
+def _finite_array(values: object) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    return array[np.isfinite(array)]
+
+
+def _nan_stat(values: object, fn=np.mean, default: float = float("nan")) -> float:
+    array = _finite_array(values)
+    if array.size == 0:
+        return float(default)
+    return float(fn(array))
+
+
+def _fmt_float(value: object, digits: int = 4, unit: str = "") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not np.isfinite(number):
+        return "unknown"
+    suffix = f" {unit}" if unit else ""
+    return f"{number:.{digits}f}{suffix}"
+
+
+def _policy_summary_from_batch(
+    base_batch: Dict[str, Dict[str, torch.Tensor]],
+    initial_case: pd.Series,
+) -> Dict[str, object]:
+    """Summarize query-window operating policy using named case-bank features.
+
+    The current case bank stores absolute current statistics rather than a
+    signed charge/discharge split. The summary therefore reports an active-step
+    current estimate (`max abs(I)`) and a window-average absolute current. This is
+    explicit in the generated markdown so charge/discharge-current semantics are
+    not overstated.
+    """
+
+    query = base_batch["query"]
+    operation_seq = _to_numpy(query["operation_seq"][0]) if "operation_seq" in query else np.empty((0, 0))
+    cycle_stats = _to_numpy(query["cycle_stats"][0]) if "cycle_stats" in query else np.empty((0, 0))
+    physics = _to_numpy(query["anchor_physics_features"][0]) if "anchor_physics_features" in query else np.empty((0,))
+
+    current_mean = _nan_stat(operation_seq[:, 0] if operation_seq.ndim == 2 and operation_seq.shape[1] > 0 else [])
+    current_std = _nan_stat(operation_seq[:, 1] if operation_seq.ndim == 2 and operation_seq.shape[1] > 1 else [])
+    current_max = _nan_stat(operation_seq[:, 2] if operation_seq.ndim == 2 and operation_seq.shape[1] > 2 else [])
+    temp_mean = _nan_stat(operation_seq[:, 3] if operation_seq.ndim == 2 and operation_seq.shape[1] > 3 else [])
+    temp_std = _nan_stat(operation_seq[:, 4] if operation_seq.ndim == 2 and operation_seq.shape[1] > 4 else [])
+    temp_max = _nan_stat(operation_seq[:, 5] if operation_seq.ndim == 2 and operation_seq.shape[1] > 5 else [])
+    energy_charge = _nan_stat(operation_seq[:, 6] if operation_seq.ndim == 2 and operation_seq.shape[1] > 6 else [])
+    energy_discharge = _nan_stat(operation_seq[:, 7] if operation_seq.ndim == 2 and operation_seq.shape[1] > 7 else [])
+
+    qv_voltage_min = _nan_stat(cycle_stats[:, 26] if cycle_stats.ndim == 2 and cycle_stats.shape[1] > 26 else [])
+    qv_voltage_max = _nan_stat(cycle_stats[:, 27] if cycle_stats.ndim == 2 and cycle_stats.shape[1] > 27 else [])
+    qv_window_ratio = _nan_stat(cycle_stats[:, 28] if cycle_stats.ndim == 2 and cycle_stats.shape[1] > 28 else [], np.mean)
+    qv_peak_value = _nan_stat(cycle_stats[:, 22] if cycle_stats.ndim == 2 and cycle_stats.shape[1] > 22 else [])
+    qv_peak_voltage = _nan_stat(cycle_stats[:, 23] if cycle_stats.ndim == 2 and cycle_stats.shape[1] > 23 else [])
+    qv_area = _nan_stat(cycle_stats[:, 24] if cycle_stats.ndim == 2 and cycle_stats.shape[1] > 24 else [])
+
+    full_or_partial = str(initial_case.get("full_or_partial", "unknown"))
+    full_metadata = full_or_partial.lower() == "full"
+    qv_available = np.isfinite(qv_window_ratio) and qv_window_ratio >= 0.5
+    if full_metadata:
+        full_text = "full charge/discharge: yes；metadata=full，按 case bank 标记为完整充放电窗口"
+    elif qv_available:
+        full_text = "full charge/discharge: not confirmed；metadata 非 full，但 Q-V 区段大部分可用"
+    else:
+        full_text = "full charge/discharge: unknown；Q-V 区段或 full/partial 标记不足"
+
+    active_current = current_max if np.isfinite(current_max) else current_mean
+    if np.isfinite(active_current):
+        current_text = (
+            f"active abs(I) max {_fmt_float(active_current, 3, 'A')}；"
+            f"window mean abs(I) {_fmt_float(current_mean, 3, 'A')}，std {_fmt_float(current_std, 3, 'A')}"
+        )
+    else:
+        current_text = "unknown；case bank 未提供可用电流统计"
+
+    voltage_text = (
+        f"{_fmt_float(qv_voltage_min, 3, 'V')} to {_fmt_float(qv_voltage_max, 3, 'V')}"
+        if np.isfinite(qv_voltage_min) and np.isfinite(qv_voltage_max)
+        else str(initial_case.get("voltage_window_bucket", "unknown"))
+    )
+
+    return {
+        "policy_condition_label": str(initial_case.get("condition_label", "unknown")),
+        "policy_raw_cell_id": str(initial_case.get("raw_cell_id", "unknown")),
+        "policy_domain_label": str(initial_case.get("domain_label", "unknown")),
+        "policy_temperature_bucket": str(initial_case.get("temperature_bucket", "unknown")),
+        "policy_charge_rate_bucket": str(initial_case.get("charge_rate_bucket", "unknown")),
+        "policy_voltage_window_bucket": str(initial_case.get("voltage_window_bucket", "unknown")),
+        "policy_full_or_partial": full_or_partial,
+        "policy_current_abs_mean_a": current_mean,
+        "policy_current_abs_std_a": current_std,
+        "policy_current_abs_max_a": current_max,
+        "policy_active_current_estimate_a": active_current,
+        "policy_temperature_mean_c": temp_mean,
+        "policy_temperature_std_c": temp_std,
+        "policy_temperature_max_c": temp_max,
+        "policy_energy_charge_delta_1": energy_charge,
+        "policy_energy_discharge_delta_1": energy_discharge,
+        "policy_qv_voltage_min_v": qv_voltage_min,
+        "policy_qv_voltage_max_v": qv_voltage_max,
+        "policy_qv_window_available_ratio": qv_window_ratio,
+        "policy_qv_dqdv_peak_value": qv_peak_value,
+        "policy_qv_dqdv_peak_voltage": qv_peak_voltage,
+        "policy_qv_dqdv_area": qv_area,
+        "policy_current_text": current_text,
+        "policy_temperature_text": (
+            f"mean {_fmt_float(temp_mean, 2, 'degC')}；max {_fmt_float(temp_max, 2, 'degC')}；std {_fmt_float(temp_std, 2, 'degC')}"
+        ),
+        "policy_voltage_text": voltage_text,
+        "policy_full_charge_discharge_text": full_text,
+        "policy_current_semantics": "case bank stores absolute current statistics; signed charge and discharge currents are not separated in this summary.",
+        "policy_anchor_physics_current_abs_max_a": float(physics[9]) if physics.size > 9 and np.isfinite(physics[9]) else float("nan"),
+    }
+
+
 def _predict_segment(
     *,
     model: BatterySOHForecaster,
@@ -227,6 +343,7 @@ def _predict_segment(
     initial_slope = _fit_initial_slope(_to_numpy(current_soh_seq).reshape(-1))
     horizon = int(base_batch["query"]["target_delta_soh"].shape[-1])
     expert_names = list(model.expert_names)
+    query_policy_summary = _policy_summary_from_batch(base_batch, initial_case)
 
     observed_records = []
     hist_start = int(initial_case["cycle_idx_start"])
@@ -314,6 +431,7 @@ def _predict_segment(
                 "pred_delta_last": float(pred_delta[step_count - 1]),
                 "pred_soh_last": float(pred_soh[step_count - 1]),
             }
+            block_record.update(query_policy_summary)
             for pos, name in enumerate(expert_names):
                 block_record[f"expert_weight_{name}"] = float(expert_weights[pos]) if pos < expert_weights.size else float("nan")
                 if pos < expert_weights_by_horizon.shape[-1]:
@@ -698,60 +816,238 @@ def _plot_retrieval_topk_segments(
     plt.close(figure)
 
 
-def _write_summary_md(path: Path, metrics: Mapping[str, object], blocks: pd.DataFrame) -> None:
+EXPERT_FACTOR_LABELS = {
+    "high_temperature_expert": "temperature stress",
+    "high_current_expert": "current stress",
+    "high_cycle_expert": "cycle-aging / low-SOH stress",
+    "high_power_expert": "power-throughput stress",
+}
+
+EXPERT_FACTOR_LABELS_ZH = {
+    "high_temperature_expert": "高温度因素",
+    "high_current_expert": "高电流因素",
+    "high_cycle_expert": "高循环/低 SOH 因素",
+    "high_power_expert": "高功率/能量吞吐因素",
+}
+
+EXPERT_TO_CONCEPT_COLUMN = {
+    "high_temperature_expert": "concept_concept_high_temperature",
+    "high_current_expert": "concept_concept_high_current",
+    "high_cycle_expert": "concept_concept_high_cycle_aging",
+    "high_power_expert": "concept_concept_high_power",
+}
+
+
+def _base_expert_columns(frame: pd.DataFrame) -> List[str]:
+    columns = []
+    for col in frame.columns:
+        if not col.startswith("expert_weight_"):
+            continue
+        if col.endswith("_first") or col.endswith("_last"):
+            continue
+        columns.append(col)
+    return sorted(columns)
+
+
+def _weight_change_table(stage: str, blocks: pd.DataFrame, segment_frame: pd.DataFrame | None) -> tuple[List[str], str]:
+    if segment_frame is not None and not segment_frame.empty:
+        sub_steps = segment_frame[
+            (segment_frame["stage"].astype(str) == str(stage))
+            & (segment_frame["segment_part"].astype(str) == "future")
+        ].sort_values("cycle_idx")
+        weight_columns = _base_expert_columns(sub_steps)
+        if not sub_steps.empty and weight_columns:
+            rows = []
+            means = {}
+            for col in weight_columns:
+                expert = col.replace("expert_weight_", "")
+                values = sub_steps[col].to_numpy(dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    continue
+                means[expert] = float(np.mean(values))
+                rows.append(
+                    f"| {expert} | {_fmt_float(values[0], 3)} | {_fmt_float(np.mean(values), 3)} | "
+                    f"{_fmt_float(values[-1], 3)} | {_fmt_float(values[-1] - values[0], 3)} |"
+                )
+            dominant = max(means.items(), key=lambda item: item[1])[0] if means else "unknown"
+            return rows, dominant
+
+    sub = blocks[blocks["stage"].astype(str) == str(stage)].sort_values("block_index")
+    if sub.empty:
+        return [], "unknown"
+    first = sub.iloc[0]
+    rows = []
+    means = {}
+    for col in _base_expert_columns(sub):
+        expert = col.replace("expert_weight_", "")
+        values = sub[col].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            continue
+        first_weight = float(first.get(f"{col}_first", values[0]))
+        last_weight = float(first.get(f"{col}_last", values[-1]))
+        means[expert] = float(np.mean(values))
+        rows.append(
+            f"| {expert} | {_fmt_float(first_weight, 3)} | {_fmt_float(np.mean(values), 3)} | "
+            f"{_fmt_float(last_weight, 3)} | {_fmt_float(last_weight - first_weight, 3)} |"
+        )
+    dominant = max(means.items(), key=lambda item: item[1])[0] if means else "unknown"
+    return rows, dominant
+
+
+def _describe_router_stage(stage: str, first: pd.Series, dominant_expert: str) -> List[str]:
+    anchor_soh = float(first.get("anchor_soh", float("nan")))
+    pred_soh_last = float(first.get("pred_soh_last", float("nan")))
+    base_delta_mean = float(first.get("base_delta_mean", float("nan")))
+    residual_mean = float(first.get("residual_mean", float("nan")))
+    residual_abs_mean = float(first.get("residual_abs_mean", float("nan")))
+    retrieval_conf = float(first.get("retrieval_confidence", float("nan")))
+    current = float(first.get("policy_active_current_estimate_a", float("nan")))
+    temp_mean = float(first.get("policy_temperature_mean_c", float("nan")))
+    temp_max = float(first.get("policy_temperature_max_c", float("nan")))
+    power_proxy = float(first.get("policy_energy_charge_delta_1", float("nan")))
+    concept_col = EXPERT_TO_CONCEPT_COLUMN.get(dominant_expert)
+    concept_score = float(first.get(concept_col, float("nan"))) if concept_col else float("nan")
+
+    direction = "向下加速退化" if residual_mean < -1e-5 else ("向上修正 base" if residual_mean > 1e-5 else "接近 0 的微调")
+    factor = EXPERT_FACTOR_LABELS_ZH.get(dominant_expert, dominant_expert)
+    lines = [
+        f"- 主导因素：`{dominant_expert}`（{factor}）；语义概念分数 {_fmt_float(concept_score, 3)}。",
+        f"- 残差方向：平均残差 `{_fmt_float(residual_mean, 5)}`，平均绝对残差 `{_fmt_float(residual_abs_mean, 5)}`，表示专家库本段主要在 `{direction}`。",
+        f"- 预测终点：anchor SOH `{_fmt_float(anchor_soh, 5)}` -> final predicted SOH `{_fmt_float(pred_soh_last, 5)}`；base 平均 delta `{_fmt_float(base_delta_mean, 5)}`。",
+        f"- 工况证据：active abs(I) max `{_fmt_float(current, 3, 'A')}`；temperature mean/max `{_fmt_float(temp_mean, 2, 'degC')}` / `{_fmt_float(temp_max, 2, 'degC')}`；energy-throughput proxy `{_fmt_float(power_proxy, 4)}`。",
+        f"- RAG 证据：retrieval confidence `{_fmt_float(retrieval_conf, 3)}`，top-k mean composite distance `{_fmt_float(first.get('topk_mean_composite_distance', float('nan')), 3)}`。",
+    ]
+    return lines
+
+
+def _retrieval_top5_rows(retrieval_segments: pd.DataFrame, stage: str) -> List[str]:
+    if retrieval_segments is None or retrieval_segments.empty:
+        return []
+    sub = retrieval_segments[
+        (retrieval_segments["stage"].astype(str) == str(stage))
+        & (retrieval_segments["series_role"].astype(str) == "reference_history")
+        & (retrieval_segments["neighbor_rank"].astype(float) > 0)
+    ].copy()
+    if sub.empty:
+        return []
+    top = (
+        sub.sort_values(["neighbor_rank", "relative_step"])
+        .groupby("neighbor_rank", as_index=False)
+        .first()
+        .sort_values("neighbor_rank")
+        .head(5)
+    )
+    rows = []
+    for _, row in top.iterrows():
+        rows.append(
+            f"| {int(row['neighbor_rank'])} | {int(row['neighbor_case_id'])} | `{row['cell_uid']}` | "
+            f"`{row['source_dataset']}` | `{row['chemistry_family']}` | {_fmt_float(row.get('composite_distance'), 4)} | "
+            f"{_fmt_float(row.get('retrieval_alpha'), 4)} | {_fmt_float(row.get('d_soh_state'), 4)} | "
+            f"{_fmt_float(row.get('d_qv_shape'), 4)} | {_fmt_float(row.get('d_physics'), 4)} | "
+            f"{_fmt_float(row.get('d_metadata'), 4)} | {_fmt_float(row.get('history_shape_rmse'), 5)} |"
+        )
+    return rows
+
+
+def _write_summary_md(
+    path: Path,
+    metrics: Mapping[str, object],
+    blocks: pd.DataFrame,
+    *,
+    segment_frame: pd.DataFrame | None = None,
+    retrieval_segments: pd.DataFrame | None = None,
+) -> None:
     lines = [
         "# Random Segment SOH Prediction Summary",
         "",
-        "## Task Definition",
-        f"- Input: `N={metrics['history_length']}` observed historical SOH values from one random segment.",
-        f"- Output: next `K={metrics['future_length']}` SOH values.",
-        "- Target remains `target_delta_soh = future_soh - anchor_soh`; absolute SOH is reconstructed as `pred_soh = anchor_soh + pred_delta_soh`.",
-        "- This is a random segment prediction experiment, not complete lifecycle prediction.",
-        "- Retrieval top-k segment figures align query/reference histories and futures by anchor SOH, so the plot compares trajectory shape rather than absolute cell identity.",
-        "",
-        "## Selected Cell",
+        "## Selected Cell And Query Segments",
         f"- cell_uid: `{metrics['cell_uid']}`",
         f"- source_dataset: `{metrics['source_dataset']}`",
         f"- chemistry_family: `{metrics['chemistry_family']}`",
         f"- split: `{metrics['split']}`",
+        f"- window: `N={metrics['history_length']}` history cycles -> `K={metrics['future_length']}` forecast cycles",
         "",
-        "## Metrics",
-        f"- Overall MAE: {float(metrics['overall_mae']):.6f}",
-        f"- Overall RMSE: {float(metrics['overall_rmse']):.6f}",
-        f"- Base-only MAE: {float(metrics.get('base_overall_mae', float('nan'))):.6f}",
-        f"- Base-only RMSE: {float(metrics.get('base_overall_rmse', float('nan'))):.6f}",
-        f"- Persistence MAE: {float(metrics['persistence_mae']):.6f}",
-        f"- Initial-slope MAE: {float(metrics['linear_slope_mae']):.6f}",
-        "",
-        "## Stage Metrics",
-        "| stage | case_id | anchor_cycle | final_MAE | base_MAE | RMSE | persistence_MAE | linear_slope_MAE |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for row in metrics.get("stage_metrics", []):
-        lines.append(
-            f"| {row['stage']} | {int(row['case_id'])} | {int(row['anchor_cycle_idx'])} | "
-            f"{float(row['mae']):.6f} | {float(row.get('base_mae', float('nan'))):.6f} | {float(row['rmse']):.6f} | "
-            f"{float(row['persistence_mae']):.6f} | {float(row['linear_slope_mae']):.6f} |"
+    if blocks.empty:
+        lines.append("_No selected segment records available._")
+    else:
+        lines.extend(
+            [
+                "| segment | case_id | anchor_cycle | anchor_soh | raw_cell / condition | current strategy | temperature | voltage / full-cycle status |",
+                "| --- | ---: | ---: | ---: | --- | --- | --- | --- |",
+            ]
         )
+        for stage, sub in blocks.groupby("stage"):
+            first = sub.sort_values("block_index").iloc[0]
+            lines.append(
+                f"| {stage} | {int(first['case_id'])} | {int(first['anchor_cycle_idx'])} | {_fmt_float(first['anchor_soh'], 5)} | "
+                f"`{first.get('policy_raw_cell_id', 'unknown')}` / `{first.get('policy_condition_label', 'unknown')}` | "
+                f"{first.get('policy_current_text', 'unknown')} | {first.get('policy_temperature_text', 'unknown')} | "
+                f"Q-V {first.get('policy_voltage_text', 'unknown')}; {first.get('policy_full_charge_discharge_text', 'unknown')} |"
+            )
+        lines.extend(
+            [
+                "",
+                "Current note: the case bank stores absolute-current statistics, so the charge/discharge current shown above is an active-step `abs(I)` estimate unless the raw adapter exposes a signed split.",
+            ]
+        )
+
     lines.extend(["", "## Router Semantic Examples"])
     if blocks.empty:
         lines.append("_No router records available._")
     else:
         for stage, sub in blocks.groupby("stage"):
             first = sub.sort_values("block_index").iloc[0]
-            evidence = json.loads(first.get("semantic_evidence_json", "{}"))
-            weights = {
-                col.replace("expert_weight_", ""): float(first[col])
-                for col in blocks.columns
-                if col.startswith("expert_weight_")
-            }
+            weight_rows, dominant = _weight_change_table(str(stage), blocks, segment_frame)
             lines.append(f"### {stage}")
-            lines.append(f"- case_id: {int(first['case_id'])}")
-            lines.append(f"- anchor_cycle_idx: {int(first['anchor_cycle_idx'])}")
-            lines.append(f"- expert_weights: `{json.dumps(weights, ensure_ascii=False)}`")
-            for key, value in evidence.items():
-                lines.append(f"- {key}: {value}")
+            lines.append(f"- case_id: `{int(first['case_id'])}`; anchor_cycle_idx: `{int(first['anchor_cycle_idx'])}`")
+            lines.extend(_describe_router_stage(str(stage), first, dominant))
             lines.append("")
+            lines.append("| expert | first-step weight | mean weight | last-step weight | last-first |")
+            lines.append("| --- | ---: | ---: | ---: | ---: |")
+            lines.extend(weight_rows if weight_rows else ["| unavailable | unknown | unknown | unknown | unknown |"])
+            evidence = json.loads(first.get("semantic_evidence_json", "{}"))
+            if evidence:
+                lines.append("")
+                lines.append("Semantic evidence:")
+                for key, value in evidence.items():
+                    lines.append(f"- `{key}`: {value}")
+            lines.append("")
+
+    lines.extend(["", "## Retrieval: RAG Top-5 Similarity"])
+    if retrieval_segments is None or retrieval_segments.empty:
+        lines.append("_No retrieval top-k segment records available._")
+    else:
+        for stage in sorted(retrieval_segments["stage"].astype(str).unique().tolist()):
+            lines.append(f"### {stage}")
+            lines.append(
+                "| rank | neighbor_case_id | cell_uid | dataset | chemistry | composite_distance | alpha | d_soh_state | d_qv_shape | d_physics | d_metadata | history_shape_RMSE |"
+            )
+            lines.append("| ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+            rows = _retrieval_top5_rows(retrieval_segments, stage)
+            lines.extend(rows if rows else ["| - | - | unavailable | unavailable | unavailable | unknown | unknown | unknown | unknown | unknown | unknown | unknown |"])
+            lines.append("")
+
+    lines.extend(
+        [
+            "",
+            "## Prediction Error Check",
+            "| segment | case_id | anchor_cycle | final_MAE | base_MAE | final_minus_base_MAE | terminal_pred_soh |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in metrics.get("stage_metrics", []):
+        final_mae = float(row["mae"])
+        base_mae = float(row.get("base_mae", float("nan")))
+        stage_blocks = blocks[blocks["stage"].astype(str) == str(row["stage"])] if not blocks.empty else pd.DataFrame()
+        terminal = float(stage_blocks.sort_values("block_index").iloc[-1].get("pred_soh_last", float("nan"))) if not stage_blocks.empty else float("nan")
+        lines.append(
+            f"| {row['stage']} | {int(row['case_id'])} | {int(row['anchor_cycle_idx'])} | "
+            f"{final_mae:.6f} | {base_mae:.6f} | {final_mae - base_mae:+.6f} | {_fmt_float(terminal, 5)} |"
+        )
+
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -822,7 +1118,11 @@ def run_experiment(
     model_init = apply_model_init_config_overrides(checkpoint["model_init"], cfg)
     model = BatterySOHForecaster(**model_init)
     missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
-    critical_missing = [key for key in missing if "horizon_calibrator" not in key]
+    critical_missing = [
+        key
+        for key in missing
+        if "horizon_calibrator" not in key and "residual_direction_head" not in key
+    ]
     if critical_missing or unexpected:
         raise RuntimeError(f"Incompatible checkpoint. missing={critical_missing}, unexpected={list(unexpected)}")
     device = resolve_device(str(cfg.get("train", {}).get("device", "auto")))
@@ -960,7 +1260,13 @@ def run_experiment(
         history_length=selected_history_length,
         future_length=selected_future_length,
     )
-    _write_summary_md(summary_md, metadata, blocks)
+    _write_summary_md(
+        summary_md,
+        metadata,
+        blocks,
+        segment_frame=segment_frame,
+        retrieval_segments=retrieval_segments,
+    )
     return {
         "metrics": metadata,
         "predictions_csv": str(predictions_csv),
